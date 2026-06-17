@@ -20,6 +20,7 @@ Product MCP 是一个面向 ERP 商品业务的 MCP 服务，包含远程 HTTP M
 - 先调用 `product_auth_status`，确认本地 Chrome 中存在 ERP 登录态。
 - 使用只读工具查询真实后端 ID，不要让用户手填分类、单位、供应商、区域等 ID。
 - 处理本地商品资料包时，先调用 `product_precheck_package`，再根据返回的 `uploadQueue` 调用 `product_upload_file`。
+- 调用 `product_upload_file` 时保留 `uploadQueue` 中的 `dedupeKey/sourceRelativePath/sourceLocalPath`，重复文件会复用第一次上传得到的 OSS URL。
 - 创建商品前，向用户总结即将写入的关键信息，并取得明确确认。
 - 只有在用户确认后，才调用 `product_create`，并传入 `confirm: true`。
 - 商品创建成功后，调用 `product_get_detail` 验证结果。
@@ -312,6 +313,7 @@ templates/商品资料模板.md
 - 不创建商品。
 - 必要时会使用 `sharp` 强制裁剪有比例要求的图片。
 - 裁剪产物写入 `.generated/prepared/`。
+- `uploadQueue` 每一项都会带上 `dedupeKey`、`sourceRelativePath`、`sourceLocalPath`。AI 调用 `product_upload_file` 时应原样保留这些字段，用于同一资料包内重复文件的 OSS URL 复用。
 
 命令行验证：
 
@@ -322,7 +324,7 @@ node dist/packagePrecheckCli.js "D:/path/to/product-package"
 
 ### `product_upload_file`
 
-本地运行。校验本地文件，必要时处理图片，通过 ERP 后端获取 OSS STS token，直传 OSS，并返回 OSS URL。
+本地运行。校验本地文件，必要时处理图片，通过 ERP 后端获取 OSS STS token，直传 OSS，并返回 OSS URL。同一 bridge 进程内，如果再次上传相同 `dedupeKey` 且源文件未变化，会直接复用第一次上传的 OSS URL，结果中 `reusedUpload` 为 `true`。
 
 输入：
 
@@ -332,7 +334,10 @@ node dist/packagePrecheckCli.js "D:/path/to/product-package"
   "usage": "productMainImage",
   "title": "optional title",
   "description": "optional description",
-  "languageList": ["zh", "en"]
+  "languageList": ["zh", "en"],
+  "dedupeKey": "optional key from product_precheck_package",
+  "sourceRelativePath": "./图片/main.png",
+  "sourceLocalPath": "D:/path/to/product-package/图片/main.png"
 }
 ```
 
@@ -503,6 +508,7 @@ If you are an AI Agent, read this section first.
 - Call `product_auth_status` first to confirm that the ERP login state is available in local Chrome.
 - Use read-only lookup tools to resolve real backend IDs. Do not ask the user to manually fill category, unit, supplier, or region IDs.
 - For a local product package, call `product_precheck_package` first, then call `product_upload_file` for items in the returned `uploadQueue`.
+- Preserve `dedupeKey/sourceRelativePath/sourceLocalPath` from each `uploadQueue` item when calling `product_upload_file`; repeated files reuse the first OSS URL.
 - Before creating a product, summarize the key fields that will be written and ask the user for explicit confirmation.
 - Call `product_create` only after confirmation, and pass `confirm: true`.
 - After creation succeeds, call `product_get_detail` to verify the result.
@@ -795,6 +801,7 @@ Notes:
 - It does not create a product.
 - Images with required aspect ratios are force-cropped by `sharp` when needed.
 - Cropped outputs are written under `.generated/prepared/`.
+- Every `uploadQueue` item includes `dedupeKey`, `sourceRelativePath`, and `sourceLocalPath`. AI agents should preserve these fields when calling `product_upload_file` so repeated files in the same package can reuse the first OSS URL.
 
 CLI verification:
 
@@ -805,7 +812,7 @@ node dist/packagePrecheckCli.js "D:/path/to/product-package"
 
 ### `product_upload_file`
 
-Runs locally. It validates a local file, prepares an image when needed, obtains an OSS STS token from the ERP backend, uploads directly to OSS, and returns the OSS URL.
+Runs locally. It validates a local file, prepares an image when needed, obtains an OSS STS token from the ERP backend, uploads directly to OSS, and returns the OSS URL. In the same bridge process, uploading the same `dedupeKey` again with an unchanged source file reuses the first OSS URL and returns `reusedUpload: true`.
 
 Input:
 
@@ -815,7 +822,10 @@ Input:
   "usage": "productMainImage",
   "title": "optional title",
   "description": "optional description",
-  "languageList": ["zh", "en"]
+  "languageList": ["zh", "en"],
+  "dedupeKey": "optional key from product_precheck_package",
+  "sourceRelativePath": "./图片/main.png",
+  "sourceLocalPath": "D:/path/to/product-package/图片/main.png"
 }
 ```
 

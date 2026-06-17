@@ -28,6 +28,9 @@ async function main() {
           usage: item.usage,
           localPath: item.localPath,
           title: item.title,
+          dedupeKey: item.dedupeKey,
+          sourceRelativePath: item.sourceRelativePath,
+          sourceLocalPath: item.sourceLocalPath,
           imagePreparation: item.imagePreparation,
           source: item.source,
           suggestedMapping: item.suggestedMapping

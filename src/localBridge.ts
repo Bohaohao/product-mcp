@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -21,7 +22,9 @@ import {
   getUploadPolicy,
   productUploadFileInputSchema,
   productUploadFileObjectSchema,
-  validateLocalFile
+  validateLocalFile,
+  type LocalFileInfo,
+  type ProductUploadFileInput
 } from './upload/policies.js';
 import { defaultUploadBackendConfig, getOssStsToken, uploadLocalFileToOss } from './upload/ossUploader.js';
 import { precheckProductPackage, productPrecheckPackageInputSchema } from './packagePrecheck.js';
@@ -64,6 +67,13 @@ interface CachedBrowserToken {
   origin: string;
   fetchedAtMs: number;
   expiresAtMs: number;
+}
+
+interface CachedOssUpload {
+  url: string;
+  objectKey: string;
+  cachedAtMs: number;
+  reuseCount: number;
 }
 
 const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
@@ -186,6 +196,50 @@ function getTokenCacheMetadata(token: CachedBrowserToken, fromCache: boolean): B
   };
 }
 
+function normalizeRelativePathForCache(relativePath?: string): string | undefined {
+  const cleaned = relativePath?.trim();
+  if (!cleaned) return undefined;
+  return cleaned.replace(/\\/g, '/').replace(/^\.\/+/, '').toLowerCase();
+}
+
+function normalizeLocalPathForCache(localPath: string): string {
+  return path.resolve(localPath).toLowerCase();
+}
+
+async function getLocalFileCacheSignature(localPath: string): Promise<string> {
+  const file = await getLocalFileInfo(localPath);
+  return `${normalizeLocalPathForCache(file.absolutePath)}|size:${file.size}|mtime:${Math.round(file.mtimeMs)}`;
+}
+
+async function buildUploadCacheKey(
+  input: ProductUploadFileInput,
+  sourceFile: LocalFileInfo,
+  uploadedFile: LocalFileInfo
+): Promise<string> {
+  const relativePath = normalizeRelativePathForCache(input.sourceRelativePath);
+  const sourcePath = input.sourceLocalPath || sourceFile.absolutePath;
+  let sourceSignature: string;
+
+  try {
+    sourceSignature = await getLocalFileCacheSignature(sourcePath);
+  } catch {
+    sourceSignature = `path:${normalizeLocalPathForCache(sourcePath)}`;
+  }
+
+  if (input.dedupeKey) {
+    return ['dedupe', input.dedupeKey, sourceSignature].join('|');
+  }
+
+  return [
+    'fallback',
+    relativePath || normalizeLocalPathForCache(sourcePath),
+    sourceSignature,
+    normalizeLocalPathForCache(uploadedFile.absolutePath),
+    `size:${uploadedFile.size}`,
+    `mtime:${Math.round(uploadedFile.mtimeMs)}`
+  ].join('|');
+}
+
 function parseJsonToolResult(result: CallToolResult): Record<string, unknown> | undefined {
   const text = result.content.find((item) => item.type === 'text');
   if (!text || text.type !== 'text') return undefined;
@@ -237,6 +291,7 @@ function isAuthFailureError(error: unknown): boolean {
 class ProductTokenBridge {
   private chromeClient?: Client;
   private cachedToken?: CachedBrowserToken;
+  private readonly uploadCache = new Map<string, CachedOssUpload>();
 
   constructor(private readonly config: BridgeConfig) {}
 
@@ -386,23 +441,40 @@ class ProductTokenBridge {
     const prepared = await prepareImageForUpload(sourceFile, policy);
     const file = prepared.file;
     const imageSize = await validateLocalFile(file, policy);
-    const backendConfig = defaultUploadBackendConfig({
-      backendBaseUrl: this.config.backendBaseUrl,
-      clientId: this.config.clientId,
-      language: this.config.language || 'zh_CN'
-    });
-    const sts = await this.getOssStsTokenWithCache(backendConfig);
-    const upload = await uploadLocalFileToOss(sts, file, policy);
+    const cacheKey = await buildUploadCacheKey(parsedInput, sourceFile, file);
+    const sourceLocalPath = parsedInput.sourceLocalPath ? path.resolve(parsedInput.sourceLocalPath) : sourceFile.absolutePath;
+    let cachedUpload = this.uploadCache.get(cacheKey);
+    const reusedUpload = Boolean(cachedUpload);
+
+    if (cachedUpload) {
+      cachedUpload.reuseCount += 1;
+    } else {
+      const backendConfig = defaultUploadBackendConfig({
+        backendBaseUrl: this.config.backendBaseUrl,
+        clientId: this.config.clientId,
+        language: this.config.language || 'zh_CN'
+      });
+      const sts = await this.getOssStsTokenWithCache(backendConfig);
+      const upload = await uploadLocalFileToOss(sts, file, policy);
+      cachedUpload = {
+        url: upload.url,
+        objectKey: upload.objectKey,
+        cachedAtMs: Date.now(),
+        reuseCount: 0
+      };
+      this.uploadCache.set(cacheKey, cachedUpload);
+    }
 
     return {
       ok: true,
-      url: upload.url,
-      objectKey: upload.objectKey,
+      url: cachedUpload.url,
+      objectKey: cachedUpload.objectKey,
       fileName: file.fileName,
       ext: file.ext,
       size: file.size,
-      sourceFileName: sourceFile.fileName,
-      sourceLocalPath: sourceFile.absolutePath,
+      sourceFileName: path.basename(sourceLocalPath),
+      sourceLocalPath,
+      sourceRelativePath: parsedInput.sourceRelativePath,
       uploadedLocalPath: file.absolutePath,
       usage: parsedInput.usage,
       label: policy.label,
@@ -427,6 +499,15 @@ class ProductTokenBridge {
             targetRatioText: prepared.targetRatioText
           },
       suggestedMapping: getSuggestedMapping(policy),
+      reusedUpload,
+      dedupe: {
+        enabled: true,
+        cacheKey,
+        sourceRelativePath: parsedInput.sourceRelativePath,
+        firstUploadedAt: new Date(cachedUpload.cachedAtMs).toISOString(),
+        reuseCount: cachedUpload.reuseCount,
+        strategy: 'same dedupeKey/source path and same upload artifact variant'
+      },
       limits: {
         allowedExtensions: policy.allowedExtensions,
         maxSizeMb: policy.maxSizeMb,
@@ -536,7 +617,7 @@ async function main(): Promise<void> {
     {
       title: 'Upload product file',
       description:
-        'Upload a local product-related file from the Codex user machine to OSS using the current Chrome Admin-Token, then return the OSS URL.',
+        'Upload a local product-related file from the Codex user machine to OSS using the current Chrome Admin-Token, then return the OSS URL. Preserve dedupeKey/sourceRelativePath/sourceLocalPath from product_precheck_package to reuse the first OSS URL for repeated files.',
       inputSchema: productUploadFileInputSchema
     },
     async (input) => {

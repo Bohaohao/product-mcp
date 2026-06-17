@@ -39,7 +39,22 @@ export const productUploadFileInputSchema = {
   ]),
   title: z.string().optional(),
   description: z.string().optional(),
-  languageList: z.array(z.enum(['zh', 'en'])).optional()
+  languageList: z.array(z.enum(['zh', 'en'])).optional(),
+  dedupeKey: z
+    .string()
+    .trim()
+    .optional()
+    .describe('Optional stable key from product_precheck_package. Uploads with the same key and same prepared artifact reuse the first OSS URL.'),
+  sourceRelativePath: z
+    .string()
+    .trim()
+    .optional()
+    .describe('Original product-package relative path, used for same-file upload deduplication metadata.'),
+  sourceLocalPath: z
+    .string()
+    .trim()
+    .optional()
+    .describe('Original local source path before precheck preparation, used for upload deduplication metadata.')
 };
 
 export const productUploadFileObjectSchema = z.object(productUploadFileInputSchema);
@@ -74,6 +89,7 @@ export interface LocalFileInfo {
   fileName: string;
   ext: string;
   size: number;
+  mtimeMs: number;
 }
 
 const IMAGE_EXTENSIONS = ['jpg', 'jpeg', 'png'];
@@ -266,7 +282,8 @@ export async function getLocalFileInfo(localPath: string): Promise<LocalFileInfo
     absolutePath,
     fileName,
     ext: path.extname(fileName).replace(/^\./, '').toLowerCase(),
-    size: stats.size
+    size: stats.size,
+    mtimeMs: stats.mtimeMs
   };
 }
 

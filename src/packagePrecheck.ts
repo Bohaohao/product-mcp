@@ -382,6 +382,25 @@ function resolveLocalPath(packageDir: string, relativePath: string): string {
   return path.isAbsolute(relativePath) ? path.resolve(relativePath) : path.resolve(packageDir, relativePath);
 }
 
+function normalizeRelativePathForDedupe(relativePath: string): string {
+  return relativePath.replace(/\\/g, '/').replace(/^\.\/+/, '').toLowerCase();
+}
+
+function getUploadArtifactVariant(file: CheckedFileReference): string {
+  const ratio = file.imagePreparation?.targetRatioText || file.imagePreparation?.targetRatio;
+  if (ratio) return `image-ratio:${ratio}`;
+  return `original-ext:${file.ext || path.extname(file.absolutePath).replace(/^\./, '').toLowerCase()}`;
+}
+
+function buildUploadDedupeKey(file: CheckedFileReference): string {
+  return [
+    'product-package-file',
+    path.resolve(file.absolutePath).toLowerCase(),
+    normalizeRelativePathForDedupe(file.relativePath),
+    getUploadArtifactVariant(file)
+  ].join('|');
+}
+
 async function resolveMarkdownPath(input: ProductPrecheckPackageInput) {
   const packagePath = path.resolve(input.packagePath);
   const stats = await stat(packagePath);
@@ -978,6 +997,9 @@ export async function precheckProductPackage(rawInput: unknown) {
       title: file.title,
       description: file.description,
       languageList: file.languageList,
+      dedupeKey: buildUploadDedupeKey(file),
+      sourceRelativePath: file.relativePath,
+      sourceLocalPath: file.absolutePath,
       imagePreparation: file.imagePreparation,
       source: {
         section: file.section,
