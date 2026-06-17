@@ -5,6 +5,7 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import * as z from 'zod/v4';
 import { productListCategoriesInputSchema } from './tools/categories.js';
 import { productCreateInputSchema } from './tools/createProduct.js';
 import {
@@ -51,7 +52,21 @@ interface BrowserToken {
   token: string;
   pageUrl: string;
   origin: string;
+  fetchedAt: string;
+  expiresAt: string;
+  expiresInSeconds: number;
+  fromCache: boolean;
 }
+
+interface CachedBrowserToken {
+  token: string;
+  pageUrl: string;
+  origin: string;
+  fetchedAtMs: number;
+  expiresAtMs: number;
+}
+
+const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 
 const DEFAULT_CHROME_MCP = {
   command: 'cmd',
@@ -60,6 +75,10 @@ const DEFAULT_CHROME_MCP = {
     PROGRAMFILES: 'C:\\Program Files',
     SystemRoot: 'C:\\WINDOWS'
   }
+};
+
+const productAuthStatusInputSchema = {
+  forceRefresh: z.boolean().default(false).describe('When true, bypass the in-memory token cache and read Admin-Token from Chrome again.')
 };
 
 function parseArgs(): { configPath: string } {
@@ -153,8 +172,71 @@ function normalizeCallToolResult(result: Awaited<ReturnType<Client['callTool']>>
   });
 }
 
+function getTokenCacheMetadata(token: CachedBrowserToken, fromCache: boolean): BrowserToken {
+  const expiresInMs = Math.max(0, token.expiresAtMs - Date.now());
+
+  return {
+    token: token.token,
+    pageUrl: token.pageUrl,
+    origin: token.origin,
+    fetchedAt: new Date(token.fetchedAtMs).toISOString(),
+    expiresAt: new Date(token.expiresAtMs).toISOString(),
+    expiresInSeconds: Math.ceil(expiresInMs / 1000),
+    fromCache
+  };
+}
+
+function parseJsonToolResult(result: CallToolResult): Record<string, unknown> | undefined {
+  const text = result.content.find((item) => item.type === 'text');
+  if (!text || text.type !== 'text') return undefined;
+
+  try {
+    const parsed = JSON.parse(text.text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isAuthFailurePayload(payload: Record<string, unknown> | undefined): boolean {
+  if (!payload) return false;
+  const code = String(payload.code || '').toUpperCase();
+  const status = Number(payload.status);
+  const message = String(payload.message || payload.error || '').toUpperCase();
+
+  return (
+    code === 'AUTH_TOKEN_INVALID' ||
+    code === 'PERMISSION_DENIED' ||
+    status === 401 ||
+    status === 403 ||
+    message.includes('AUTH_TOKEN_INVALID') ||
+    message.includes('PERMISSION_DENIED') ||
+    message.includes('401') ||
+    message.includes('403')
+  );
+}
+
+function isAuthFailureError(error: unknown): boolean {
+  const record = error && typeof error === 'object' ? (error as Record<string, unknown>) : undefined;
+  const code = String(record?.code || '').toUpperCase();
+  const status = Number(record?.status);
+  const message = error instanceof Error ? error.message.toUpperCase() : String(error).toUpperCase();
+
+  return (
+    code === 'AUTH_TOKEN_INVALID' ||
+    code === 'PERMISSION_DENIED' ||
+    status === 401 ||
+    status === 403 ||
+    message.includes('AUTH_TOKEN_INVALID') ||
+    message.includes('PERMISSION_DENIED') ||
+    message.includes('401') ||
+    message.includes('403')
+  );
+}
+
 class ProductTokenBridge {
   private chromeClient?: Client;
+  private cachedToken?: CachedBrowserToken;
 
   constructor(private readonly config: BridgeConfig) {}
 
@@ -162,7 +244,15 @@ class ProductTokenBridge {
     await this.chromeClient?.close();
   }
 
-  async getBrowserToken(): Promise<BrowserToken> {
+  invalidateTokenCache(): void {
+    this.cachedToken = undefined;
+  }
+
+  async getBrowserToken(options: { forceRefresh?: boolean } = {}): Promise<BrowserToken> {
+    if (!options.forceRefresh && this.cachedToken && this.cachedToken.expiresAtMs > Date.now()) {
+      return getTokenCacheMetadata(this.cachedToken, true);
+    }
+
     const chrome = await this.getChromeClient();
     const pagesResult = await chrome.callTool({ name: 'list_pages', arguments: {} });
     const pagesText = this.getSingleText(pagesResult);
@@ -223,15 +313,42 @@ class ProductTokenBridge {
       );
     }
 
-    return {
+    const now = Date.now();
+    this.cachedToken = {
       token: tokenPayload.token,
       pageUrl: tokenPayload.href || page.url,
-      origin: tokenPayload.origin || new URL(page.url).origin
+      origin: tokenPayload.origin || new URL(page.url).origin,
+      fetchedAtMs: now,
+      expiresAtMs: now + TOKEN_CACHE_TTL_MS
     };
+
+    return getTokenCacheMetadata(this.cachedToken, false);
   }
 
-  async callRemoteTool(name: string, args: Record<string, unknown>) {
-    const browserToken = await this.getBrowserToken();
+  async callRemoteTool(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
+    let firstResult: CallToolResult;
+
+    try {
+      firstResult = await this.callRemoteToolOnce(name, args, false);
+    } catch (error) {
+      if (!isAuthFailureError(error)) throw error;
+      this.invalidateTokenCache();
+      return await this.callRemoteToolOnce(name, args, true);
+    }
+
+    const firstPayload = parseJsonToolResult(firstResult);
+
+    if (!isAuthFailurePayload(firstPayload)) {
+      return firstResult;
+    }
+
+    this.invalidateTokenCache();
+    const secondResult = await this.callRemoteToolOnce(name, args, true);
+    return secondResult;
+  }
+
+  private async callRemoteToolOnce(name: string, args: Record<string, unknown>, forceRefreshToken: boolean): Promise<CallToolResult> {
+    const browserToken = await this.getBrowserToken({ forceRefresh: forceRefreshToken });
     const transport = new StreamableHTTPClientTransport(new URL(this.config.remoteMcpUrl), {
       requestInit: {
         headers: {
@@ -244,11 +361,19 @@ class ProductTokenBridge {
 
     try {
       await client.connect(transport);
-      const result = await client.callTool({
-        name,
-        arguments: args
-      });
-      return normalizeCallToolResult(result);
+      try {
+        const result = await client.callTool({
+          name,
+          arguments: args
+        });
+        return normalizeCallToolResult(result);
+      } catch (error) {
+        if (!forceRefreshToken && isAuthFailureError(error)) {
+          this.invalidateTokenCache();
+          return await this.callRemoteToolOnce(name, args, true);
+        }
+        throw error;
+      }
     } finally {
       await client.close();
     }
@@ -261,13 +386,12 @@ class ProductTokenBridge {
     const prepared = await prepareImageForUpload(sourceFile, policy);
     const file = prepared.file;
     const imageSize = await validateLocalFile(file, policy);
-    const browserToken = await this.getBrowserToken();
     const backendConfig = defaultUploadBackendConfig({
       backendBaseUrl: this.config.backendBaseUrl,
       clientId: this.config.clientId,
       language: this.config.language || 'zh_CN'
     });
-    const sts = await getOssStsToken(backendConfig, asBearer(browserToken.token));
+    const sts = await this.getOssStsTokenWithCache(backendConfig);
     const upload = await uploadLocalFileToOss(sts, file, policy);
 
     return {
@@ -319,6 +443,19 @@ class ProductTokenBridge {
     return await precheckProductPackage(input);
   }
 
+  private async getOssStsTokenWithCache(backendConfig: ReturnType<typeof defaultUploadBackendConfig>) {
+    try {
+      const browserToken = await this.getBrowserToken();
+      return await getOssStsToken(backendConfig, asBearer(browserToken.token));
+    } catch (error) {
+      if (!isAuthFailureError(error)) throw error;
+    }
+
+    this.invalidateTokenCache();
+    const refreshedToken = await this.getBrowserToken({ forceRefresh: true });
+    return await getOssStsToken(backendConfig, asBearer(refreshedToken.token));
+  }
+
   private async getChromeClient(): Promise<Client> {
     if (this.chromeClient) return this.chromeClient;
 
@@ -355,12 +492,14 @@ async function main(): Promise<void> {
     'product_auth_status',
     {
       title: 'Product MCP auth status',
-      description: 'Read the configured project tab in Chrome and report whether Admin-Token is available without exposing it.',
-      inputSchema: {}
+      description:
+        'Report whether Admin-Token is available without exposing it. Uses the in-memory token cache for up to 2 hours unless forceRefresh=true.',
+      inputSchema: productAuthStatusInputSchema
     },
-    async () => {
+    async (input) => {
       try {
-        const token = await bridge.getBrowserToken();
+        const forceRefresh = Boolean((input as { forceRefresh?: boolean } | undefined)?.forceRefresh);
+        const token = await bridge.getBrowserToken({ forceRefresh });
         return textResult({
           ok: true,
           projectUrl: config.projectUrl,
@@ -369,6 +508,15 @@ async function main(): Promise<void> {
           tokenStorageKey: config.tokenStorageKey,
           tokenPresent: true,
           tokenLength: token.token.length,
+          tokenSource: token.fromCache ? 'cache' : 'chrome',
+          tokenCache: {
+            enabled: true,
+            maxTtlSeconds: TOKEN_CACHE_TTL_MS / 1000,
+            fromCache: token.fromCache,
+            fetchedAt: token.fetchedAt,
+            expiresAt: token.expiresAt,
+            expiresInSeconds: token.expiresInSeconds
+          },
           remoteMcpUrl: config.remoteMcpUrl
         });
       } catch (error) {

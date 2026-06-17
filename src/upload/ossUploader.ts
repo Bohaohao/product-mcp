@@ -20,7 +20,16 @@ export interface OssUploadResult {
   objectKey: string;
 }
 
+type OssStsError = Error & { status?: number; code?: string | number };
+
 const DEFAULT_CLIENT_ID = 'e5cd7e4891bf95d1d19206ce24a7b32e';
+
+function createOssStsError(message: string, status?: number, code?: string | number): OssStsError {
+  const error = new Error(message) as OssStsError;
+  error.status = status;
+  error.code = code;
+  return error;
+}
 
 export function defaultUploadBackendConfig(partial: Partial<UploadBackendConfig> = {}): UploadBackendConfig {
   return {
@@ -45,16 +54,16 @@ export async function getOssStsToken(config: UploadBackendConfig, authorization:
   const body = text ? (JSON.parse(text) as { code?: number | string; msg?: string; message?: string; data?: unknown }) : {};
 
   if (!response.ok) {
-    throw new Error(body.msg || body.message || `获取 OSS STS Token 失败，HTTP ${response.status}`);
+    throw createOssStsError(body.msg || body.message || `Failed to get OSS STS token: HTTP ${response.status}`, response.status, body.code);
   }
 
   if (body.code !== undefined && String(body.code) !== '200') {
-    throw new Error(body.msg || body.message || '获取 OSS STS Token 失败');
+    throw createOssStsError(body.msg || body.message || 'Failed to get OSS STS token.', undefined, body.code);
   }
 
   const data = body.data as Partial<OssStsToken> | undefined;
   if (!data?.region || !data.accessKeyId || !data.accessKeySecret || !data.securityToken || !data.bucketName) {
-    throw new Error('OSS STS Token 响应字段不完整');
+    throw new Error('OSS STS token response is missing required fields.');
   }
 
   return {

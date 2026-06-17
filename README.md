@@ -197,6 +197,18 @@ product-token-bridge.config.json
 
 使用 bridge 前，用户必须先在 Chrome 中登录 ERP 系统，并保留一个匹配 `matchUrlPrefixes` 的 ERP 页面。
 
+### Token 缓存与失效
+
+本地 bridge 会在进程内缓存第一次读取到的 `Admin-Token`，最长缓存 2 小时。缓存只存在于当前 bridge 进程内存中，不写入磁盘，也不会返回 token 内容。
+
+缓存命中时，后续工具调用会直接复用 token，避免每次都重新唤起 Chrome DevTools MCP 调试确认窗口。
+
+缓存失效规则：
+
+- 超过 2 小时自动失效，下次调用会重新从 Chrome 读取。
+- 远程 Product MCP 或 ERP 后端返回 401/403 时，bridge 会立即清空缓存，重新从 Chrome 读取 token，并自动重试一次。
+- `product_auth_status` 支持 `forceRefresh: true`，用于主动绕过缓存并重新读取 Chrome。
+
 ## 部署
 
 ### PM2
@@ -260,6 +272,15 @@ location /healthz {
   "tokenStorageKey": "Admin-Token",
   "tokenPresent": true,
   "tokenLength": 245,
+  "tokenSource": "cache",
+  "tokenCache": {
+    "enabled": true,
+    "maxTtlSeconds": 7200,
+    "fromCache": true,
+    "fetchedAt": "2026-06-17T08:00:00.000Z",
+    "expiresAt": "2026-06-17T10:00:00.000Z",
+    "expiresInSeconds": 6500
+  },
   "remoteMcpUrl": "http://47.95.237.95:8787/mcp"
 }
 ```
@@ -649,6 +670,18 @@ Use this stdio server config when the MCP client should get the login state from
 
 Before using the bridge, the user must log in to ERP in Chrome and keep an ERP page that matches `matchUrlPrefixes`.
 
+### Token Cache And Invalidation
+
+The local bridge caches the first `Admin-Token` it reads in process memory for up to 2 hours. The cache is memory-only, never written to disk, and the token value is never returned.
+
+When the cache is valid, later tool calls reuse the token and avoid reopening the Chrome DevTools MCP confirmation flow for every call.
+
+Cache invalidation rules:
+
+- The token automatically expires after 2 hours; the next call reads from Chrome again.
+- If the remote Product MCP or ERP backend returns 401/403, the bridge immediately clears the cache, reads the token from Chrome again, and retries once.
+- `product_auth_status` supports `forceRefresh: true` to bypass the cache and read from Chrome manually.
+
 ## Deployment
 
 ### PM2
@@ -712,6 +745,15 @@ Example success result:
   "tokenStorageKey": "Admin-Token",
   "tokenPresent": true,
   "tokenLength": 245,
+  "tokenSource": "cache",
+  "tokenCache": {
+    "enabled": true,
+    "maxTtlSeconds": 7200,
+    "fromCache": true,
+    "fetchedAt": "2026-06-17T08:00:00.000Z",
+    "expiresAt": "2026-06-17T10:00:00.000Z",
+    "expiresInSeconds": 6500
+  },
   "remoteMcpUrl": "http://47.95.237.95:8787/mcp"
 }
 ```
