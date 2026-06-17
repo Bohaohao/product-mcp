@@ -9,18 +9,22 @@ const numberLikeSchema = z.union([z.number(), z.string().trim().min(1)]).optiona
 const zeroOneSchema = z.union([z.literal(0), z.literal(1)]);
 const objectArraySchema = z.array(z.record(z.string(), z.any())).optional();
 
-const regionSchema = z.object({
+const regionSchema = z.looseObject({
+  id: optionalIdSchema,
   regionId: optionalIdSchema,
   regionName: z.string().trim().optional(),
   isAll: z.union([z.literal(0), z.literal(1)]).optional(),
   customerType: z.union([z.string(), z.array(z.string())]).optional(),
   originPlace: z.string().trim().optional(),
-  sortNo: z.number().int().positive().optional()
+  sortNo: z.number().int().positive().optional(),
+  remark: z.string().optional()
 });
 
-const mediaSchema = z.object({
+const mediaSchema = z.looseObject({
+  id: optionalIdSchema,
   mediaType: z.union([z.literal(1), z.literal(2), z.literal(3), z.literal(4)]),
   mediaUrl: z.string().trim().min(1),
+  mediaId: optionalIdSchema,
   mediaName: z.string().trim().optional(),
   mediaTitle: z.string().optional(),
   mediaSubtitle: z.string().optional(),
@@ -28,13 +32,14 @@ const mediaSchema = z.object({
   imageCategory: z.number().int().positive().optional(),
   videoCategory: z.number().int().positive().optional(),
   otherCategory: z.number().int().positive().optional(),
+  language: z.string().trim().optional(),
   languageList: z.array(z.enum(['zh', 'en'])).optional(),
   sort: z.number().int().positive().optional(),
   remark: z.string().optional(),
   duration: z.number().nonnegative().optional()
 });
 
-const packageInfoSchema = z.object({
+const packageFieldSchemas = {
   palletInfo: z.string().optional(),
   cartonMark: z.string().optional(),
   stackingReq: z.string().optional(),
@@ -53,9 +58,12 @@ const packageInfoSchema = z.object({
   bulkCarrier: numberLikeSchema,
   packWeight: numberLikeSchema,
   netWeight: numberLikeSchema
-});
+};
 
-const priceTierSchema = z.object({
+const packageInfoSchema = z.looseObject(packageFieldSchemas);
+
+const priceTierSchema = z.looseObject({
+  id: optionalIdSchema,
   minPriceQuantity: numberLikeSchema,
   maxPriceQuantity: numberLikeSchema,
   unitPrice: numberLikeSchema,
@@ -64,14 +72,34 @@ const priceTierSchema = z.object({
   maxDeliveryDays: numberLikeSchema
 });
 
+const supplierSchema = z.looseObject({
+  id: optionalIdSchema,
+  supplierId: idSchema,
+  supplierName: z.string().trim().optional(),
+  productionCycle: numberLikeSchema,
+  cycleUnit: numberLikeSchema,
+  remark: z.string().optional()
+});
+
+const tagObjectSchema = z.looseObject({
+  id: optionalIdSchema,
+  tagName: z.string().trim().min(1),
+  remark: z.string().optional()
+});
+
 export const productCreateInputSchema = {
   confirm: z.literal(true).describe('Required confirmation. This tool creates a real product.'),
   clientRequestId: z.string().trim().max(100).optional(),
 
+  id: optionalIdSchema,
+  tenantId: z.string().trim().optional(),
+  createBy: optionalIdSchema,
+  createDept: optionalIdSchema,
+  language: z.string().trim().optional(),
   productNameCn: z.string().trim().min(1).describe('Product Chinese name.'),
   productNameEn: z.string().trim().min(1).describe('Product English name.'),
   productType: z.union([z.literal(1), z.literal(2), z.literal(3)]).default(1).describe('1=whole machine, 2=part, 3=service.'),
-  status: z.union([z.literal(1), z.literal(2)]).default(1).describe('1=on shelf, 2=off shelf. Creating status=3 is not allowed.'),
+  status: z.union([z.literal(1), z.literal(2), z.literal(3)]).default(1).describe('1=on shelf, 2=off shelf, 3=void.'),
   level: scalarSchema,
 
   categoryFirstId: idSchema,
@@ -80,10 +108,11 @@ export const productCreateInputSchema = {
   unitId: idSchema,
   unitName: z.string().trim().optional(),
 
-  supplierId: idSchema,
+  supplierId: optionalIdSchema,
   supplierName: z.string().trim().optional(),
   supplierProductionCycle: z.number().int().positive().optional(),
   supplierCycleUnit: z.number().int().positive().optional(),
+  suppliers: z.array(supplierSchema).optional(),
 
   useAllRegions: z.boolean().default(false).describe('When true, create one global region row.'),
   regions: z.array(regionSchema).optional(),
@@ -99,6 +128,7 @@ export const productCreateInputSchema = {
   brand: z.string().trim().optional(),
   remark: z.string().optional(),
   usagePurpose: z.string().trim().optional(),
+  relatedCommodityId: z.string().trim().optional(),
   supportConsolidation: zeroOneSchema.default(0),
   canExhibit: zeroOneSchema.default(0),
   needInstallation: zeroOneSchema.default(0),
@@ -140,8 +170,9 @@ export const productCreateInputSchema = {
   proofreadStatus: z.union([z.literal(0), z.literal(1)]).optional(),
   skipTranslation: z.boolean().optional(),
 
+  ...packageFieldSchemas,
   packageInfo: packageInfoSchema.optional(),
-  tags: z.array(z.union([z.string().trim().min(1), z.object({ tagName: z.string().trim().min(1) })])).optional(),
+  tags: z.array(z.union([z.string().trim().min(1), tagObjectSchema])).optional(),
   baseConfigs: objectArraySchema,
   technicalParams: objectArraySchema,
   optionalConfigs: objectArraySchema,
@@ -376,21 +407,36 @@ function normalizeRegions(input: ProductCreateInput): Array<Record<string, unkno
   return regions.map((region, index) => {
     const isAll = region.isAll ?? 0;
     return {
+      ...region,
+      id: toOptionalIdValue(region.id),
       originPlace: region.originPlace,
       customerType: toCsv(region.customerType),
       isAll,
       regionId: isAll === 1 ? toOptionalIdValue(region.regionId) ?? '' : toRequiredIdValue(region.regionId, `regions[${index}].regionId`),
       regionName: region.regionName,
-      sortNo: region.sortNo ?? index + 1
+      sortNo: region.sortNo ?? index + 1,
+      remark: region.remark
     };
   });
 }
 
 function normalizeTags(tags: ProductCreateInput['tags']): Array<{ tagName: string }> {
-  return (tags || []).map((tag) => (typeof tag === 'string' ? { tagName: tag } : { tagName: tag.tagName }));
+  return (tags || []).map((tag) => (typeof tag === 'string' ? { tagName: tag } : tag));
 }
 
 function normalizeSupplier(input: ProductCreateInput): Array<Record<string, unknown>> {
+  if (input.suppliers?.length) {
+    return input.suppliers.map((supplier, index) => ({
+      ...supplier,
+      id: toOptionalIdValue(supplier.id),
+      supplierId: toRequiredIdValue(supplier.supplierId, `suppliers[${index}].supplierId`),
+      supplierName: supplier.supplierName,
+      productionCycle: toOptionalNumberValue(supplier.productionCycle, `suppliers[${index}].productionCycle`),
+      cycleUnit: toOptionalNumberValue(supplier.cycleUnit, `suppliers[${index}].cycleUnit`),
+      remark: supplier.remark
+    }));
+  }
+
   const supplier: Record<string, unknown> = {
     supplierId: toRequiredIdValue(input.supplierId, 'supplierId'),
     supplierName: input.supplierName
@@ -447,16 +493,22 @@ function addIfPresent(target: Record<string, unknown>, key: string, value: unkno
   if (isPresent(value)) target[key] = value;
 }
 
-function mergePackageInfo(target: Record<string, unknown>, packageInfo: ProductCreateInput['packageInfo']): void {
-  if (!packageInfo) return;
+function mergePackageFields(target: Record<string, unknown>, source: Record<string, unknown> | undefined, prefix: string): void {
+  if (!source) return;
   const textKeys = new Set(['palletInfo', 'cartonMark', 'stackingReq', 'moistureProofReq', 'waterproofReq', 'packingListTemplate']);
-  for (const [key, value] of Object.entries(packageInfo)) {
+  for (const key of Object.keys(packageFieldSchemas)) {
+    const value = source[key];
     if (textKeys.has(key)) {
       addIfPresent(target, key, value);
     } else {
-      addIfPresent(target, key, toNumberValue(value, `packageInfo.${key}`));
+      const fieldName = prefix ? `${prefix}.${key}` : key;
+      addIfPresent(target, key, toNumberValue(value, fieldName));
     }
   }
+}
+
+function mergePackageInfo(target: Record<string, unknown>, packageInfo: ProductCreateInput['packageInfo']): void {
+  mergePackageFields(target, packageInfo, 'packageInfo');
 }
 
 function normalizePriceTiers(priceTiers: ProductCreateInput['priceTiers']): Array<Record<string, unknown>> | undefined {
@@ -564,7 +616,11 @@ function buildProductI18nList(input: ProductCreateInput): Array<Record<string, u
 function buildRequestBody(input: ProductCreateInput, categoryConfig?: CategoryConfigResponse): Record<string, unknown> {
   const body: Record<string, unknown> = {
     ...(input.extraBody || {}),
-    language: 'zh',
+    id: toOptionalIdValue(input.id),
+    tenantId: input.tenantId,
+    createBy: toOptionalIdValue(input.createBy),
+    createDept: toOptionalIdValue(input.createDept),
+    language: input.language || 'zh',
     commodityId: input.commodityId,
     productType: input.productType,
     level: input.level,
@@ -583,6 +639,7 @@ function buildRequestBody(input: ProductCreateInput, categoryConfig?: CategoryCo
     productModel: input.productModel,
     brand: input.brand,
     remark: input.remark,
+    relatedCommodityId: input.relatedCommodityId,
     categoryFirstId: toRequiredIdValue(input.categoryFirstId, 'categoryFirstId'),
     categorySecondId: toOptionalIdValue(input.categorySecondId),
     categoryThirdId: toOptionalIdValue(input.categoryThirdId),
@@ -639,6 +696,7 @@ function buildRequestBody(input: ProductCreateInput, categoryConfig?: CategoryCo
   };
 
   mergePackageInfo(body, input.packageInfo);
+  mergePackageFields(body, input as Record<string, unknown>, '');
 
   return body;
 }

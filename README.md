@@ -30,7 +30,7 @@ Product MCP 是一个面向 ERP 商品业务的 MCP 服务，包含远程 HTTP M
 - 不要要求用户粘贴或暴露 `Admin-Token`。
 - 不要在没有用户明确确认的情况下调用 `product_create`。
 - 不要把本地文件路径直接交给远程 HTTP MCP；远程服务不能读取用户本地文件。
-- 不要在创建商品时传入 `status=3`，该状态保留给已有商品作废操作。
+- `status=3` 表示作废状态；只有用户明确要求创建为作废状态时才传入。
 
 ### 推荐创建流程
 
@@ -289,6 +289,14 @@ location /healthz {
 
 本地运行。读取商品资料包目录或商品资料 Markdown 文件，解析已支持字段和文件表格，校验本地文件，并返回创建草稿和上传队列。
 
+仓库内提供最新字段范本：
+
+```text
+templates/商品资料模板.md
+```
+
+使用时把这个文件复制到用户自己的商品资料包目录，命名为 `商品资料.md`，再替换商品字段、供应商、分类名称和文件相对路径。模板中的本地文件路径只是结构示例，真实创建前必须指向用户资料包中实际存在的文件。
+
 输入：
 
 ```json
@@ -414,7 +422,9 @@ POST /user/erp/commodity
 }
 ```
 
-`confirm: true` 是必填项。创建时禁止传 `status=3`，因为 `3` 保留给已有商品作废。
+`confirm: true` 是必填项。`status` 支持 `1` 上架、`2` 下架、`3` 作废；默认建议使用 `1`，只有用户明确要求作废状态时才传 `3`。
+
+`product_create` 兼容两种输入风格：可以继续使用 `supplierId`、`supplierName`、`packageInfo` 等 MCP 便捷字段；也可以直接使用后端 `CommoditySaveDTO` 的 `suppliers` 数组、顶层包装/装柜字段、`tenantId`、`relatedCommodityId` 等字段。两者同时存在时，顶层后端 DTO 字段优先覆盖 `packageInfo` 中的同名包装字段。
 
 成功结果示例：
 
@@ -503,7 +513,7 @@ If you are an AI Agent, read this section first.
 - Do not ask the user to paste or reveal `Admin-Token`.
 - Do not call `product_create` without explicit user confirmation.
 - Do not pass local file paths directly to the remote HTTP MCP. The remote server cannot read local user files.
-- Do not create a product with `status=3`; that status is reserved for voiding an existing product.
+- `status=3` means void. Pass it only when the user explicitly asks to create the product in a voided state.
 
 ### Recommended Creation Flow
 
@@ -762,6 +772,14 @@ Example success result:
 
 Runs locally. It reads a product package directory or product Markdown file, parses supported fields and file tables, validates local files, and returns a create draft plus an upload queue.
 
+The repository ships the latest field template:
+
+```text
+templates/商品资料模板.md
+```
+
+Copy this file into the user's own product package directory as `商品资料.md`, then replace product fields, supplier/category names, and relative file paths. File paths in the template are structural examples; before real creation they must point to files that actually exist in the user's package.
+
 Input:
 
 ```json
@@ -887,7 +905,9 @@ Recommended input after uploading a main image:
 }
 ```
 
-`confirm: true` is mandatory. Creating with `status=3` is blocked because `3` is reserved for voiding an existing product.
+`confirm: true` is mandatory. `status` supports `1` on shelf, `2` off shelf, and `3` void. Prefer the default `1`; pass `3` only when the user explicitly asks for a voided state.
+
+`product_create` accepts both input styles: existing MCP convenience fields such as `supplierId`, `supplierName`, and `packageInfo`; and backend `CommoditySaveDTO` fields such as `suppliers`, top-level package/container fields, `tenantId`, and `relatedCommodityId`. When both styles provide the same package field, the top-level backend DTO field wins over `packageInfo`.
 
 Example success result:
 

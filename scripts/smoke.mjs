@@ -136,7 +136,11 @@ function createFakeBackend() {
         assert(body.categoryFirstId === 1, 'categoryFirstId was not normalized');
         assert(body.unitId === 9, 'unitId was not normalized');
         assert(body.suppliers?.[0]?.supplierId === 88, 'supplier was not mapped');
+        assert(body.suppliers?.[0]?.productionCycle === 7, 'supplier productionCycle was not normalized');
+        assert(body.suppliers?.[0]?.cycleUnit === 1, 'supplier cycleUnit was not normalized');
         assert(body.regions?.[0]?.isAll === 1, 'global region was not mapped');
+        assert(body.tenantId === 'tenant-smoke', 'tenantId was not forwarded');
+        assert(body.relatedCommodityId === '456,789', 'relatedCommodityId was not forwarded');
         assert(body.spuNameEn === 'Smoke Test Product EN', 'spuNameEn compatibility field was not forwarded');
         assert(body.i18nList?.[1]?.spuName === 'Smoke Test Product EN', 'product i18nList was not created');
         assert(body.baseConfigs?.[0]?.categoryBaseId === '8001', 'base config was not resolved');
@@ -146,7 +150,12 @@ function createFakeBackend() {
         assert(body.optionalConfigs?.[0]?.configValue === 'Red', 'optional config value was not normalized');
         assert(body.medias?.[0]?.imageCategory === 1, 'main image media was not created');
         assert(body.medias?.[0]?.mediaUrl === 'https://example.test/main.png', 'main image url was not mapped');
+        assert(body.medias?.[1]?.language === 'cn', 'media language was not preserved');
+        assert(body.medias?.[1]?.mediaId === 'media-zh-1', 'mediaId was not preserved');
         assert(body.palletInfo === 'Smoke pallet', 'package text field was not preserved');
+        assert(body.packLength === 101, 'top-level packLength should override packageInfo');
+        assert(body.bulkCarrier === 3, 'top-level bulkCarrier was not forwarded');
+        assert(body.packingListTemplate === 'Smoke template', 'top-level packingListTemplate was not forwarded');
 
         sendJson(res, 200, {
           code: 200,
@@ -267,15 +276,21 @@ async function main() {
         confirm: true,
         productNameCn: 'Smoke Test Product',
         productNameEn: 'Smoke Test Product EN',
+        tenantId: 'tenant-smoke',
+        relatedCommodityId: '456,789',
         categoryFirstId: '1',
         categorySecondId: '11',
         unitId: '9',
-        supplierId: '88',
+        suppliers: [{ supplierId: '88', supplierName: 'Smoke Supplier', productionCycle: '7', cycleUnit: '1' }],
         useAllRegions: true,
         productMainImageUrl: 'https://example.test/main.png',
+        medias: [{ mediaType: 1, imageCategory: 2, mediaUrl: 'https://example.test/detail.png', language: 'cn', mediaId: 'media-zh-1' }],
         baseConfigs: [{ name: 'Power', configValue: '100W' }],
         technicalParams: [{ name: 'Length', paramValue: '10cm' }],
         optionalConfigs: [{ name: 'Color', configValue: 'Red', status: 0 }],
+        packLength: 101,
+        bulkCarrier: '3',
+        packingListTemplate: 'Smoke template',
         packageInfo: {
           packLength: 100,
           packWidth: 100,

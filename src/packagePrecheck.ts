@@ -111,7 +111,8 @@ const productTypeMap: Record<string, number> = {
 
 const statusMap: Record<string, number> = {
   上架: 1,
-  下架: 2
+  下架: 2,
+  作废: 3
 };
 
 const proofreadStatusMap: Record<string, number> = {
@@ -761,17 +762,26 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
   const sales = fieldMap(tables, '销售、交付、售后');
   const price = fieldMap(tables, '价格信息');
   const packageInfo = fieldMap(tables, '包装与物流');
+  const related = fieldMap(tables, '关联商品');
 
   const draft: Record<string, unknown> = {
     productNameCn: requiredText(issues, basic['商品中文名称'], '商品中文名称', '基础信息'),
     productNameEn: requiredText(issues, basic['商品英文名称'], '商品英文名称', '基础信息'),
     productType: mappedValue(issues, basic['产品类型'], productTypeMap, '产品类型', '基础信息', true),
     status: mappedValue(issues, basic['上架状态'], statusMap, '上架状态', '基础信息', true),
+    id: optionalText(basic['商品主键ID']),
+    commodityId: numberValue(issues, basic['原商品ID'], '原商品ID', '基础信息'),
+    productCode: optionalText(basic['产品编码']),
+    language: optionalText(basic['语言标识']),
+    tenantId: optionalText(basic['租户编号']),
+    createBy: numberValue(issues, basic['创建者'], '创建者', '基础信息'),
+    createDept: numberValue(issues, basic['创建部门'], '创建部门', '基础信息'),
     level: optionalText(basic['产品等级']),
     brand: optionalText(basic['品牌']),
     productModel: optionalText(basic['产品型号']),
     hsCode: optionalText(basic['HS 编码']),
     usagePurpose: optionalText(basic['产品用途']),
+    relatedCommodityId: optionalText(related['关联商品ID']),
     remark: optionalText(basic['商品备注']),
     skipTranslation: mappedValue(issues, basic['是否跳过翻译'], yesNoMap, '是否跳过翻译', '基础信息'),
     proofreadStatus: mappedValue(issues, basic['校对状态'], proofreadStatusMap, '校对状态', '基础信息'),
@@ -840,6 +850,25 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
   };
 
   draft.tags = extractCodeBlockAfterHeading(markdown, '商品标签').map((tagName) => ({ tagName }));
+  draft.suppliers = compactRows(
+    tableRows(tables, '分类、单位、供应商', '供应商名称').map((row) => ({
+      supplierName: optionalText(row['供应商名称']),
+      supplierId: optionalText(row['供应商ID']),
+      productionCycle: numberValue(issues, row['预计生产周期'], '供应商明细.预计生产周期', '供应商明细'),
+      cycleUnit: mappedValue(issues, row['周期单位'], cycleUnitMap, '供应商明细.周期单位', '供应商明细'),
+      remark: optionalText(row['备注'])
+    }))
+  );
+  draft.regions = compactRows(
+    tableRows(tables, '适用区域', '区域名称').map((row) => ({
+      regionName: optionalText(row['区域名称']),
+      regionId: optionalText(row['区域ID']),
+      customerType: optionalText(row['客户类型']),
+      originPlace: optionalText(row['产品产地']),
+      sortNo: numberValue(issues, row['排序'], '适用区域.排序', '适用区域'),
+      remark: optionalText(row['备注'])
+    }))
+  );
   draft.priceTiers = compactRows(
     tableRows(tables, '价格信息', '最小数量').map((row) => ({
       minPriceQuantity: numberValue(issues, row['最小数量'], '价格阶梯.最小数量', '价格信息'),
