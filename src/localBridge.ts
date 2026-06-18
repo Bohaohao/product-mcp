@@ -617,7 +617,7 @@ async function main(): Promise<void> {
     {
       title: 'Upload product file',
       description:
-        'Upload a local product-related file from the Codex user machine to OSS using the current Chrome Admin-Token, then return the OSS URL. Preserve dedupeKey/sourceRelativePath/sourceLocalPath from product_precheck_package to reuse the first OSS URL for repeated files.',
+        'Upload a local product-related file from the Codex user machine directly to OSS using the current Chrome Admin-Token and STS, then return the OSS URL. Use this for images, videos, PDFs, 3D files, and other local files instead of sending file bytes or base64 through the remote HTTP MCP. Preserve dedupeKey/sourceRelativePath/sourceLocalPath from product_precheck_package to reuse the first OSS URL for repeated files.',
       inputSchema: productUploadFileInputSchema
     },
     async (input) => {
@@ -680,7 +680,7 @@ async function main(): Promise<void> {
     {
       title: 'Create product',
       description:
-        'Read Admin-Token from the configured Chrome project tab, then create a real product through the remote Product MCP. Use product_upload_file first for local files.',
+        'Read Admin-Token from the configured Chrome project tab, then create a real product through the remote Product MCP. Use product_upload_file first for local files, and pass only returned OSS URLs plus business fields here; never pass local paths, file bytes, or large base64 payloads.',
       inputSchema: productCreateInputSchema
     },
     async (input) => {

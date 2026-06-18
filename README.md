@@ -17,10 +17,12 @@ Product MCP 是一个面向 ERP 商品业务的 MCP 服务，包含远程 HTTP M
 
 ### 你应该做什么
 
+- Codex/本地资料包场景优先连接本地 bridge 作为统一入口；分类、供应商、区域、字典、创建、详情等 ERP 业务工具由 bridge 代理到远程 MCP。
 - 先调用 `product_auth_status`，确认本地 Chrome 中存在 ERP 登录态。
 - 使用只读工具查询真实后端 ID，不要让用户手填分类、单位、供应商、区域等 ID。
 - 处理本地商品资料包时，先调用 `product_precheck_package`，再根据返回的 `uploadQueue` 调用 `product_upload_file`。
 - 调用 `product_upload_file` 时保留 `uploadQueue` 中的 `dedupeKey/sourceRelativePath/sourceLocalPath`，重复文件会复用第一次上传得到的 OSS URL。
+- 大文件、图片、视频、PDF 等本地文件只通过 `product_upload_file` 拿 STS 后直传 OSS；创建商品时只传 OSS URL 和业务字段。
 - 创建商品前，向用户总结即将写入的关键信息，并取得明确确认。
 - 只有在用户确认后，才调用 `product_create`，并传入 `confirm: true`。
 - 商品创建成功后，调用 `product_get_detail` 验证结果。
@@ -31,6 +33,7 @@ Product MCP 是一个面向 ERP 商品业务的 MCP 服务，包含远程 HTTP M
 - 不要要求用户粘贴或暴露 `Admin-Token`。
 - 不要在没有用户明确确认的情况下调用 `product_create`。
 - 不要把本地文件路径直接交给远程 HTTP MCP；远程服务不能读取用户本地文件。
+- 不要把视频、图片、附件等文件内容或 base64 塞进远程 HTTP MCP 请求；这会触发 `Payload Too Large`、网关超时或 MCP 请求超时。
 - `status=3` 表示作废状态；只有用户明确要求创建为作废状态时才传入。
 
 ### 推荐创建流程
@@ -57,6 +60,20 @@ Product MCP 提供三类能力：
 | 本地 Chrome Token Bridge | 通过 Chrome DevTools MCP 读取用户已登录 ERP 页面中的 `localStorage.Admin-Token` |
 | 本地文件工具 | 预检商品资料包、校验文件、按要求裁剪图片、通过 STS 上传 OSS |
 
+### 本地与远程边界
+
+推荐边界是：本地 bridge 做用户机器相关的事情，远程 MCP 做 ERP 后端业务相关的事情。Codex 用户通常只需要配置本地 bridge；bridge 会自动读取 Chrome 登录态，并在需要分类、供应商、创建商品等业务能力时代理远程 MCP。
+
+| 场景 | 应使用 | 原因 |
+| --- | --- | --- |
+| Chrome 登录态、`Admin-Token` 缓存 | 本地 bridge | token 只存在用户 Chrome，本地读取且不返回 token 内容 |
+| 本地资料包、`D:\...` 路径、图片裁剪 | 本地 bridge | 远程服务不能读取用户磁盘 |
+| 大视频、图片、PDF、3D 文件上传 | 本地 bridge 的 `product_upload_file` | 本地校验后直传 OSS，避免远程 HTTP MCP 的请求体大小和超时限制 |
+| 分类、单位、供应商、区域、字典查询 | 远程 MCP，通常由本地 bridge 代理 | 后端数据权威，适合集中维护 |
+| 创建商品、查询详情 | 远程 MCP，通常由本地 bridge 代理 | 写入 ERP 业务系统，应走统一后端入口 |
+
+因此，“优先使用远程 MCP”只适用于 ERP 业务查询和写入，不适用于本地文件传输。商品创建时应先把本地文件通过 `product_upload_file` 上传为 OSS URL，再把 URL 传给 `product_create`。
+
 ## 架构
 
 ```text
@@ -74,7 +91,7 @@ MCP Client
 
 ### 远程 HTTP MCP 工具
 
-这些工具运行在远程 MCP Server 中，需要请求携带当前用户的 `Authorization`。
+这些工具运行在远程 MCP Server 中，需要请求携带当前用户的 `Authorization`。它们负责 ERP 业务查询和写入，不接收本地文件路径、文件内容或 base64 大文件。
 
 | Tool | 读写 | 用途 |
 | --- | --- | --- |
@@ -88,7 +105,7 @@ MCP Client
 
 ### 本地 Bridge 工具
 
-这些工具在本地 bridge 中可用。本地路径读取、图片裁剪和文件上传都应通过本地 bridge 完成。
+这些工具在本地 bridge 中可用。本地路径读取、图片裁剪和文件上传都应通过本地 bridge 完成；远程业务工具也可以通过 bridge 自动携带 Chrome token 代理调用。
 
 | Tool | 读写 | 用途 |
 | --- | --- | --- |
@@ -326,6 +343,8 @@ node dist/packagePrecheckCli.js "D:/path/to/product-package"
 
 本地运行。校验本地文件，必要时处理图片，通过 ERP 后端获取 OSS STS token，直传 OSS，并返回 OSS URL。同一 bridge 进程内，如果再次上传相同 `dedupeKey` 且源文件未变化，会直接复用第一次上传的 OSS URL，结果中 `reusedUpload` 为 `true`。
 
+视频、图片、PDF、3D 文件等不要通过远程 HTTP MCP 传文件内容或 base64。`product_upload_file` 会在本地读取文件并直传 OSS，商品创建时只需要使用返回的 OSS URL。
+
 输入：
 
 ```json
@@ -431,6 +450,8 @@ POST /user/erp/commodity
 
 `product_create` 兼容两种输入风格：可以继续使用 `supplierId`、`supplierName`、`packageInfo` 等 MCP 便捷字段；也可以直接使用后端 `CommoditySaveDTO` 的 `suppliers` 数组、顶层包装/装柜字段、`tenantId`、`relatedCommodityId` 等字段。两者同时存在时，顶层后端 DTO 字段优先覆盖 `packageInfo` 中的同名包装字段。
 
+`product_create` 只应接收业务字段和已经上传得到的 OSS URL。不要把本地路径、二进制文件内容或 base64 大文件传给它。
+
 成功结果示例：
 
 ```json
@@ -471,6 +492,12 @@ POST /user/erp/commodity
 - 本地路径应通过本地 bridge 的 `product_precheck_package` 或 `product_upload_file` 处理。
 - 确认路径为绝对路径，或相对于 bridge 进程工作目录。
 
+### Payload Too Large 或上传超时
+
+- 不要把大视频、高清图片、PDF、3D 文件或 base64 内容传给远程 HTTP MCP。
+- 先调用本地 bridge 的 `product_upload_file`，让文件从用户机器直传 OSS。
+- 再把返回的 OSS URL 放入 `product_create` 的 `medias`、`certifications`、`salesSupports` 或其它业务字段。
+
 ## 仓库拆分建议
 
 本仓库只负责 Product MCP 运行时代码。
@@ -505,10 +532,12 @@ If you are an AI Agent, read this section first.
 
 ### What You Should Do
 
+- In Codex/local package workflows, connect to the local bridge as the single entry point; let it proxy ERP business tools such as categories, suppliers, regions, dictionaries, creation, and detail lookup to the remote MCP.
 - Call `product_auth_status` first to confirm that the ERP login state is available in local Chrome.
 - Use read-only lookup tools to resolve real backend IDs. Do not ask the user to manually fill category, unit, supplier, or region IDs.
 - For a local product package, call `product_precheck_package` first, then call `product_upload_file` for items in the returned `uploadQueue`.
 - Preserve `dedupeKey/sourceRelativePath/sourceLocalPath` from each `uploadQueue` item when calling `product_upload_file`; repeated files reuse the first OSS URL.
+- Upload large files, images, videos, PDFs, and other local files only through `product_upload_file`, which obtains STS and uploads directly to OSS; pass only OSS URLs and business fields to product creation.
 - Before creating a product, summarize the key fields that will be written and ask the user for explicit confirmation.
 - Call `product_create` only after confirmation, and pass `confirm: true`.
 - After creation succeeds, call `product_get_detail` to verify the result.
@@ -519,6 +548,7 @@ If you are an AI Agent, read this section first.
 - Do not ask the user to paste or reveal `Admin-Token`.
 - Do not call `product_create` without explicit user confirmation.
 - Do not pass local file paths directly to the remote HTTP MCP. The remote server cannot read local user files.
+- Do not put video, image, attachment, or base64 file content into remote HTTP MCP requests. This can cause `Payload Too Large`, gateway timeouts, or MCP request timeouts.
 - `status=3` means void. Pass it only when the user explicitly asks to create the product in a voided state.
 
 ### Recommended Creation Flow
@@ -545,6 +575,20 @@ Product MCP provides three capability groups:
 | Local Chrome Token Bridge | Reads `localStorage.Admin-Token` from a logged-in ERP page through Chrome DevTools MCP |
 | Local File Tools | Prechecks product packages, validates files, crops images when required, and uploads files to OSS through STS |
 
+### Local And Remote Boundary
+
+The recommended boundary is: the local bridge handles things that exist on the user's machine, and the remote MCP handles ERP backend business operations. Codex users usually only need to configure the local bridge; the bridge reads the Chrome login state and proxies remote MCP business tools when it needs categories, suppliers, product creation, or detail lookup.
+
+| Scenario | Use | Why |
+| --- | --- | --- |
+| Chrome login state and `Admin-Token` cache | Local bridge | The token lives in the user's Chrome; the bridge reads it locally and never returns the token value |
+| Local product packages, `D:\...` paths, image cropping | Local bridge | The remote service cannot read the user's disk |
+| Large videos, images, PDFs, 3D files | `product_upload_file` in the local bridge | The file is validated locally and uploaded directly to OSS, avoiding remote HTTP MCP request-size and timeout limits |
+| Category, unit, supplier, region, and dictionary lookup | Remote MCP, usually proxied by the local bridge | Backend reference data is authoritative and centrally maintained |
+| Product creation and detail lookup | Remote MCP, usually proxied by the local bridge | ERP writes should go through the unified backend entry point |
+
+So "prefer the remote MCP" applies to ERP business reads and writes, not local file transfer. For product creation, upload local files through `product_upload_file` first, then pass the returned OSS URLs to `product_create`.
+
 ## Architecture
 
 ```text
@@ -562,7 +606,7 @@ MCP Client
 
 ### Remote HTTP MCP Tools
 
-These tools run on the remote MCP Server. Requests must carry the current user's `Authorization`.
+These tools run on the remote MCP Server. Requests must carry the current user's `Authorization`. They handle ERP business reads and writes, not local file paths, file bytes, or large base64 payloads.
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
@@ -576,7 +620,7 @@ These tools run on the remote MCP Server. Requests must carry the current user's
 
 ### Local Bridge Tools
 
-These tools are available in the local bridge. Local path reads, image preparation, and file uploads should go through the local bridge.
+These tools are available in the local bridge. Local path reads, image preparation, and file uploads should go through the local bridge; remote business tools can also be proxied through the bridge with the Chrome token attached automatically.
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
@@ -814,6 +858,8 @@ node dist/packagePrecheckCli.js "D:/path/to/product-package"
 
 Runs locally. It validates a local file, prepares an image when needed, obtains an OSS STS token from the ERP backend, uploads directly to OSS, and returns the OSS URL. In the same bridge process, uploading the same `dedupeKey` again with an unchanged source file reuses the first OSS URL and returns `reusedUpload: true`.
 
+Do not send video, image, PDF, 3D file, or base64 file content through the remote HTTP MCP. `product_upload_file` reads the file locally and uploads it directly to OSS; product creation only needs the returned OSS URL.
+
 Input:
 
 ```json
@@ -919,6 +965,8 @@ Recommended input after uploading a main image:
 
 `product_create` accepts both input styles: existing MCP convenience fields such as `supplierId`, `supplierName`, and `packageInfo`; and backend `CommoditySaveDTO` fields such as `suppliers`, top-level package/container fields, `tenantId`, and `relatedCommodityId`. When both styles provide the same package field, the top-level backend DTO field wins over `packageInfo`.
 
+`product_create` should receive only business fields and OSS URLs that were already uploaded. Do not pass local paths, binary file content, or large base64 payloads to it.
+
 Example success result:
 
 ```json
@@ -958,6 +1006,12 @@ Please open Chrome, log in to the ERP system, keep an ERP page that matches the 
 - Remote MCP cannot read local paths.
 - Local paths should be handled through `product_precheck_package` or `product_upload_file` in the local bridge.
 - Make sure the path is absolute, or relative to the bridge process working directory.
+
+### Payload Too Large Or Upload Timeout
+
+- Do not send large videos, high-resolution images, PDFs, 3D files, or base64 content to the remote HTTP MCP.
+- Call `product_upload_file` in the local bridge first so the file uploads directly from the user's machine to OSS.
+- Then pass the returned OSS URL into `product_create` fields such as `medias`, `certifications`, `salesSupports`, or other business fields.
 
 ## Repository Split
 
