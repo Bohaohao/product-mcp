@@ -78,6 +78,7 @@ interface CachedOssUpload {
 }
 
 const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
+const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
 
@@ -418,6 +419,7 @@ class ProductTokenBridge {
   private chromeClient?: Client;
   private cachedToken?: CachedBrowserToken;
   private chromeDevtoolsMcpPreflight?: Promise<void>;
+  private lastAuthFailureRefreshAtMs = 0;
   private readonly uploadCache = new Map<string, CachedOssUpload>();
 
   constructor(private readonly config: BridgeConfig) {}
@@ -428,6 +430,14 @@ class ProductTokenBridge {
 
   invalidateTokenCache(): void {
     this.cachedToken = undefined;
+  }
+
+  private canRefreshTokenAfterAuthFailure(): boolean {
+    return Date.now() - this.lastAuthFailureRefreshAtMs > AUTH_FAILURE_REFRESH_COOLDOWN_MS;
+  }
+
+  private noteAuthFailureRefresh(): void {
+    this.lastAuthFailureRefreshAtMs = Date.now();
   }
 
   async getBrowserToken(options: { forceRefresh?: boolean } = {}): Promise<BrowserToken> {
@@ -528,6 +538,8 @@ class ProductTokenBridge {
       firstResult = await this.callRemoteToolOnce(name, args, false);
     } catch (error) {
       if (!isAuthFailureError(error)) throw error;
+      if (!this.canRefreshTokenAfterAuthFailure()) throw error;
+      this.noteAuthFailureRefresh();
       this.invalidateTokenCache();
       return await this.callRemoteToolOnce(name, args, true);
     }
@@ -538,6 +550,11 @@ class ProductTokenBridge {
       return firstResult;
     }
 
+    if (!this.canRefreshTokenAfterAuthFailure()) {
+      return firstResult;
+    }
+
+    this.noteAuthFailureRefresh();
     this.invalidateTokenCache();
     const secondResult = await this.callRemoteToolOnce(name, args, true);
     return secondResult;
@@ -565,6 +582,8 @@ class ProductTokenBridge {
         return normalizeCallToolResult(result);
       } catch (error) {
         if (!forceRefreshToken && isAuthFailureError(error)) {
+          if (!this.canRefreshTokenAfterAuthFailure()) throw error;
+          this.noteAuthFailureRefresh();
           this.invalidateTokenCache();
           return await this.callRemoteToolOnce(name, args, true);
         }
@@ -671,8 +690,10 @@ class ProductTokenBridge {
       return await getOssStsToken(backendConfig, asBearer(browserToken.token));
     } catch (error) {
       if (!isAuthFailureError(error)) throw error;
+      if (!this.canRefreshTokenAfterAuthFailure()) throw error;
     }
 
+    this.noteAuthFailureRefresh();
     this.invalidateTokenCache();
     const refreshedToken = await this.getBrowserToken({ forceRefresh: true });
     return await getOssStsToken(backendConfig, asBearer(refreshedToken.token));

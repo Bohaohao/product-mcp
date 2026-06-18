@@ -229,7 +229,8 @@ product-token-bridge.config.json
 缓存失效规则：
 
 - 超过 2 小时自动失效，下次调用会重新从 Chrome 读取。
-- 远程 Product MCP 或 ERP 后端返回 401/403 时，bridge 会立即清空缓存，重新从 Chrome 读取 token，并自动重试一次。
+- 远程 Product MCP 或 ERP 后端返回 401/403 时，bridge 会清空缓存，重新从 Chrome 读取 token，并自动重试一次。
+- 如果短时间内连续出现 401/403，bridge 不会每次都重新唤起 Chrome；它会保留最近一次刷新结果并返回后端错误，避免权限错误或持续失效状态造成反复 Chrome 远程调试确认。
 - `product_auth_status` 支持 `forceRefresh: true`，用于主动绕过缓存并重新读取 Chrome。
 
 ## 部署
@@ -772,7 +773,8 @@ When there is no valid token cache, the bridge normally tries to connect to Chro
 Cache invalidation rules:
 
 - The token automatically expires after 2 hours; the next call reads from Chrome again.
-- If the remote Product MCP or ERP backend returns 401/403, the bridge immediately clears the cache, reads the token from Chrome again, and retries once.
+- If the remote Product MCP or ERP backend returns 401/403, the bridge clears the cache, reads the token from Chrome again, and retries once.
+- If 401/403 keeps happening in a short window, the bridge does not reopen Chrome for every call. It keeps the latest refreshed result and returns the backend error, avoiding repeated Chrome remote-debugging prompts caused by permission errors or a persistently invalid token.
 - `product_auth_status` supports `forceRefresh: true` to bypass the cache and read from Chrome manually.
 
 ## Deployment
