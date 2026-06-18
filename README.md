@@ -19,6 +19,7 @@ Product MCP 是一个面向 ERP 商品业务的 MCP 服务，包含远程 HTTP M
 
 - Codex/本地资料包场景优先连接本地 bridge 作为统一入口；分类、供应商、区域、字典、创建、详情等 ERP 业务工具由 bridge 代理到远程 MCP。
 - 先调用 `product_auth_status`，它会预检并自动预热 `chrome-devtools-mcp`，再确认本地 Chrome 中存在 ERP 登录态。
+- 只有当 `product_auth_status` 返回 `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` 时，才按返回步骤提示用户打开 Chrome 的 “Allow remote debugging for this browser instance”，完成后重新调用 `product_auth_status`。
 - 使用只读工具查询真实后端 ID，不要让用户手填分类、单位、供应商、区域等 ID。
 - 处理本地商品资料包时，先调用 `product_precheck_package`，再根据返回的 `uploadQueue` 调用 `product_upload_file`。
 - 调用 `product_upload_file` 时保留 `uploadQueue` 中的 `dedupeKey/sourceRelativePath/sourceLocalPath`，重复文件会复用第一次上传得到的 OSS URL。
@@ -223,6 +224,8 @@ product-token-bridge.config.json
 
 第一次需要读取 Chrome 登录态时，bridge 会先通过 npm 预检并自动解析 `chrome-devtools-mcp@latest`。如果当前机器缺少该 npm 包但 npm 网络可用，会自动安装/缓存后继续；如果 npm、网络或代理不可用，`product_auth_status` 会返回 `CHROME_DEVTOOLS_MCP_UNAVAILABLE` 和恢复建议。
 
+没有有效 token 缓存时，bridge 会正常尝试连接 Chrome 并读取 ERP 页面的 token。只有在 `chrome-devtools-mcp` 已可用但无法连接 Chrome 时，才返回 `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` 和远程调试操作步骤；如果 Chrome 可连接但 ERP 未登录或 token 不存在，则按登录态缺失处理。
+
 缓存失效规则：
 
 - 超过 2 小时自动失效，下次调用会重新从 Chrome 读取。
@@ -281,6 +284,29 @@ location /healthz {
 ### `product_auth_status`
 
 检查配置的 Chrome ERP 页面中是否存在 `localStorage.Admin-Token`。
+
+当 `chrome-devtools-mcp` 已安装但无法连接 Chrome 时，会返回远程调试操作步骤：
+
+```json
+{
+  "ok": false,
+  "code": "CHROME_REMOTE_DEBUGGING_NOT_ALLOWED",
+  "requiresUserAction": true,
+  "steps": [
+    "1. 打开本机 Chrome 浏览器，确认使用的是 Chrome，不是 Edge 或其它浏览器。",
+    "2. 在 Chrome 中打开或切换到 ERP 页面：https://test.eysscm.com/erp/purchase",
+    "3. 确认 ERP 页面已登录；如果登录过期，请重新登录并刷新页面。",
+    "4. 当 Chrome 出现 “Allow remote debugging for this browser instance” 提示时，点击并选择 Allow/允许。",
+    "5. 完成后回到 Codex，重新检查登录态。"
+  ],
+  "nextToolCall": {
+    "name": "product_auth_status",
+    "arguments": {}
+  }
+}
+```
+
+AI 应等待用户完成上述操作后，再按 `nextToolCall` 继续。不要把“没有 token 缓存”直接解释成远程调试未开启。
 
 成功结果示例：
 
@@ -536,6 +562,7 @@ If you are an AI Agent, read this section first.
 
 - In Codex/local package workflows, connect to the local bridge as the single entry point; let it proxy ERP business tools such as categories, suppliers, regions, dictionaries, creation, and detail lookup to the remote MCP.
 - Call `product_auth_status` first. It preflights and warms `chrome-devtools-mcp`, then confirms that the ERP login state is available in local Chrome.
+- Only when `product_auth_status` returns `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED`, stop the task, show the returned steps for enabling Chrome "Allow remote debugging for this browser instance", and call `product_auth_status` again after the user completes those steps.
 - Use read-only lookup tools to resolve real backend IDs. Do not ask the user to manually fill category, unit, supplier, or region IDs.
 - For a local product package, call `product_precheck_package` first, then call `product_upload_file` for items in the returned `uploadQueue`.
 - Preserve `dedupeKey/sourceRelativePath/sourceLocalPath` from each `uploadQueue` item when calling `product_upload_file`; repeated files reuse the first OSS URL.
@@ -740,6 +767,8 @@ When the cache is valid, later tool calls reuse the token and avoid reopening th
 
 The first time Chrome login state is needed, the bridge preflights and resolves `chrome-devtools-mcp@latest` through npm. If the package is missing and npm network access works, it is installed/cached automatically before continuing. If npm, network, or proxy access fails, `product_auth_status` returns `CHROME_DEVTOOLS_MCP_UNAVAILABLE` with recovery guidance.
 
+When there is no valid token cache, the bridge normally tries to connect to Chrome and read the ERP page token. It returns `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` with remote-debugging steps only when `chrome-devtools-mcp` is available but cannot connect to Chrome. If Chrome is reachable but ERP is not logged in or no token exists, handle it as a missing login state.
+
 Cache invalidation rules:
 
 - The token automatically expires after 2 hours; the next call reads from Chrome again.
@@ -798,6 +827,29 @@ location /healthz {
 ### `product_auth_status`
 
 Checks whether the configured Chrome ERP page contains `localStorage.Admin-Token`.
+
+When `chrome-devtools-mcp` is installed but cannot connect to Chrome, the tool returns remote-debugging steps:
+
+```json
+{
+  "ok": false,
+  "code": "CHROME_REMOTE_DEBUGGING_NOT_ALLOWED",
+  "requiresUserAction": true,
+  "steps": [
+    "1. Open local Chrome and make sure it is Chrome, not Edge or another browser.",
+    "2. Open or switch to the ERP page: https://test.eysscm.com/erp/purchase",
+    "3. Make sure the ERP page is logged in; if the session expired, log in again and refresh.",
+    "4. When Chrome shows “Allow remote debugging for this browser instance”, click it and choose Allow.",
+    "5. Return to Codex and check login state again."
+  ],
+  "nextToolCall": {
+    "name": "product_auth_status",
+    "arguments": {}
+  }
+}
+```
+
+AI agents should wait until the user completes those steps before following `nextToolCall`. Do not treat a missing token cache by itself as a remote-debugging failure.
 
 Example success result:
 

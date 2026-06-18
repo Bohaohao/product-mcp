@@ -101,6 +101,13 @@ class ChromeDevtoolsMcpPreflightError extends Error {
   }
 }
 
+class ChromeRemoteDebuggingNotAllowedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ChromeRemoteDebuggingNotAllowedError';
+  }
+}
+
 function parseArgs(): { configPath: string } {
   const index = process.argv.indexOf('--config');
   const configPath = index >= 0 ? process.argv[index + 1] : process.env.PRODUCT_MCP_BRIDGE_CONFIG;
@@ -225,6 +232,69 @@ function preinstallChromeDevtoolsMcp(env: Record<string, string>): void {
 
 function isChromeDevtoolsMcpPreflightError(error: unknown): boolean {
   return error instanceof Error && error.name === 'ChromeDevtoolsMcpPreflightError';
+}
+
+function isChromeRemoteDebuggingNotAllowedError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'ChromeRemoteDebuggingNotAllowedError';
+}
+
+function isPotentialChromeRemoteDebuggingError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /remote debugging|devtools|chrome|browser|target|websocket|connection|connect|ECONNREFUSED|ECONNRESET/i.test(message);
+}
+
+function chromeRemoteDebuggingGuidance(config: BridgeConfig) {
+  return {
+    title: 'Chrome DevTools MCP 已安装，但无法连接本机 Chrome',
+    reason:
+      'Product MCP 需要通过 chrome-devtools-mcp 读取你已登录 ERP 页面中的 localStorage.Admin-Token。当前 chrome-devtools-mcp 无法连接 Chrome，通常是 Chrome 未允许本次远程调试，或目标 Chrome 实例未打开。',
+    steps: [
+      '1. 打开本机 Chrome 浏览器，确认使用的是 Chrome，不是 Edge 或其它浏览器。',
+      `2. 在 Chrome 中打开或切换到 ERP 页面：${config.projectUrl}`,
+      `3. 确认页面地址以这些前缀之一开头：${(config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl]).join(' , ')}`,
+      '4. 保持 ERP 页面已登录状态；如果登录过期，请先重新登录并刷新页面。',
+      '5. 当 Chrome 顶部、右上角或页面上出现 “Allow remote debugging for this browser instance” 提示时，点击它并选择 Allow/允许。',
+      '6. 如果暂时没有看到该提示，请保持 Chrome 打开，回到 Codex 再次触发登录检查；提示通常会在 chrome-devtools-mcp 尝试连接时出现。'
+    ],
+    afterUserAction: '用户完成上述操作后，AI 应重新调用 product_auth_status；不需要额外传入调试确认参数。',
+    nextToolCall: {
+      name: 'product_auth_status',
+      arguments: {}
+    }
+  };
+}
+
+function bridgeErrorPayload(error: unknown, config: BridgeConfig, defaultCode: string): Record<string, unknown> {
+  if (isChromeDevtoolsMcpPreflightError(error)) {
+    return {
+      ok: false,
+      code: 'CHROME_DEVTOOLS_MCP_UNAVAILABLE',
+      message: error instanceof Error ? error.message : String(error),
+      recoverableAction: '请允许 npm/npx 访问网络；如网络需要代理，请先配置 npm proxy，然后重试 product_auth_status。',
+      projectUrl: config.projectUrl,
+      tokenStorageKey: config.tokenStorageKey,
+      remoteMcpUrl: config.remoteMcpUrl
+    };
+  }
+
+  if (isChromeRemoteDebuggingNotAllowedError(error)) {
+    return {
+      ok: false,
+      code: 'CHROME_REMOTE_DEBUGGING_NOT_ALLOWED',
+      message: error instanceof Error ? error.message : String(error),
+      requiresUserAction: true,
+      ...chromeRemoteDebuggingGuidance(config),
+      projectUrl: config.projectUrl,
+      tokenStorageKey: config.tokenStorageKey,
+      remoteMcpUrl: config.remoteMcpUrl
+    };
+  }
+
+  return {
+    ok: false,
+    code: defaultCode,
+    message: error instanceof Error ? error.message : String(error)
+  };
 }
 
 function normalizeCallToolResult(result: Awaited<ReturnType<Client['callTool']>>): CallToolResult {
@@ -365,8 +435,22 @@ class ProductTokenBridge {
       return getTokenCacheMetadata(this.cachedToken, true);
     }
 
-    const chrome = await this.getChromeClient();
-    const pagesResult = await chrome.callTool({ name: 'list_pages', arguments: {} });
+    const chromeConfig = this.config.chromeMcp || DEFAULT_CHROME_MCP;
+    await this.ensureChromeDevtoolsMcp(chromeConfig);
+
+    let chrome: Client;
+    let pagesResult: Awaited<ReturnType<Client['callTool']>>;
+    try {
+      chrome = await this.getChromeClient();
+      pagesResult = await chrome.callTool({ name: 'list_pages', arguments: {} });
+    } catch (error) {
+      if (isPotentialChromeRemoteDebuggingError(error)) {
+        throw new ChromeRemoteDebuggingNotAllowedError(
+          `Chrome DevTools MCP is installed but could not connect to Chrome. Please make sure Chrome is open and allows remote debugging for this browser instance. Original error: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      throw error;
+    }
     const pagesText = this.getSingleText(pagesResult);
     const pages = parsePages(pagesText);
 
@@ -675,17 +759,7 @@ async function main(): Promise<void> {
           remoteMcpUrl: config.remoteMcpUrl
         });
       } catch (error) {
-        return textResult({
-          ok: false,
-          code: isChromeDevtoolsMcpPreflightError(error) ? 'CHROME_DEVTOOLS_MCP_UNAVAILABLE' : 'PRODUCT_AUTH_STATUS_FAILED',
-          message: error instanceof Error ? error.message : String(error),
-          recoverableAction: isChromeDevtoolsMcpPreflightError(error)
-            ? 'Allow npm/npx network access, configure npm proxy if needed, then retry product_auth_status.'
-            : undefined,
-          projectUrl: config.projectUrl,
-          tokenStorageKey: config.tokenStorageKey,
-          remoteMcpUrl: config.remoteMcpUrl
-        });
+        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_AUTH_STATUS_FAILED'));
       }
     }
   );
@@ -702,11 +776,7 @@ async function main(): Promise<void> {
       try {
         return textResult(await bridge.uploadLocalFile(input));
       } catch (error) {
-        return textResult({
-          ok: false,
-          code: 'PRODUCT_UPLOAD_FILE_FAILED',
-          message: error instanceof Error ? error.message : String(error)
-        });
+        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_UPLOAD_FILE_FAILED'));
       }
     }
   );
@@ -744,11 +814,7 @@ async function main(): Promise<void> {
       try {
         return await bridge.callRemoteTool('product_list_categories', input);
       } catch (error) {
-        return textResult({
-          ok: false,
-          code: 'PRODUCT_TOKEN_BRIDGE_FAILED',
-          message: error instanceof Error ? error.message : String(error)
-        });
+        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
       }
     }
   );
@@ -765,11 +831,7 @@ async function main(): Promise<void> {
       try {
         return await bridge.callRemoteTool('product_create', input);
       } catch (error) {
-        return textResult({
-          ok: false,
-          code: 'PRODUCT_TOKEN_BRIDGE_FAILED',
-          message: error instanceof Error ? error.message : String(error)
-        });
+        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
       }
     }
   );
@@ -786,11 +848,7 @@ async function main(): Promise<void> {
       try {
         return await bridge.callRemoteTool('product_get_category_config', input);
       } catch (error) {
-        return textResult({
-          ok: false,
-          code: 'PRODUCT_TOKEN_BRIDGE_FAILED',
-          message: error instanceof Error ? error.message : String(error)
-        });
+        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
       }
     }
   );
@@ -807,11 +865,7 @@ async function main(): Promise<void> {
       try {
         return await bridge.callRemoteTool('product_list_suppliers', input);
       } catch (error) {
-        return textResult({
-          ok: false,
-          code: 'PRODUCT_TOKEN_BRIDGE_FAILED',
-          message: error instanceof Error ? error.message : String(error)
-        });
+        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
       }
     }
   );
@@ -828,11 +882,7 @@ async function main(): Promise<void> {
       try {
         return await bridge.callRemoteTool('product_list_regions', input);
       } catch (error) {
-        return textResult({
-          ok: false,
-          code: 'PRODUCT_TOKEN_BRIDGE_FAILED',
-          message: error instanceof Error ? error.message : String(error)
-        });
+        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
       }
     }
   );
@@ -849,11 +899,7 @@ async function main(): Promise<void> {
       try {
         return await bridge.callRemoteTool('product_get_dict', input);
       } catch (error) {
-        return textResult({
-          ok: false,
-          code: 'PRODUCT_TOKEN_BRIDGE_FAILED',
-          message: error instanceof Error ? error.message : String(error)
-        });
+        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
       }
     }
   );
@@ -870,11 +916,7 @@ async function main(): Promise<void> {
       try {
         return await bridge.callRemoteTool('product_get_detail', input);
       } catch (error) {
-        return textResult({
-          ok: false,
-          code: 'PRODUCT_TOKEN_BRIDGE_FAILED',
-          message: error instanceof Error ? error.message : String(error)
-        });
+        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
       }
     }
   );
