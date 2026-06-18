@@ -31,12 +31,17 @@ import { defaultUploadBackendConfig, getOssStsToken, uploadLocalFileToOss } from
 import { precheckProductPackage, productPrecheckPackageInputSchema } from './packagePrecheck.js';
 import { prepareImageForUpload } from './upload/imagePreparer.js';
 
-interface BridgeConfig {
-  projectUrl: string;
+interface BridgeEnvironmentConfig {
+  projectUrl?: string;
   matchUrlPrefixes?: string[];
-  tokenStorageKey: string;
-  remoteMcpUrl: string;
+  remoteMcpUrl?: string;
   backendBaseUrl?: string;
+}
+
+interface BridgeConfig extends BridgeEnvironmentConfig {
+  environment?: string;
+  environments?: Record<string, BridgeEnvironmentConfig>;
+  tokenStorageKey?: string;
   clientId?: string;
   language?: string;
   chromeMcp?: {
@@ -44,6 +49,13 @@ interface BridgeConfig {
     args: string[];
     env?: Record<string, string>;
   };
+}
+
+interface ResolvedBridgeConfig extends BridgeConfig {
+  projectUrl: string;
+  tokenStorageKey: string;
+  remoteMcpUrl: string;
+  selectedEnvironment?: string;
 }
 
 interface ChromePage {
@@ -120,14 +132,71 @@ function parseArgs(): { configPath: string } {
   return { configPath };
 }
 
-function loadConfig(path: string): BridgeConfig {
+function loadConfig(path: string): ResolvedBridgeConfig {
   const config = JSON.parse(readFileSync(path, 'utf8')) as BridgeConfig;
+  const resolvedConfig = resolveEnvironmentConfig(config);
 
-  if (!config.projectUrl) throw new Error('Bridge config missing projectUrl.');
-  if (!config.tokenStorageKey) throw new Error('Bridge config missing tokenStorageKey.');
-  if (!config.remoteMcpUrl) throw new Error('Bridge config missing remoteMcpUrl.');
+  if (!resolvedConfig.projectUrl) throw new Error('Bridge config missing projectUrl.');
+  if (!resolvedConfig.tokenStorageKey) throw new Error('Bridge config missing tokenStorageKey.');
+  if (!resolvedConfig.remoteMcpUrl) throw new Error('Bridge config missing remoteMcpUrl.');
 
-  return config;
+  return resolvedConfig;
+}
+
+function normalizeEnvironmentName(value: string | undefined): string | undefined {
+  const normalized = value?.trim().toLowerCase();
+  if (!normalized) return undefined;
+  if (['prod', 'production'].includes(normalized)) return 'prod';
+  if (['stage', 'staging', 'test', 'testing'].includes(normalized)) return 'stage';
+  return normalized;
+}
+
+function readCsvEnv(name: string): string[] | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+
+  const values = raw
+    .split(',')
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  return values.length ? values : undefined;
+}
+
+function firstEnv(names: string[]): string | undefined {
+  return names.map((name) => process.env[name]?.trim()).find(Boolean);
+}
+
+function resolveEnvironmentConfig(config: BridgeConfig): ResolvedBridgeConfig {
+  const selectedEnvironment = normalizeEnvironmentName(
+    firstEnv(['PRODUCT_MCP_ENV', 'PRODUCT_MCP_BRIDGE_ENV', 'ERP_PRODUCT_ENV']) ||
+      config.environment ||
+      (config.environments?.stage ? 'stage' : undefined)
+  );
+  const environmentConfig = selectedEnvironment ? config.environments?.[selectedEnvironment] : undefined;
+
+  if (selectedEnvironment && config.environments && !environmentConfig) {
+    const available = Object.keys(config.environments).sort().join(', ') || 'none';
+    throw new Error(`Bridge config environment not found: ${selectedEnvironment}. Available environments: ${available}.`);
+  }
+
+  const resolved = {
+    ...config,
+    ...(environmentConfig || {}),
+    selectedEnvironment,
+    projectUrl: process.env.PRODUCT_MCP_PROJECT_URL || environmentConfig?.projectUrl || config.projectUrl,
+    matchUrlPrefixes: readCsvEnv('PRODUCT_MCP_MATCH_URL_PREFIXES') || environmentConfig?.matchUrlPrefixes || config.matchUrlPrefixes,
+    tokenStorageKey: process.env.PRODUCT_MCP_TOKEN_STORAGE_KEY || config.tokenStorageKey,
+    remoteMcpUrl: process.env.PRODUCT_MCP_REMOTE_MCP_URL || environmentConfig?.remoteMcpUrl || config.remoteMcpUrl,
+    backendBaseUrl:
+      firstEnv(['PRODUCT_MCP_BRIDGE_BACKEND_BASE_URL', 'PRODUCT_MCP_BACKEND_BASE_URL']) ||
+      environmentConfig?.backendBaseUrl ||
+      config.backendBaseUrl,
+    clientId: process.env.PRODUCT_MCP_CLIENT_ID || config.clientId,
+    language: process.env.PRODUCT_MCP_LANGUAGE || config.language
+  };
+
+  return resolved as ResolvedBridgeConfig;
 }
 
 function textResult(payload: unknown) {
@@ -167,7 +236,7 @@ function extractJsonFromChromeText(text: string): unknown {
   return JSON.parse(raw);
 }
 
-function isMatchingProjectPage(config: BridgeConfig, pageUrl: string): boolean {
+function isMatchingProjectPage(config: ResolvedBridgeConfig, pageUrl: string): boolean {
   const prefixes = config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl];
   return prefixes.some((prefix) => pageUrl.startsWith(prefix));
 }
@@ -244,7 +313,7 @@ function isPotentialChromeRemoteDebuggingError(error: unknown): boolean {
   return /remote debugging|devtools|chrome|browser|target|websocket|connection|connect|ECONNREFUSED|ECONNRESET/i.test(message);
 }
 
-function chromeRemoteDebuggingGuidance(config: BridgeConfig) {
+function chromeRemoteDebuggingGuidance(config: ResolvedBridgeConfig) {
   return {
     title: 'Chrome DevTools MCP 已安装，但无法连接本机 Chrome',
     reason:
@@ -265,14 +334,16 @@ function chromeRemoteDebuggingGuidance(config: BridgeConfig) {
   };
 }
 
-function bridgeErrorPayload(error: unknown, config: BridgeConfig, defaultCode: string): Record<string, unknown> {
+function bridgeErrorPayload(error: unknown, config: ResolvedBridgeConfig, defaultCode: string): Record<string, unknown> {
   if (isChromeDevtoolsMcpPreflightError(error)) {
     return {
       ok: false,
       code: 'CHROME_DEVTOOLS_MCP_UNAVAILABLE',
       message: error instanceof Error ? error.message : String(error),
       recoverableAction: '请允许 npm/npx 访问网络；如网络需要代理，请先配置 npm proxy，然后重试 product_auth_status。',
+      environment: config.selectedEnvironment,
       projectUrl: config.projectUrl,
+      matchUrlPrefixes: config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl],
       tokenStorageKey: config.tokenStorageKey,
       remoteMcpUrl: config.remoteMcpUrl
     };
@@ -285,7 +356,9 @@ function bridgeErrorPayload(error: unknown, config: BridgeConfig, defaultCode: s
       message: error instanceof Error ? error.message : String(error),
       requiresUserAction: true,
       ...chromeRemoteDebuggingGuidance(config),
+      environment: config.selectedEnvironment,
       projectUrl: config.projectUrl,
+      matchUrlPrefixes: config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl],
       tokenStorageKey: config.tokenStorageKey,
       remoteMcpUrl: config.remoteMcpUrl
     };
@@ -422,7 +495,7 @@ class ProductTokenBridge {
   private lastAuthFailureRefreshAtMs = 0;
   private readonly uploadCache = new Map<string, CachedOssUpload>();
 
-  constructor(private readonly config: BridgeConfig) {}
+  constructor(private readonly config: ResolvedBridgeConfig) {}
 
   async close(): Promise<void> {
     await this.chromeClient?.close();
@@ -762,7 +835,9 @@ async function main(): Promise<void> {
         const token = await bridge.getBrowserToken({ forceRefresh });
         return textResult({
           ok: true,
+          environment: config.selectedEnvironment,
           projectUrl: config.projectUrl,
+          matchUrlPrefixes: config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl],
           matchedPageUrl: token.pageUrl,
           origin: token.origin,
           tokenStorageKey: config.tokenStorageKey,

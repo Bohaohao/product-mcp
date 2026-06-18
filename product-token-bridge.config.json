@@ -1,9 +1,19 @@
 {
-  "projectUrl": "https://test.eysscm.com/erp/purchase",
-  "matchUrlPrefixes": ["https://test.eysscm.com/erp/"],
+  "environment": "stage",
+  "environments": {
+    "stage": {
+      "projectUrl": "https://test.eysscm.com/erp/commodity/commodity",
+      "matchUrlPrefixes": ["https://test.eysscm.com/erp/"],
+      "backendBaseUrl": "https://test.eysscm.com/api"
+    },
+    "prod": {
+      "projectUrl": "https://eysscm.com/erp/commodity/commodity",
+      "matchUrlPrefixes": ["https://eysscm.com/erp/", "https://www.eysscm.com/erp/"],
+      "backendBaseUrl": "https://eysscm.com/api"
+    }
+  },
   "tokenStorageKey": "Admin-Token",
   "remoteMcpUrl": "http://47.95.237.95:8787/mcp",
-  "backendBaseUrl": "https://test.eysscm.com/api",
   "clientId": "e5cd7e4891bf95d1d19206ce24a7b32e",
   "language": "zh_CN",
   "chromeMcp": {
