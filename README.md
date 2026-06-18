@@ -18,7 +18,7 @@ Product MCP 是一个面向 ERP 商品业务的 MCP 服务，包含远程 HTTP M
 ### 你应该做什么
 
 - Codex/本地资料包场景优先连接本地 bridge 作为统一入口；分类、供应商、区域、字典、创建、详情等 ERP 业务工具由 bridge 代理到远程 MCP。
-- 先调用 `product_auth_status`，确认本地 Chrome 中存在 ERP 登录态。
+- 先调用 `product_auth_status`，它会预检并自动预热 `chrome-devtools-mcp`，再确认本地 Chrome 中存在 ERP 登录态。
 - 使用只读工具查询真实后端 ID，不要让用户手填分类、单位、供应商、区域等 ID。
 - 处理本地商品资料包时，先调用 `product_precheck_package`，再根据返回的 `uploadQueue` 调用 `product_upload_file`。
 - 调用 `product_upload_file` 时保留 `uploadQueue` 中的 `dedupeKey/sourceRelativePath/sourceLocalPath`，重复文件会复用第一次上传得到的 OSS URL。
@@ -220,6 +220,8 @@ product-token-bridge.config.json
 本地 bridge 会在进程内缓存第一次读取到的 `Admin-Token`，最长缓存 2 小时。缓存只存在于当前 bridge 进程内存中，不写入磁盘，也不会返回 token 内容。
 
 缓存命中时，后续工具调用会直接复用 token，避免每次都重新唤起 Chrome DevTools MCP 调试确认窗口。
+
+第一次需要读取 Chrome 登录态时，bridge 会先通过 npm 预检并自动解析 `chrome-devtools-mcp@latest`。如果当前机器缺少该 npm 包但 npm 网络可用，会自动安装/缓存后继续；如果 npm、网络或代理不可用，`product_auth_status` 会返回 `CHROME_DEVTOOLS_MCP_UNAVAILABLE` 和恢复建议。
 
 缓存失效规则：
 
@@ -533,7 +535,7 @@ If you are an AI Agent, read this section first.
 ### What You Should Do
 
 - In Codex/local package workflows, connect to the local bridge as the single entry point; let it proxy ERP business tools such as categories, suppliers, regions, dictionaries, creation, and detail lookup to the remote MCP.
-- Call `product_auth_status` first to confirm that the ERP login state is available in local Chrome.
+- Call `product_auth_status` first. It preflights and warms `chrome-devtools-mcp`, then confirms that the ERP login state is available in local Chrome.
 - Use read-only lookup tools to resolve real backend IDs. Do not ask the user to manually fill category, unit, supplier, or region IDs.
 - For a local product package, call `product_precheck_package` first, then call `product_upload_file` for items in the returned `uploadQueue`.
 - Preserve `dedupeKey/sourceRelativePath/sourceLocalPath` from each `uploadQueue` item when calling `product_upload_file`; repeated files reuse the first OSS URL.
@@ -735,6 +737,8 @@ Before using the bridge, the user must log in to ERP in Chrome and keep an ERP p
 The local bridge caches the first `Admin-Token` it reads in process memory for up to 2 hours. The cache is memory-only, never written to disk, and the token value is never returned.
 
 When the cache is valid, later tool calls reuse the token and avoid reopening the Chrome DevTools MCP confirmation flow for every call.
+
+The first time Chrome login state is needed, the bridge preflights and resolves `chrome-devtools-mcp@latest` through npm. If the package is missing and npm network access works, it is installed/cached automatically before continuing. If npm, network, or proxy access fails, `product_auth_status` returns `CHROME_DEVTOOLS_MCP_UNAVAILABLE` with recovery guidance.
 
 Cache invalidation rules:
 

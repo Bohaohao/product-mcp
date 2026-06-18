@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
@@ -77,6 +78,8 @@ interface CachedOssUpload {
 }
 
 const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
+const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
+const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
 
 const DEFAULT_CHROME_MCP = {
   command: 'cmd',
@@ -90,6 +93,13 @@ const DEFAULT_CHROME_MCP = {
 const productAuthStatusInputSchema = {
   forceRefresh: z.boolean().default(false).describe('When true, bypass the in-memory token cache and read Admin-Token from Chrome again.')
 };
+
+class ChromeDevtoolsMcpPreflightError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ChromeDevtoolsMcpPreflightError';
+  }
+}
 
 function parseArgs(): { configPath: string } {
   const index = process.argv.indexOf('--config');
@@ -169,6 +179,52 @@ function cleanEnv(env: NodeJS.ProcessEnv, overrides: Record<string, string> = {}
     ...result,
     ...overrides
   };
+}
+
+function npmCommand(): string {
+  return process.platform === 'win32' ? 'npm.cmd' : 'npm';
+}
+
+function usesChromeDevtoolsMcpPackage(config: BridgeConfig['chromeMcp']): boolean {
+  if (!config) return true;
+  return [config.command, ...config.args].join(' ').includes('chrome-devtools-mcp');
+}
+
+function preinstallChromeDevtoolsMcp(env: Record<string, string>): void {
+  const result = spawnSync(
+    npmCommand(),
+    ['exec', '--yes', '--package', CHROME_DEVTOOLS_MCP_PACKAGE, '--', 'node', '-e', 'process.stdout.write("ok")'],
+    {
+      cwd: process.cwd(),
+      env,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS,
+      windowsHide: true
+    }
+  );
+
+  if (result.error) {
+    throw new ChromeDevtoolsMcpPreflightError(
+      `Chrome DevTools MCP preflight failed before reading ERP login token. Tried to resolve ${CHROME_DEVTOOLS_MCP_PACKAGE} through npm, but npm failed: ${result.error.message}`
+    );
+  }
+
+  if (result.status !== 0) {
+    throw new ChromeDevtoolsMcpPreflightError(
+      [
+        `Chrome DevTools MCP preflight failed before reading ERP login token. Tried to auto-install/resolve ${CHROME_DEVTOOLS_MCP_PACKAGE} through npm.`,
+        result.stderr?.trim() ? `stderr: ${result.stderr.trim()}` : undefined,
+        result.stdout?.trim() ? `stdout: ${result.stdout.trim()}` : undefined
+      ]
+        .filter(Boolean)
+        .join('\n')
+    );
+  }
+}
+
+function isChromeDevtoolsMcpPreflightError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'ChromeDevtoolsMcpPreflightError';
 }
 
 function normalizeCallToolResult(result: Awaited<ReturnType<Client['callTool']>>): CallToolResult {
@@ -291,6 +347,7 @@ function isAuthFailureError(error: unknown): boolean {
 class ProductTokenBridge {
   private chromeClient?: Client;
   private cachedToken?: CachedBrowserToken;
+  private chromeDevtoolsMcpPreflight?: Promise<void>;
   private readonly uploadCache = new Map<string, CachedOssUpload>();
 
   constructor(private readonly config: BridgeConfig) {}
@@ -541,6 +598,7 @@ class ProductTokenBridge {
     if (this.chromeClient) return this.chromeClient;
 
     const chromeConfig = this.config.chromeMcp || DEFAULT_CHROME_MCP;
+    await this.ensureChromeDevtoolsMcp(chromeConfig);
     const transport = new StdioClientTransport({
       command: chromeConfig.command,
       args: chromeConfig.args,
@@ -550,6 +608,22 @@ class ProductTokenBridge {
     await client.connect(transport);
     this.chromeClient = client;
     return client;
+  }
+
+  private async ensureChromeDevtoolsMcp(chromeConfig: NonNullable<BridgeConfig['chromeMcp']>): Promise<void> {
+    if (!usesChromeDevtoolsMcpPackage(chromeConfig)) return;
+
+    this.chromeDevtoolsMcpPreflight ??= Promise.resolve()
+      .then(() => {
+        const env = cleanEnv(process.env, chromeConfig.env || {});
+        preinstallChromeDevtoolsMcp(env);
+      })
+      .catch((error) => {
+        this.chromeDevtoolsMcpPreflight = undefined;
+        throw error;
+      });
+
+    await this.chromeDevtoolsMcpPreflight;
   }
 
   private getSingleText(result: Awaited<ReturnType<Client['callTool']>>): string {
@@ -603,7 +677,11 @@ async function main(): Promise<void> {
       } catch (error) {
         return textResult({
           ok: false,
+          code: isChromeDevtoolsMcpPreflightError(error) ? 'CHROME_DEVTOOLS_MCP_UNAVAILABLE' : 'PRODUCT_AUTH_STATUS_FAILED',
           message: error instanceof Error ? error.message : String(error),
+          recoverableAction: isChromeDevtoolsMcpPreflightError(error)
+            ? 'Allow npm/npx network access, configure npm proxy if needed, then retry product_auth_status.'
+            : undefined,
           projectUrl: config.projectUrl,
           tokenStorageKey: config.tokenStorageKey,
           remoteMcpUrl: config.remoteMcpUrl
