@@ -98,13 +98,15 @@ interface BrowserTokenPayload {
   origin?: string;
   hasToken?: boolean;
   token?: string;
+  readError?: string;
+  readErrorName?: string;
 }
 
 const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.10';
+const LOCAL_BRIDGE_VERSION = '0.1.11';
 const DEFAULT_CLIENT_ID = 'e5cd7e4891bf95d1d19206ce24a7b32e';
 
 const POSIX_PATH_ENTRIES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
@@ -645,21 +647,12 @@ class ProductTokenBridge {
       throw new Error(`No Chrome tab matched configured project URL: ${this.config.projectUrl}`);
     }
 
-    if (!page.selected) {
-      await chrome.callTool({
-        name: 'select_page',
-        arguments: {
-          pageId: page.id,
-          bringToFront: false
-        }
-      });
-    }
-
-    const tokenPayload = await this.readChromeTokenPayload(chrome);
+    const tokenPayload = await this.readChromeTokenFromMatchedPage(chrome, page);
 
     if (!tokenPayload.hasToken || !tokenPayload.token) {
+      const readError = tokenPayload.readError ? ` localStorage read error: ${tokenPayload.readError}` : '';
       throw new Error(
-        `Chrome tab ${tokenPayload.href || page.url} does not contain localStorage.${this.config.tokenStorageKey}. Please login in Chrome first.`
+        `Chrome tab ${tokenPayload.href || page.url} does not contain localStorage.${this.config.tokenStorageKey}. Please login in Chrome first.${readError}`
       );
     }
 
@@ -687,18 +680,70 @@ class ProductTokenBridge {
       arguments: {
         function: `() => {
           const key = ${JSON.stringify(this.config.tokenStorageKey)};
-          const token = window.localStorage.getItem(key);
-          return {
-            href: location.href,
-            origin: location.origin,
-            hasToken: Boolean(token),
-            token
-          };
+          try {
+            const token = window.localStorage.getItem(key);
+            return {
+              href: location.href,
+              origin: location.origin,
+              hasToken: Boolean(token),
+              token
+            };
+          } catch (error) {
+            return {
+              href: location.href,
+              origin: location.origin,
+              hasToken: false,
+              readError: error instanceof Error ? error.message : String(error),
+              readErrorName: error instanceof Error ? error.name : undefined
+            };
+          }
         }`
       }
     });
 
     return extractJsonFromChromeText(this.getSingleText(tokenResult)) as BrowserTokenPayload;
+  }
+
+  private async readChromeTokenFromMatchedPage(chrome: Client, page: ChromePage): Promise<BrowserTokenPayload> {
+    if (!page.selected) {
+      await chrome.callTool({
+        name: 'select_page',
+        arguments: {
+          pageId: page.id,
+          bringToFront: false
+        }
+      });
+    }
+
+    let tokenPayload = await this.readChromeTokenPayload(chrome);
+    if (tokenPayload.href && isMatchingProjectPage(this.config, tokenPayload.href)) {
+      return tokenPayload;
+    }
+
+    await chrome.callTool({
+      name: 'select_page',
+      arguments: {
+        pageId: page.id,
+        bringToFront: true
+      }
+    });
+
+    tokenPayload = await this.readChromeTokenPayload(chrome);
+    if (tokenPayload.href && isMatchingProjectPage(this.config, tokenPayload.href)) {
+      return tokenPayload;
+    }
+
+    throw new Error(
+      [
+        'Chrome page context mismatch while reading ERP login token.',
+        `matchedPageId=${page.id}`,
+        `matchedPageUrl=${page.url}`,
+        `evaluatedUrl=${tokenPayload.href || '<unknown>'}`,
+        `projectUrl=${this.config.projectUrl}`,
+        `matchUrlPrefixes=${(this.config.matchUrlPrefixes?.length ? this.config.matchUrlPrefixes : [this.config.projectUrl]).join(',')}`,
+        'This means Chrome DevTools MCP listed the ERP tab, but evaluate_script ran in a different page context.'
+      ].join(' ')
+    );
   }
 
   private cacheBrowserToken(tokenPayload: BrowserTokenPayload, fallbackPageUrl: string): BrowserToken {
@@ -1222,12 +1267,17 @@ async function main(): Promise<void> {
     }
   );
 
-  process.on('SIGINT', () => {
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     bridge.close().finally(() => process.exit(0));
-  });
-  process.on('SIGTERM', () => {
-    bridge.close().finally(() => process.exit(0));
-  });
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+  process.stdin.on('end', shutdown);
+  process.stdin.on('close', shutdown);
 
   await server.connect(new StdioServerTransport());
 }
