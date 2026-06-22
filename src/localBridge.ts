@@ -84,11 +84,18 @@ interface CachedOssUpload {
   reuseCount: number;
 }
 
+interface BrowserTokenPayload {
+  href?: string;
+  origin?: string;
+  hasToken?: boolean;
+  token?: string;
+}
+
 const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.4';
+const LOCAL_BRIDGE_VERSION = '0.1.5';
 
 const DEFAULT_CHROME_MCP = {
   command: 'cmd',
@@ -532,9 +539,21 @@ class ProductTokenBridge {
     await this.ensureChromeDevtoolsMcp(chromeConfig);
 
     let chrome: Client;
-    let pagesResult: Awaited<ReturnType<Client['callTool']>>;
     try {
       chrome = await this.getChromeClient();
+      const selectedPageToken = await this.tryGetTokenFromSelectedChromePage(chrome);
+      if (selectedPageToken) return selectedPageToken;
+    } catch (error) {
+      if (isPotentialChromeRemoteDebuggingError(error)) {
+        throw new ChromeRemoteDebuggingNotAllowedError(
+          `Chrome DevTools MCP is installed but could not connect to Chrome. Open chrome://inspect/#remote-debugging in Chrome and enable "Allow remote debugging for this browser instance". Original error: ${error instanceof Error ? error.message : String(error)}`
+        );
+      }
+      throw error;
+    }
+
+    let pagesResult: Awaited<ReturnType<Client['callTool']>>;
+    try {
       pagesResult = await chrome.callTool({ name: 'list_pages', arguments: {} });
     } catch (error) {
       if (isPotentialChromeRemoteDebuggingError(error)) {
@@ -566,14 +585,43 @@ class ProductTokenBridge {
       throw new Error(`No Chrome tab matched configured project URL: ${this.config.projectUrl}`);
     }
 
-    await chrome.callTool({
-      name: 'select_page',
-      arguments: {
-        pageId: page.id,
-        bringToFront: false
-      }
-    });
+    if (!page.selected) {
+      await chrome.callTool({
+        name: 'select_page',
+        arguments: {
+          pageId: page.id,
+          bringToFront: false
+        }
+      });
+    }
 
+    const tokenPayload = await this.readChromeTokenPayload(chrome);
+
+    if (!tokenPayload.hasToken || !tokenPayload.token) {
+      throw new Error(
+        `Chrome tab ${tokenPayload.href || page.url} does not contain localStorage.${this.config.tokenStorageKey}. Please login in Chrome first.`
+      );
+    }
+
+    return this.cacheBrowserToken(tokenPayload, page.url);
+  }
+
+  private async tryGetTokenFromSelectedChromePage(chrome: Client): Promise<BrowserToken | undefined> {
+    let tokenPayload: BrowserTokenPayload;
+    try {
+      tokenPayload = await this.readChromeTokenPayload(chrome);
+    } catch (error) {
+      if (isPotentialChromeRemoteDebuggingError(error)) throw error;
+      return undefined;
+    }
+
+    if (!tokenPayload.href || !isMatchingProjectPage(this.config, tokenPayload.href)) return undefined;
+    if (!tokenPayload.hasToken || !tokenPayload.token) return undefined;
+
+    return this.cacheBrowserToken(tokenPayload, tokenPayload.href);
+  }
+
+  private async readChromeTokenPayload(chrome: Client): Promise<BrowserTokenPayload> {
     const tokenResult = await chrome.callTool({
       name: 'evaluate_script',
       arguments: {
@@ -589,24 +637,20 @@ class ProductTokenBridge {
         }`
       }
     });
-    const tokenPayload = extractJsonFromChromeText(this.getSingleText(tokenResult)) as {
-      href?: string;
-      origin?: string;
-      hasToken?: boolean;
-      token?: string;
-    };
 
-    if (!tokenPayload.hasToken || !tokenPayload.token) {
-      throw new Error(
-        `Chrome tab ${tokenPayload.href || page.url} does not contain localStorage.${this.config.tokenStorageKey}. Please login in Chrome first.`
-      );
+    return extractJsonFromChromeText(this.getSingleText(tokenResult)) as BrowserTokenPayload;
+  }
+
+  private cacheBrowserToken(tokenPayload: BrowserTokenPayload, fallbackPageUrl: string): BrowserToken {
+    if (!tokenPayload.token) {
+      throw new Error(`Chrome tab ${tokenPayload.href || fallbackPageUrl} does not contain localStorage.${this.config.tokenStorageKey}.`);
     }
-
     const now = Date.now();
+    const pageUrl = tokenPayload.href || fallbackPageUrl;
     this.cachedToken = {
       token: tokenPayload.token,
-      pageUrl: tokenPayload.href || page.url,
-      origin: tokenPayload.origin || new URL(page.url).origin,
+      pageUrl,
+      origin: tokenPayload.origin || new URL(pageUrl).origin,
       fetchedAtMs: now,
       expiresAtMs: now + TOKEN_CACHE_TTL_MS
     };

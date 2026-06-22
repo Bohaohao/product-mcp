@@ -239,7 +239,7 @@ product-token-bridge.config.json
 
 第一次需要读取 Chrome 登录态时，bridge 会先通过 npm 预检并自动解析 `chrome-devtools-mcp@latest`。如果当前机器缺少该 npm 包但 npm 网络可用，会自动安装/缓存后继续；如果 npm、网络或代理不可用，`product_auth_status` 会返回 `CHROME_DEVTOOLS_MCP_UNAVAILABLE` 和恢复建议。
 
-没有有效 token 缓存时，bridge 会正常尝试连接 Chrome 并读取 ERP 页面的 token。只有在 `chrome-devtools-mcp` 已可用但无法连接 Chrome 时，才返回 `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` 和远程调试操作步骤；如果 Chrome 可连接但 ERP 未登录或 token 不存在，则按登录态缺失处理。
+没有有效 token 缓存时，bridge 会正常尝试连接 Chrome 并读取 ERP 页面的 token。它会优先直接读取当前选中的 Chrome 页面；如果当前页不是 ERP 页面或没有 token，才回退到页面列表匹配。回退时，如果目标 ERP 页已经是选中页，会跳过重复选中动作，减少 Chrome 远程调试确认。只有在 `chrome-devtools-mcp` 已可用但无法连接 Chrome 时，才返回 `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` 和远程调试操作步骤；如果 Chrome 可连接但 ERP 未登录或 token 不存在，则按登录态缺失处理。
 
 缓存失效规则：
 
@@ -308,7 +308,7 @@ location /healthz {
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.4",
+    "version": "0.1.5",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",
@@ -824,7 +824,7 @@ When the cache is valid, later tool calls reuse the token and avoid reopening th
 
 The first time Chrome login state is needed, the bridge preflights and resolves `chrome-devtools-mcp@latest` through npm. If the package is missing and npm network access works, it is installed/cached automatically before continuing. If npm, network, or proxy access fails, `product_auth_status` returns `CHROME_DEVTOOLS_MCP_UNAVAILABLE` with recovery guidance.
 
-When there is no valid token cache, the bridge normally tries to connect to Chrome and read the ERP page token. It returns `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` with remote-debugging steps only when `chrome-devtools-mcp` is available but cannot connect to Chrome. If Chrome is reachable but ERP is not logged in or no token exists, handle it as a missing login state.
+When there is no valid token cache, the bridge normally tries to connect to Chrome and read the ERP page token. It first tries to read the currently selected Chrome page directly. If that page is not an ERP page or has no token, it falls back to page-list matching. During fallback, an already selected ERP page is not selected again, reducing Chrome remote-debugging confirmations. It returns `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` with remote-debugging steps only when `chrome-devtools-mcp` is available but cannot connect to Chrome. If Chrome is reachable but ERP is not logged in or no token exists, handle it as a missing login state.
 
 Cache invalidation rules:
 
@@ -893,7 +893,7 @@ Example success result:
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.4",
+    "version": "0.1.5",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",
