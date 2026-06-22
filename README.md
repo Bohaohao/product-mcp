@@ -308,7 +308,7 @@ location /healthz {
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.2",
+    "version": "0.1.3",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",
@@ -332,7 +332,7 @@ location /healthz {
   "requiresUserAction": true,
   "remoteDebuggingSettingsUrl": "chrome://inspect/#remote-debugging",
   "steps": [
-    "1. 打开本机 Chrome 浏览器，确认使用的是 Chrome，不是 Edge 或其它浏览器。",
+    "1. 确认使用的是 Chrome浏览器，不是 Edge浏览器。",
     "2. 在 Chrome 地址栏打开：chrome://inspect/#remote-debugging",
     "3. 勾选或开启 “Allow remote debugging for this browser instance”。",
     "4. 回到或新开 ERP 页面：https://test.eysscm.com/erp/commodity/commodity",
@@ -893,7 +893,7 @@ Example success result:
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.2",
+    "version": "0.1.3",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",

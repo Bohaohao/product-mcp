@@ -93,7 +93,7 @@ const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.2';
+const LOCAL_BRIDGE_VERSION = '0.1.3';
 
 const DEFAULT_CHROME_MCP = {
   command: 'cmd',
@@ -349,7 +349,7 @@ function chromeRemoteDebuggingGuidance(config: ResolvedBridgeConfig) {
       'Product MCP 需要通过 chrome-devtools-mcp 读取你已登录 ERP 页面中的 localStorage.Admin-Token。当前 chrome-devtools-mcp 无法连接 Chrome，通常是 Chrome 的远程调试开关未允许，或目标 Chrome 实例未打开。',
     remoteDebuggingSettingsUrl: 'chrome://inspect/#remote-debugging',
     steps: [
-      '1. 打开本机 Chrome 浏览器，确认使用的是 Chrome，不是 Edge 或其它浏览器。',
+      '1. 确认使用的是 Chrome浏览器，不是 Edge浏览器。',
       '2. 在 Chrome 地址栏打开：chrome://inspect/#remote-debugging',
       '3. 勾选或开启 “Allow remote debugging for this browser instance”。',
       `4. 回到或新开 ERP 页面：${config.projectUrl}`,
