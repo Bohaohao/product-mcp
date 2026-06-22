@@ -17,7 +17,7 @@ Product MCP 是一个面向 ERP 商品业务的 MCP 服务，包含远程 HTTP M
 
 ### 你应该做什么
 
-- Codex/本地资料包场景优先连接本地 bridge 作为统一入口；分类、供应商、区域、字典、创建、详情等 ERP 业务工具由 bridge 代理到远程 MCP。
+- Codex/本地资料包场景优先连接本地 bridge 作为统一入口；分类、供应商、区域、字典、详情等紧凑查询由 bridge 代理到远程 MCP，创建商品这类可能很大的写入 payload 由本地 bridge 直连 ERP 后端。
 - 需要确认本地 bridge 实际加载的环境、`projectUrl`、`matchUrlPrefixes` 或配置文件时，先调用 `product_bridge_config_status`；它不会读取 Chrome、token 或远程 ERP。
 - 先调用 `product_auth_status`，它会预检并自动预热 `chrome-devtools-mcp`，再确认本地 Chrome 中存在 ERP 登录态。
 - 只有当 `product_auth_status` 返回 `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` 时，才按返回步骤提示用户在 Chrome 打开 `chrome://inspect/#remote-debugging` 并勾选 “Allow remote debugging for this browser instance”，完成后重新调用 `product_auth_status`。
@@ -65,7 +65,7 @@ Product MCP 提供三类能力：
 
 ### 本地与远程边界
 
-推荐边界是：本地 bridge 做用户机器相关的事情，远程 MCP 做 ERP 后端业务相关的事情。Codex 用户通常只需要配置本地 bridge；bridge 会自动读取 Chrome 登录态，并在需要分类、供应商、创建商品等业务能力时代理远程 MCP。
+推荐边界是：本地 bridge 做用户机器相关的事情和较大的创建请求，远程 MCP 做紧凑的 ERP 后端查询/详情能力。Codex 用户通常只需要配置本地 bridge；bridge 会自动读取 Chrome 登录态，紧凑查询按需代理远程 MCP，创建商品则由本地 bridge 直连 ERP 后端。
 
 | 场景 | 应使用 | 原因 |
 | --- | --- | --- |
@@ -73,9 +73,10 @@ Product MCP 提供三类能力：
 | 本地资料包、`D:\...` 路径、图片裁剪 | 本地 bridge | 远程服务不能读取用户磁盘 |
 | 大视频、图片、PDF、3D 文件上传 | 本地 bridge 的 `product_upload_file` | 本地校验后直传 OSS，避免远程 HTTP MCP 的请求体大小和超时限制 |
 | 分类、单位、供应商、区域、字典查询 | 远程 MCP，通常由本地 bridge 代理 | 后端数据权威，适合集中维护 |
-| 创建商品、查询详情 | 远程 MCP，通常由本地 bridge 代理 | 写入 ERP 业务系统，应走统一后端入口 |
+| 创建商品 | 本地 bridge 直连 ERP 后端 | 避免合法大字段触发远端 MCP 网关请求体限制 |
+| 查询详情 | 远程 MCP，通常由本地 bridge 代理 | 紧凑后端查询适合远端 MCP |
 
-因此，“优先使用远程 MCP”只适用于 ERP 业务查询和写入，不适用于本地文件传输。商品创建时应先把本地文件通过 `product_upload_file` 上传为 OSS URL，再把 URL 传给 `product_create`。
+因此，“优先使用远程 MCP”只适用于紧凑的 ERP 业务查询/详情，不适用于本地文件传输，也不适用于可能很大的商品创建 payload。商品创建时应先把本地文件通过 `product_upload_file` 上传为 OSS URL，再把 URL 传给 `product_create`；本地 bridge 会直连 ERP 后端提交创建请求。
 
 ## 架构
 
@@ -104,7 +105,7 @@ MCP Client
 | `product_list_regions` | 只读 | 查询适用区域 |
 | `product_get_dict` | 只读 | 查询系统字典 |
 | `product_get_detail` | 只读 | 创建后查询商品详情，用于验收 |
-| `product_create` | 写入 | 通过 ERP 后端创建真实商品 |
+| `product_create` | 写入 | 本地 bridge 读取 Chrome 登录态后直连 ERP 后端创建真实商品，避免远端 MCP 网关请求体大小限制 |
 
 ### 本地 Bridge 工具
 
@@ -275,8 +276,8 @@ curl http://127.0.0.1:8787/healthz
 
 ```bash
 cd product-mcp
-docker build -t product-mcp:0.1.6 .
-docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.6
+docker build -t product-mcp:0.1.7 .
+docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.7
 ```
 
 如需 HTTPS，请放到公司网关或 Nginx 后面。
@@ -308,7 +309,7 @@ location /healthz {
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.6",
+    "version": "0.1.7",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",
@@ -467,6 +468,8 @@ richTextAttachment
 
 ### `product_create`
 
+本地 bridge 版本的 `product_create` 会读取 Chrome 登录态，并在本机直接调用 ERP 后端创建接口，不再把完整创建 payload 转发给远端 MCP 网关。这样长图文、销售支持、竞品对比、案例等合法大字段不会因为远端 MCP 网关请求体限制触发 `Payload Too Large`。
+
 写入操作。通过以下后端接口创建真实 ERP 商品：
 
 ```text
@@ -602,7 +605,7 @@ If you are an AI Agent, read this section first.
 
 ### What You Should Do
 
-- In Codex/local package workflows, connect to the local bridge as the single entry point; let it proxy ERP business tools such as categories, suppliers, regions, dictionaries, creation, and detail lookup to the remote MCP.
+- In Codex/local package workflows, connect to the local bridge as the single entry point. It proxies compact lookup/detail tools to the remote MCP and handles large product creation directly against the ERP backend to avoid remote MCP gateway body limits.
 - To confirm the local bridge's effective environment, `projectUrl`, `matchUrlPrefixes`, or config path, call `product_bridge_config_status` first. It does not read Chrome, the token, or the remote ERP backend.
 - Call `product_auth_status` first. It preflights and warms `chrome-devtools-mcp`, then confirms that the ERP login state is available in local Chrome.
 - Only when `product_auth_status` returns `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED`, stop the task, tell the user to open `chrome://inspect/#remote-debugging` in Chrome and enable "Allow remote debugging for this browser instance", then call `product_auth_status` again after the user completes those steps.
@@ -650,7 +653,7 @@ Product MCP provides three capability groups:
 
 ### Local And Remote Boundary
 
-The recommended boundary is: the local bridge handles things that exist on the user's machine, and the remote MCP handles ERP backend business operations. Codex users usually only need to configure the local bridge; the bridge reads the Chrome login state and proxies remote MCP business tools when it needs categories, suppliers, product creation, or detail lookup.
+The recommended boundary is: the local bridge handles things that exist on the user's machine and large create payloads, while the remote MCP handles compact ERP backend lookup/detail operations. Codex users usually only need to configure the local bridge; the bridge reads the Chrome login state, proxies compact remote MCP tools when needed, and calls the ERP backend directly for product creation.
 
 | Scenario | Use | Why |
 | --- | --- | --- |
@@ -658,9 +661,10 @@ The recommended boundary is: the local bridge handles things that exist on the u
 | Local product packages, `D:\...` paths, image cropping | Local bridge | The remote service cannot read the user's disk |
 | Large videos, images, PDFs, 3D files | `product_upload_file` in the local bridge | The file is validated locally and uploaded directly to OSS, avoiding remote HTTP MCP request-size and timeout limits |
 | Category, unit, supplier, region, and dictionary lookup | Remote MCP, usually proxied by the local bridge | Backend reference data is authoritative and centrally maintained |
-| Product creation and detail lookup | Remote MCP, usually proxied by the local bridge | ERP writes should go through the unified backend entry point |
+| Product creation | Local bridge direct ERP backend call | Avoids remote MCP gateway body limits for valid large create payloads |
+| Product detail lookup | Remote MCP, usually proxied by the local bridge | Compact backend lookup suitable for the remote MCP |
 
-So "prefer the remote MCP" applies to ERP business reads and writes, not local file transfer. For product creation, upload local files through `product_upload_file` first, then pass the returned OSS URLs to `product_create`.
+For product creation, upload local files through `product_upload_file` first, then pass the returned OSS URLs to `product_create`. The local bridge will submit the create request directly to the ERP backend instead of routing the full payload through the remote MCP gateway.
 
 ## Architecture
 
@@ -689,7 +693,7 @@ These tools run on the remote MCP Server. Requests must carry the current user's
 | `product_list_regions` | Read | Query applicable regions |
 | `product_get_dict` | Read | Query system dictionary values |
 | `product_get_detail` | Read | Query product details after creation for verification |
-| `product_create` | Write | Create a real product through the ERP backend |
+| `product_create` | Write | Read Chrome login state in the local bridge and call the ERP backend directly, avoiding remote MCP gateway request-size limits |
 
 ### Local Bridge Tools
 
@@ -860,8 +864,8 @@ curl http://127.0.0.1:8787/healthz
 
 ```bash
 cd product-mcp
-docker build -t product-mcp:0.1.6 .
-docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.6
+docker build -t product-mcp:0.1.7 .
+docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.7
 ```
 
 For HTTPS, place this service behind a company gateway or Nginx.
@@ -893,7 +897,7 @@ Example success result:
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.6",
+    "version": "0.1.7",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",
@@ -1051,6 +1055,8 @@ richTextAttachment
 ```
 
 ### `product_create`
+
+The local-bridge `product_create` reads Chrome login state and calls the ERP backend create endpoint directly from the user's machine. It no longer forwards the full create payload through the remote MCP gateway, so valid large fields such as rich sales support, competitor comparisons, media metadata, and customer cases do not hit remote MCP `Payload Too Large` limits.
 
 Write operation. Creates a real ERP product through:
 

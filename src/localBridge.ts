@@ -8,9 +8,12 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import * as z from 'zod/v4';
+import { BackendClient } from './backendClient.js';
+import type { ProductMcpConfig } from './config.js';
+import { toErrorPayload } from './errors.js';
 import { parsePages, type ChromePage } from './chromePages.js';
 import { productListCategoriesInputSchema } from './tools/categories.js';
-import { productCreateInputSchema } from './tools/createProduct.js';
+import { productCreate, productCreateInputSchema } from './tools/createProduct.js';
 import {
   productGetCategoryConfigInputSchema,
   productGetDictInputSchema,
@@ -56,6 +59,8 @@ interface ResolvedBridgeConfig extends BridgeConfig {
   projectUrl: string;
   tokenStorageKey: string;
   remoteMcpUrl: string;
+  backendBaseUrl: string;
+  clientId: string;
   selectedEnvironment?: string;
 }
 
@@ -95,7 +100,8 @@ const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.6';
+const LOCAL_BRIDGE_VERSION = '0.1.7';
+const DEFAULT_CLIENT_ID = 'e5cd7e4891bf95d1d19206ce24a7b32e';
 
 const DEFAULT_CHROME_MCP = {
   command: 'cmd',
@@ -195,9 +201,13 @@ function resolveEnvironmentConfig(config: BridgeConfig): ResolvedBridgeConfig {
       firstEnv(['PRODUCT_MCP_BRIDGE_BACKEND_BASE_URL', 'PRODUCT_MCP_BACKEND_BASE_URL']) ||
       environmentConfig?.backendBaseUrl ||
       config.backendBaseUrl,
-    clientId: process.env.PRODUCT_MCP_CLIENT_ID || config.clientId,
+    clientId: process.env.PRODUCT_MCP_CLIENT_ID || config.clientId || DEFAULT_CLIENT_ID,
     language: process.env.PRODUCT_MCP_LANGUAGE || config.language
   };
+
+  if (!resolved.backendBaseUrl) {
+    throw new Error('Bridge config missing backendBaseUrl for the selected environment.');
+  }
 
   return resolved as ResolvedBridgeConfig;
 }
@@ -211,6 +221,10 @@ function textResult(payload: unknown) {
       }
     ]
   };
+}
+
+function createBridgeRequestId(prefix = 'bridge'): string {
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
 function bridgeConfigStatus(config: ResolvedBridgeConfig, configPath: string) {
@@ -737,6 +751,50 @@ class ProductTokenBridge {
     }
   }
 
+  async createProduct(input: unknown, requestId: string): Promise<CallToolResult> {
+    try {
+      return await this.createProductOnce(input, requestId, false);
+    } catch (error) {
+      if (!isAuthFailureError(error)) throw error;
+      if (!this.canRefreshTokenAfterAuthFailure()) throw error;
+    }
+
+    this.noteAuthFailureRefresh();
+    this.invalidateTokenCache();
+    return await this.createProductOnce(input, requestId, true);
+  }
+
+  private async createProductOnce(input: unknown, requestId: string, forceRefreshToken: boolean): Promise<CallToolResult> {
+    const browserToken = await this.getBrowserToken({ forceRefresh: forceRefreshToken });
+    const backend = new BackendClient(this.localBackendConfig(), {
+      authorization: asBearer(browserToken.token),
+      requestId,
+      language: this.config.language || 'zh_CN'
+    });
+    const result = await productCreate(backend, input, requestId);
+
+    return textResult({
+      ...result,
+      transport: {
+        mode: 'local_bridge_backend',
+        reason: 'product_create uses the local bridge to call the ERP backend directly and avoid the remote MCP gateway request-size limit.',
+        remoteMcpBypassed: true
+      }
+    });
+  }
+
+  private localBackendConfig(): ProductMcpConfig {
+    return {
+      port: 0,
+      host: '127.0.0.1',
+      path: '/mcp',
+      backendBaseUrl: this.config.backendBaseUrl.replace(/\/+$/, ''),
+      clientId: this.config.clientId || DEFAULT_CLIENT_ID,
+      requestTimeoutMs: 50_000,
+      defaultLanguage: this.config.language || 'zh_CN'
+    };
+  }
+
   async uploadLocalFile(input: unknown) {
     const parsedInput = productUploadFileObjectSchema.parse(input);
     const policy = getUploadPolicy(parsedInput.usage);
@@ -1001,14 +1059,22 @@ async function main(): Promise<void> {
     {
       title: 'Create product',
       description:
-        'Read Admin-Token from the configured Chrome project tab, then create a real product through the remote Product MCP. Use product_upload_file first for local files, and pass only returned OSS URLs plus business fields here; never pass local paths, file bytes, or large base64 payloads.',
+        'Read Admin-Token from the configured Chrome project tab, then create a real product by calling the ERP backend directly from the local bridge. This avoids the remote MCP gateway request-size limit for large but valid product payloads. Use product_upload_file first for local files, and pass only returned OSS URLs plus business fields here; never pass local paths, file bytes, or large base64 payloads.',
       inputSchema: productCreateInputSchema
     },
     async (input) => {
+      const requestId = createBridgeRequestId('product_create');
       try {
-        return await bridge.callRemoteTool('product_create', input);
+        return await bridge.createProduct(input, requestId);
       } catch (error) {
-        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        if (
+          isChromeDevtoolsMcpPreflightError(error) ||
+          isChromeRemoteDebuggingNotAllowedError(error)
+        ) {
+          return textResult(bridgeErrorPayload(error, config, 'PRODUCT_CREATE_FAILED'));
+        }
+
+        return textResult(toErrorPayload(error, requestId));
       }
     }
   );
