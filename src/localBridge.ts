@@ -95,7 +95,7 @@ const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.5';
+const LOCAL_BRIDGE_VERSION = '0.1.6';
 
 const DEFAULT_CHROME_MCP = {
   command: 'cmd',
@@ -273,8 +273,18 @@ function cleanEnv(env: NodeJS.ProcessEnv, overrides: Record<string, string> = {}
   };
 }
 
-function npmCommand(): string {
-  return process.platform === 'win32' ? 'npm.cmd' : 'npm';
+function npmExecCommand(args: string[]): { command: string; args: string[] } {
+  if (process.platform === 'win32') {
+    return {
+      command: 'cmd',
+      args: ['/d', '/s', '/c', 'npm', ...args]
+    };
+  }
+
+  return {
+    command: 'npm',
+    args
+  };
 }
 
 function usesChromeDevtoolsMcpPackage(config: BridgeConfig['chromeMcp']): boolean {
@@ -283,18 +293,24 @@ function usesChromeDevtoolsMcpPackage(config: BridgeConfig['chromeMcp']): boolea
 }
 
 function preinstallChromeDevtoolsMcp(env: Record<string, string>): void {
-  const result = spawnSync(
-    npmCommand(),
-    ['exec', '--yes', '--package', CHROME_DEVTOOLS_MCP_PACKAGE, '--', 'node', '-e', 'process.stdout.write("ok")'],
-    {
-      cwd: process.cwd(),
-      env,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS,
-      windowsHide: true
-    }
-  );
+  const npmExec = npmExecCommand([
+    'exec',
+    '--yes',
+    '--package',
+    CHROME_DEVTOOLS_MCP_PACKAGE,
+    '--',
+    'node',
+    '-e',
+    'process.stdout.write("ok")'
+  ]);
+  const result = spawnSync(npmExec.command, npmExec.args, {
+    cwd: process.cwd(),
+    env,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS,
+    windowsHide: true
+  });
 
   if (result.error) {
     throw new ChromeDevtoolsMcpPreflightError(

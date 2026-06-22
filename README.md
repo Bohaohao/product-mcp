@@ -275,8 +275,8 @@ curl http://127.0.0.1:8787/healthz
 
 ```bash
 cd product-mcp
-docker build -t product-mcp:0.1.0 .
-docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.0
+docker build -t product-mcp:0.1.6 .
+docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.6
 ```
 
 如需 HTTPS，请放到公司网关或 Nginx 后面。
@@ -308,7 +308,7 @@ location /healthz {
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.5",
+    "version": "0.1.6",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",
@@ -860,8 +860,8 @@ curl http://127.0.0.1:8787/healthz
 
 ```bash
 cd product-mcp
-docker build -t product-mcp:0.1.0 .
-docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.0
+docker build -t product-mcp:0.1.6 .
+docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.6
 ```
 
 For HTTPS, place this service behind a company gateway or Nginx.
@@ -893,7 +893,7 @@ Example success result:
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.5",
+    "version": "0.1.6",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",
