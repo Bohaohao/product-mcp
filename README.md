@@ -20,7 +20,7 @@ Product MCP 是一个面向 ERP 商品业务的 MCP 服务，包含远程 HTTP M
 - Codex/本地资料包场景优先连接本地 bridge 作为统一入口；分类、供应商、区域、字典、创建、详情等 ERP 业务工具由 bridge 代理到远程 MCP。
 - 需要确认本地 bridge 实际加载的环境、`projectUrl`、`matchUrlPrefixes` 或配置文件时，先调用 `product_bridge_config_status`；它不会读取 Chrome、token 或远程 ERP。
 - 先调用 `product_auth_status`，它会预检并自动预热 `chrome-devtools-mcp`，再确认本地 Chrome 中存在 ERP 登录态。
-- 只有当 `product_auth_status` 返回 `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` 时，才按返回步骤提示用户打开 Chrome 的 “Allow remote debugging for this browser instance”，完成后重新调用 `product_auth_status`。
+- 只有当 `product_auth_status` 返回 `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` 时，才按返回步骤提示用户在 Chrome 打开 `chrome://inspect/#remote-debugging` 并勾选 “Allow remote debugging for this browser instance”，完成后重新调用 `product_auth_status`。
 - 使用只读工具查询真实后端 ID，不要让用户手填分类、单位、供应商、区域等 ID。
 - 处理本地商品资料包时，先调用 `product_precheck_package`，再根据返回的 `uploadQueue` 调用 `product_upload_file`。
 - 调用 `product_upload_file` 时保留 `uploadQueue` 中的 `dedupeKey/sourceRelativePath/sourceLocalPath`，重复文件会复用第一次上传得到的 OSS URL。
@@ -308,7 +308,7 @@ location /healthz {
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",
@@ -330,12 +330,14 @@ location /healthz {
   "ok": false,
   "code": "CHROME_REMOTE_DEBUGGING_NOT_ALLOWED",
   "requiresUserAction": true,
+  "remoteDebuggingSettingsUrl": "chrome://inspect/#remote-debugging",
   "steps": [
     "1. 打开本机 Chrome 浏览器，确认使用的是 Chrome，不是 Edge 或其它浏览器。",
-    "2. 在 Chrome 中打开或切换到 ERP 页面：https://test.eysscm.com/erp/commodity/commodity",
-    "3. 确认 ERP 页面已登录；如果登录过期，请重新登录并刷新页面。",
-    "4. 当 Chrome 出现 “Allow remote debugging for this browser instance” 提示时，点击并选择 Allow/允许。",
-    "5. 完成后回到 Codex，重新检查登录态。"
+    "2. 在 Chrome 地址栏打开：chrome://inspect/#remote-debugging",
+    "3. 勾选或开启 “Allow remote debugging for this browser instance”。",
+    "4. 回到或新开 ERP 页面：https://test.eysscm.com/erp/commodity/commodity",
+    "5. 确认 ERP 页面已登录；如果登录过期，请重新登录并刷新页面。",
+    "6. 完成后回到 Codex，重新检查登录态。"
   ],
   "nextToolCall": {
     "name": "product_auth_status",
@@ -344,7 +346,7 @@ location /healthz {
 }
 ```
 
-AI 应等待用户完成上述操作后，再按 `nextToolCall` 继续。不要把“没有 token 缓存”直接解释成远程调试未开启。
+AI 应等待用户完成上述操作后，再按 `nextToolCall` 继续。不要把“没有 token 缓存”直接解释成远程调试未开启；遇到 `Could not find DevToolsActivePort` 时，应优先提示用户打开 `chrome://inspect/#remote-debugging` 并勾选允许项。
 
 成功结果示例：
 
@@ -603,7 +605,7 @@ If you are an AI Agent, read this section first.
 - In Codex/local package workflows, connect to the local bridge as the single entry point; let it proxy ERP business tools such as categories, suppliers, regions, dictionaries, creation, and detail lookup to the remote MCP.
 - To confirm the local bridge's effective environment, `projectUrl`, `matchUrlPrefixes`, or config path, call `product_bridge_config_status` first. It does not read Chrome, the token, or the remote ERP backend.
 - Call `product_auth_status` first. It preflights and warms `chrome-devtools-mcp`, then confirms that the ERP login state is available in local Chrome.
-- Only when `product_auth_status` returns `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED`, stop the task, show the returned steps for enabling Chrome "Allow remote debugging for this browser instance", and call `product_auth_status` again after the user completes those steps.
+- Only when `product_auth_status` returns `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED`, stop the task, tell the user to open `chrome://inspect/#remote-debugging` in Chrome and enable "Allow remote debugging for this browser instance", then call `product_auth_status` again after the user completes those steps.
 - Use read-only lookup tools to resolve real backend IDs. Do not ask the user to manually fill category, unit, supplier, or region IDs.
 - For a local product package, call `product_precheck_package` first, then call `product_upload_file` for items in the returned `uploadQueue`.
 - Preserve `dedupeKey/sourceRelativePath/sourceLocalPath` from each `uploadQueue` item when calling `product_upload_file`; repeated files reuse the first OSS URL.
@@ -891,7 +893,7 @@ Example success result:
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",
@@ -913,12 +915,14 @@ When `chrome-devtools-mcp` is installed but cannot connect to Chrome, the tool r
   "ok": false,
   "code": "CHROME_REMOTE_DEBUGGING_NOT_ALLOWED",
   "requiresUserAction": true,
+  "remoteDebuggingSettingsUrl": "chrome://inspect/#remote-debugging",
   "steps": [
     "1. Open local Chrome and make sure it is Chrome, not Edge or another browser.",
-    "2. Open or switch to the ERP page: https://test.eysscm.com/erp/commodity/commodity",
-    "3. Make sure the ERP page is logged in; if the session expired, log in again and refresh.",
-    "4. When Chrome shows “Allow remote debugging for this browser instance”, click it and choose Allow.",
-    "5. Return to Codex and check login state again."
+    "2. Open chrome://inspect/#remote-debugging in the Chrome address bar.",
+    "3. Enable “Allow remote debugging for this browser instance”.",
+    "4. Return to or open the ERP page: https://test.eysscm.com/erp/commodity/commodity",
+    "5. Make sure the ERP page is logged in; if the session expired, log in again and refresh.",
+    "6. Return to Codex and check login state again."
   ],
   "nextToolCall": {
     "name": "product_auth_status",
@@ -927,7 +931,7 @@ When `chrome-devtools-mcp` is installed but cannot connect to Chrome, the tool r
 }
 ```
 
-AI agents should wait until the user completes those steps before following `nextToolCall`. Do not treat a missing token cache by itself as a remote-debugging failure.
+AI agents should wait until the user completes those steps before following `nextToolCall`. Do not treat a missing token cache by itself as a remote-debugging failure. For `Could not find DevToolsActivePort`, tell the user to open `chrome://inspect/#remote-debugging` and enable the allow setting first.
 
 Example success result:
 

@@ -93,7 +93,7 @@ const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.1';
+const LOCAL_BRIDGE_VERSION = '0.1.2';
 
 const DEFAULT_CHROME_MCP = {
   command: 'cmd',
@@ -346,16 +346,18 @@ function chromeRemoteDebuggingGuidance(config: ResolvedBridgeConfig) {
   return {
     title: 'Chrome DevTools MCP 已安装，但无法连接本机 Chrome',
     reason:
-      'Product MCP 需要通过 chrome-devtools-mcp 读取你已登录 ERP 页面中的 localStorage.Admin-Token。当前 chrome-devtools-mcp 无法连接 Chrome，通常是 Chrome 未允许本次远程调试，或目标 Chrome 实例未打开。',
+      'Product MCP 需要通过 chrome-devtools-mcp 读取你已登录 ERP 页面中的 localStorage.Admin-Token。当前 chrome-devtools-mcp 无法连接 Chrome，通常是 Chrome 的远程调试开关未允许，或目标 Chrome 实例未打开。',
+    remoteDebuggingSettingsUrl: 'chrome://inspect/#remote-debugging',
     steps: [
       '1. 打开本机 Chrome 浏览器，确认使用的是 Chrome，不是 Edge 或其它浏览器。',
-      `2. 在 Chrome 中打开或切换到 ERP 页面：${config.projectUrl}`,
-      `3. 确认页面地址以这些前缀之一开头：${(config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl]).join(' , ')}`,
-      '4. 保持 ERP 页面已登录状态；如果登录过期，请先重新登录并刷新页面。',
-      '5. 当 Chrome 顶部、右上角或页面上出现 “Allow remote debugging for this browser instance” 提示时，点击它并选择 Allow/允许。',
-      '6. 如果暂时没有看到该提示，请保持 Chrome 打开，回到 Codex 再次触发登录检查；提示通常会在 chrome-devtools-mcp 尝试连接时出现。'
+      '2. 在 Chrome 地址栏打开：chrome://inspect/#remote-debugging',
+      '3. 勾选或开启 “Allow remote debugging for this browser instance”。',
+      `4. 回到或新开 ERP 页面：${config.projectUrl}`,
+      `5. 确认 ERP 页面地址以这些前缀之一开头：${(config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl]).join(' , ')}`,
+      '6. 保持 ERP 页面已登录状态；如果登录过期，请先重新登录并刷新页面。',
+      '7. 如果 chrome://inspect/#remote-debugging 页面没有出现该选项，请完全退出 Chrome 后重新打开 Chrome，再重复上述步骤。'
     ],
-    afterUserAction: '用户完成上述操作后，AI 应重新调用 product_auth_status；不需要额外传入调试确认参数。',
+    afterUserAction: '用户完成上述操作后，AI 应重新调用 product_auth_status；不需要额外传入调试确认参数。不要只提示等待弹窗，应优先引导用户检查 chrome://inspect/#remote-debugging。',
     nextToolCall: {
       name: 'product_auth_status',
       arguments: {}
@@ -558,7 +560,7 @@ class ProductTokenBridge {
     } catch (error) {
       if (isPotentialChromeRemoteDebuggingError(error)) {
         throw new ChromeRemoteDebuggingNotAllowedError(
-          `Chrome DevTools MCP is installed but could not connect to Chrome. Please make sure Chrome is open and allows remote debugging for this browser instance. Original error: ${error instanceof Error ? error.message : String(error)}`
+          `Chrome DevTools MCP is installed but could not connect to Chrome. Open chrome://inspect/#remote-debugging in Chrome and enable "Allow remote debugging for this browser instance". Original error: ${error instanceof Error ? error.message : String(error)}`
         );
       }
       throw error;
