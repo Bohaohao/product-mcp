@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import { once } from 'node:events';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import { parsePages } from '../dist/chromePages.js';
 import { createProductMcpExpressApp } from '../dist/server.js';
 
 const fakeBackendPort = Number(process.env.SMOKE_BACKEND_PORT || 18787);
@@ -199,7 +200,22 @@ function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
 
+function assertChromePageParsing() {
+  const oldFormat = parsePages('0: https://test.eysscm.com/erp/commodity/commodity [selected]');
+  assert(oldFormat[0]?.url === 'https://test.eysscm.com/erp/commodity/commodity', 'old Chrome page format parsing failed');
+  assert(oldFormat[0]?.selected === true, 'old Chrome page selected flag parsing failed');
+
+  const newFormat = parsePages('1: ERP 商品管理 (https://test.eysscm.com/erp/commodity/commodity)');
+  assert(newFormat[0]?.url === 'https://test.eysscm.com/erp/commodity/commodity', 'title plus URL Chrome page format parsing failed');
+
+  const newSelectedFormat = parsePages('2: ERP 商品管理 (https://test.eysscm.com/erp/commodity/commodity) [selected]');
+  assert(newSelectedFormat[0]?.url === 'https://test.eysscm.com/erp/commodity/commodity', 'selected title plus URL parsing failed');
+  assert(newSelectedFormat[0]?.selected === true, 'selected title plus URL flag parsing failed');
+}
+
 async function main() {
+  assertChromePageParsing();
+
   const fakeBackend = createFakeBackend();
   fakeBackend.listen(fakeBackendPort, '127.0.0.1');
   await once(fakeBackend, 'listening');

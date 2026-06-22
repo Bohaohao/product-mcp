@@ -8,6 +8,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import * as z from 'zod/v4';
+import { parsePages, type ChromePage } from './chromePages.js';
 import { productListCategoriesInputSchema } from './tools/categories.js';
 import { productCreateInputSchema } from './tools/createProduct.js';
 import {
@@ -58,12 +59,6 @@ interface ResolvedBridgeConfig extends BridgeConfig {
   selectedEnvironment?: string;
 }
 
-interface ChromePage {
-  id: number;
-  url: string;
-  selected: boolean;
-}
-
 interface BrowserToken {
   token: string;
   pageUrl: string;
@@ -93,7 +88,7 @@ const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.3';
+const LOCAL_BRIDGE_VERSION = '0.1.4';
 
 const DEFAULT_CHROME_MCP = {
   command: 'cmd',
@@ -237,22 +232,6 @@ function bridgeConfigStatus(config: ResolvedBridgeConfig, configPath: string) {
     },
     readsChromeToken: false
   };
-}
-
-function parsePages(text: string): ChromePage[] {
-  const pages: ChromePage[] = [];
-
-  for (const line of text.split(/\r?\n/)) {
-    const match = line.match(/^(\d+):\s+(.+?)(\s+\[selected\])?$/);
-    if (!match) continue;
-    pages.push({
-      id: Number(match[1]),
-      url: match[2].trim(),
-      selected: Boolean(match[3])
-    });
-  }
-
-  return pages;
 }
 
 function extractJsonFromChromeText(text: string): unknown {
