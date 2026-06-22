@@ -5,22 +5,25 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import * as z from 'zod/v4';
 import { BackendClient } from './backendClient.js';
 import type { ProductMcpConfig } from './config.js';
 import { toErrorPayload } from './errors.js';
 import { parsePages, type ChromePage } from './chromePages.js';
-import { productListCategoriesInputSchema } from './tools/categories.js';
+import { productListCategories, productListCategoriesInputSchema } from './tools/categories.js';
 import { productCreate, productCreateInputSchema } from './tools/createProduct.js';
 import {
+  productGetCategoryConfig,
   productGetCategoryConfigInputSchema,
+  productGetDict,
   productGetDictInputSchema,
+  productListRegions,
   productListRegionsInputSchema,
+  productListSuppliers,
   productListSuppliersInputSchema
 } from './tools/references.js';
-import { productGetDetailInputSchema } from './tools/productDetail.js';
+import { productGetDetail, productGetDetailInputSchema } from './tools/productDetail.js';
 import {
   getLocalFileInfo,
   getSuggestedMapping,
@@ -58,7 +61,7 @@ interface BridgeConfig extends BridgeEnvironmentConfig {
 interface ResolvedBridgeConfig extends BridgeConfig {
   projectUrl: string;
   tokenStorageKey: string;
-  remoteMcpUrl: string;
+  remoteMcpUrl?: string;
   backendBaseUrl: string;
   clientId: string;
   selectedEnvironment?: string;
@@ -100,7 +103,7 @@ const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.7';
+const LOCAL_BRIDGE_VERSION = '0.1.8';
 const DEFAULT_CLIENT_ID = 'e5cd7e4891bf95d1d19206ce24a7b32e';
 
 const DEFAULT_CHROME_MCP = {
@@ -147,7 +150,6 @@ function loadConfig(path: string): ResolvedBridgeConfig {
 
   if (!resolvedConfig.projectUrl) throw new Error('Bridge config missing projectUrl.');
   if (!resolvedConfig.tokenStorageKey) throw new Error('Bridge config missing tokenStorageKey.');
-  if (!resolvedConfig.remoteMcpUrl) throw new Error('Bridge config missing remoteMcpUrl.');
 
   return resolvedConfig;
 }
@@ -239,7 +241,8 @@ function bridgeConfigStatus(config: ResolvedBridgeConfig, configPath: string) {
     projectUrl: config.projectUrl,
     matchUrlPrefixes: config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl],
     tokenStorageKey: config.tokenStorageKey,
-    remoteMcpUrl: config.remoteMcpUrl,
+    remoteMcpUrl: config.remoteMcpUrl || null,
+    remoteMcpMode: config.remoteMcpUrl ? 'legacy_optional' : 'disabled',
     backendBaseUrl: config.backendBaseUrl,
     clientId: config.clientId,
     language: config.language || 'zh_CN',
@@ -418,17 +421,6 @@ function bridgeErrorPayload(error: unknown, config: ResolvedBridgeConfig, defaul
   };
 }
 
-function normalizeCallToolResult(result: Awaited<ReturnType<Client['callTool']>>): CallToolResult {
-  if ('content' in result && Array.isArray(result.content)) {
-    return result as CallToolResult;
-  }
-
-  return textResult({
-    ok: true,
-    result
-  });
-}
-
 function getTokenCacheMetadata(token: CachedBrowserToken, fromCache: boolean): BrowserToken {
   const expiresInMs = Math.max(0, token.expiresAtMs - Date.now());
 
@@ -487,36 +479,6 @@ async function buildUploadCacheKey(
   ].join('|');
 }
 
-function parseJsonToolResult(result: CallToolResult): Record<string, unknown> | undefined {
-  const text = result.content.find((item) => item.type === 'text');
-  if (!text || text.type !== 'text') return undefined;
-
-  try {
-    const parsed = JSON.parse(text.text);
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? (parsed as Record<string, unknown>) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function isAuthFailurePayload(payload: Record<string, unknown> | undefined): boolean {
-  if (!payload) return false;
-  const code = String(payload.code || '').toUpperCase();
-  const status = Number(payload.status);
-  const message = String(payload.message || payload.error || '').toUpperCase();
-
-  return (
-    code === 'AUTH_TOKEN_INVALID' ||
-    code === 'PERMISSION_DENIED' ||
-    status === 401 ||
-    status === 403 ||
-    message.includes('AUTH_TOKEN_INVALID') ||
-    message.includes('PERMISSION_DENIED') ||
-    message.includes('401') ||
-    message.includes('403')
-  );
-}
-
 function isAuthFailureError(error: unknown): boolean {
   const record = error && typeof error === 'object' ? (error as Record<string, unknown>) : undefined;
   const code = String(record?.code || '').toUpperCase();
@@ -533,6 +495,26 @@ function isAuthFailureError(error: unknown): boolean {
     message.includes('401') ||
     message.includes('403')
   );
+}
+
+function localBackendToolPayload(result: unknown, toolName: string, reason: string): Record<string, unknown> {
+  const payload =
+    result && typeof result === 'object' && !Array.isArray(result)
+      ? { ...(result as Record<string, unknown>) }
+      : {
+          ok: true,
+          result
+        };
+
+  return {
+    ...payload,
+    transport: {
+      mode: 'local_bridge_backend',
+      toolName,
+      reason,
+      remoteMcpBypassed: true
+    }
+  };
 }
 
 class ProductTokenBridge {
@@ -688,72 +670,14 @@ class ProductTokenBridge {
     return getTokenCacheMetadata(this.cachedToken, false);
   }
 
-  async callRemoteTool(name: string, args: Record<string, unknown>): Promise<CallToolResult> {
-    let firstResult: CallToolResult;
-
+  async callBackendTool(
+    name: string,
+    requestId: string,
+    run: (backend: BackendClient) => Promise<unknown>,
+    reason: string
+  ): Promise<CallToolResult> {
     try {
-      firstResult = await this.callRemoteToolOnce(name, args, false);
-    } catch (error) {
-      if (!isAuthFailureError(error)) throw error;
-      if (!this.canRefreshTokenAfterAuthFailure()) throw error;
-      this.noteAuthFailureRefresh();
-      this.invalidateTokenCache();
-      return await this.callRemoteToolOnce(name, args, true);
-    }
-
-    const firstPayload = parseJsonToolResult(firstResult);
-
-    if (!isAuthFailurePayload(firstPayload)) {
-      return firstResult;
-    }
-
-    if (!this.canRefreshTokenAfterAuthFailure()) {
-      return firstResult;
-    }
-
-    this.noteAuthFailureRefresh();
-    this.invalidateTokenCache();
-    const secondResult = await this.callRemoteToolOnce(name, args, true);
-    return secondResult;
-  }
-
-  private async callRemoteToolOnce(name: string, args: Record<string, unknown>, forceRefreshToken: boolean): Promise<CallToolResult> {
-    const browserToken = await this.getBrowserToken({ forceRefresh: forceRefreshToken });
-    const transport = new StreamableHTTPClientTransport(new URL(this.config.remoteMcpUrl), {
-      requestInit: {
-        headers: {
-          Authorization: asBearer(browserToken.token),
-          'Content-Language': this.config.language || 'zh_CN'
-        }
-      }
-    });
-    const client = new Client({ name: 'product-token-bridge-remote-client', version: '0.1.0' });
-
-    try {
-      await client.connect(transport);
-      try {
-        const result = await client.callTool({
-          name,
-          arguments: args
-        });
-        return normalizeCallToolResult(result);
-      } catch (error) {
-        if (!forceRefreshToken && isAuthFailureError(error)) {
-          if (!this.canRefreshTokenAfterAuthFailure()) throw error;
-          this.noteAuthFailureRefresh();
-          this.invalidateTokenCache();
-          return await this.callRemoteToolOnce(name, args, true);
-        }
-        throw error;
-      }
-    } finally {
-      await client.close();
-    }
-  }
-
-  async createProduct(input: unknown, requestId: string): Promise<CallToolResult> {
-    try {
-      return await this.createProductOnce(input, requestId, false);
+      return await this.callBackendToolOnce(name, requestId, run, reason, false);
     } catch (error) {
       if (!isAuthFailureError(error)) throw error;
       if (!this.canRefreshTokenAfterAuthFailure()) throw error;
@@ -761,26 +685,34 @@ class ProductTokenBridge {
 
     this.noteAuthFailureRefresh();
     this.invalidateTokenCache();
-    return await this.createProductOnce(input, requestId, true);
+    return await this.callBackendToolOnce(name, requestId, run, reason, true);
   }
 
-  private async createProductOnce(input: unknown, requestId: string, forceRefreshToken: boolean): Promise<CallToolResult> {
+  private async callBackendToolOnce(
+    name: string,
+    requestId: string,
+    run: (backend: BackendClient) => Promise<unknown>,
+    reason: string,
+    forceRefreshToken: boolean
+  ): Promise<CallToolResult> {
     const browserToken = await this.getBrowserToken({ forceRefresh: forceRefreshToken });
     const backend = new BackendClient(this.localBackendConfig(), {
       authorization: asBearer(browserToken.token),
       requestId,
       language: this.config.language || 'zh_CN'
     });
-    const result = await productCreate(backend, input, requestId);
+    const result = await run(backend);
 
-    return textResult({
-      ...result,
-      transport: {
-        mode: 'local_bridge_backend',
-        reason: 'product_create uses the local bridge to call the ERP backend directly and avoid the remote MCP gateway request-size limit.',
-        remoteMcpBypassed: true
-      }
-    });
+    return textResult(localBackendToolPayload(result, name, reason));
+  }
+
+  async createProduct(input: unknown, requestId: string): Promise<CallToolResult> {
+    return this.callBackendTool(
+      'product_create',
+      requestId,
+      (backend) => productCreate(backend, input, requestId),
+      'product_create uses the local bridge to call the ERP backend directly and avoid the remote MCP gateway request-size limit.'
+    );
   }
 
   private localBackendConfig(): ProductMcpConfig {
@@ -1042,14 +974,27 @@ async function main(): Promise<void> {
     {
       title: 'List product categories',
       description:
-        'Read Admin-Token from the configured Chrome project tab, then query product categories through the remote Product MCP.',
+        'Read Admin-Token from the configured Chrome project tab, then query product categories directly from the ERP backend.',
       inputSchema: productListCategoriesInputSchema
     },
     async (input) => {
+      const requestId = createBridgeRequestId('product_list_categories');
       try {
-        return await bridge.callRemoteTool('product_list_categories', input);
+        return await bridge.callBackendTool(
+          'product_list_categories',
+          requestId,
+          (backend) => productListCategories(backend, input, requestId),
+          'product_list_categories uses the local bridge to call the ERP backend directly.'
+        );
       } catch (error) {
-        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        if (
+          isChromeDevtoolsMcpPreflightError(error) ||
+          isChromeRemoteDebuggingNotAllowedError(error)
+        ) {
+          return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        }
+
+        return textResult(toErrorPayload(error, requestId));
       }
     }
   );
@@ -1084,14 +1029,27 @@ async function main(): Promise<void> {
     {
       title: 'Get product category config',
       description:
-        'Read Admin-Token from the configured Chrome project tab, then query category units/configs through the remote Product MCP.',
+        'Read Admin-Token from the configured Chrome project tab, then query category units/configs directly from the ERP backend.',
       inputSchema: productGetCategoryConfigInputSchema
     },
     async (input) => {
+      const requestId = createBridgeRequestId('product_get_category_config');
       try {
-        return await bridge.callRemoteTool('product_get_category_config', input);
+        return await bridge.callBackendTool(
+          'product_get_category_config',
+          requestId,
+          (backend) => productGetCategoryConfig(backend, input, requestId),
+          'product_get_category_config uses the local bridge to call the ERP backend directly.'
+        );
       } catch (error) {
-        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        if (
+          isChromeDevtoolsMcpPreflightError(error) ||
+          isChromeRemoteDebuggingNotAllowedError(error)
+        ) {
+          return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        }
+
+        return textResult(toErrorPayload(error, requestId));
       }
     }
   );
@@ -1101,14 +1059,27 @@ async function main(): Promise<void> {
     {
       title: 'List suppliers',
       description:
-        'Read Admin-Token from the configured Chrome project tab, then query supplier options through the remote Product MCP.',
+        'Read Admin-Token from the configured Chrome project tab, then query supplier options directly from the ERP backend.',
       inputSchema: productListSuppliersInputSchema
     },
     async (input) => {
+      const requestId = createBridgeRequestId('product_list_suppliers');
       try {
-        return await bridge.callRemoteTool('product_list_suppliers', input);
+        return await bridge.callBackendTool(
+          'product_list_suppliers',
+          requestId,
+          (backend) => productListSuppliers(backend, input, requestId),
+          'product_list_suppliers uses the local bridge to call the ERP backend directly.'
+        );
       } catch (error) {
-        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        if (
+          isChromeDevtoolsMcpPreflightError(error) ||
+          isChromeRemoteDebuggingNotAllowedError(error)
+        ) {
+          return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        }
+
+        return textResult(toErrorPayload(error, requestId));
       }
     }
   );
@@ -1118,14 +1089,27 @@ async function main(): Promise<void> {
     {
       title: 'List product regions',
       description:
-        'Read Admin-Token from the configured Chrome project tab, then query region options through the remote Product MCP.',
+        'Read Admin-Token from the configured Chrome project tab, then query region options directly from the ERP backend.',
       inputSchema: productListRegionsInputSchema
     },
     async (input) => {
+      const requestId = createBridgeRequestId('product_list_regions');
       try {
-        return await bridge.callRemoteTool('product_list_regions', input);
+        return await bridge.callBackendTool(
+          'product_list_regions',
+          requestId,
+          (backend) => productListRegions(backend, input, requestId),
+          'product_list_regions uses the local bridge to call the ERP backend directly.'
+        );
       } catch (error) {
-        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        if (
+          isChromeDevtoolsMcpPreflightError(error) ||
+          isChromeRemoteDebuggingNotAllowedError(error)
+        ) {
+          return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        }
+
+        return textResult(toErrorPayload(error, requestId));
       }
     }
   );
@@ -1135,14 +1119,27 @@ async function main(): Promise<void> {
     {
       title: 'Get system dict',
       description:
-        'Read Admin-Token from the configured Chrome project tab, then query system dictionary values through the remote Product MCP.',
+        'Read Admin-Token from the configured Chrome project tab, then query system dictionary values directly from the ERP backend.',
       inputSchema: productGetDictInputSchema
     },
     async (input) => {
+      const requestId = createBridgeRequestId('product_get_dict');
       try {
-        return await bridge.callRemoteTool('product_get_dict', input);
+        return await bridge.callBackendTool(
+          'product_get_dict',
+          requestId,
+          (backend) => productGetDict(backend, input, requestId),
+          'product_get_dict uses the local bridge to call the ERP backend directly.'
+        );
       } catch (error) {
-        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        if (
+          isChromeDevtoolsMcpPreflightError(error) ||
+          isChromeRemoteDebuggingNotAllowedError(error)
+        ) {
+          return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        }
+
+        return textResult(toErrorPayload(error, requestId));
       }
     }
   );
@@ -1152,14 +1149,27 @@ async function main(): Promise<void> {
     {
       title: 'Get product detail',
       description:
-        'Read Admin-Token from the configured Chrome project tab, then query product edit detail sections through the remote Product MCP.',
+        'Read Admin-Token from the configured Chrome project tab, then query product edit detail sections directly from the ERP backend.',
       inputSchema: productGetDetailInputSchema
     },
     async (input) => {
+      const requestId = createBridgeRequestId('product_get_detail');
       try {
-        return await bridge.callRemoteTool('product_get_detail', input);
+        return await bridge.callBackendTool(
+          'product_get_detail',
+          requestId,
+          (backend) => productGetDetail(backend, input, requestId),
+          'product_get_detail uses the local bridge to call the ERP backend directly.'
+        );
       } catch (error) {
-        return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        if (
+          isChromeDevtoolsMcpPreflightError(error) ||
+          isChromeRemoteDebuggingNotAllowedError(error)
+        ) {
+          return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
+        }
+
+        return textResult(toErrorPayload(error, requestId));
       }
     }
   );
