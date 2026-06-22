@@ -93,6 +93,7 @@ const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
+const LOCAL_BRIDGE_VERSION = '0.1.1';
 
 const DEFAULT_CHROME_MCP = {
   command: 'cmd',
@@ -207,6 +208,34 @@ function textResult(payload: unknown) {
         text: JSON.stringify(payload, null, 2)
       }
     ]
+  };
+}
+
+function bridgeConfigStatus(config: ResolvedBridgeConfig, configPath: string) {
+  return {
+    ok: true,
+    bridge: {
+      name: 'product-token-bridge',
+      version: LOCAL_BRIDGE_VERSION,
+      configPath
+    },
+    environment: config.selectedEnvironment,
+    projectUrl: config.projectUrl,
+    matchUrlPrefixes: config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl],
+    tokenStorageKey: config.tokenStorageKey,
+    remoteMcpUrl: config.remoteMcpUrl,
+    backendBaseUrl: config.backendBaseUrl,
+    clientId: config.clientId,
+    language: config.language || 'zh_CN',
+    tokenCache: {
+      enabled: true,
+      maxTtlSeconds: TOKEN_CACHE_TTL_MS / 1000
+    },
+    chromeMcp: {
+      configured: Boolean(config.chromeMcp),
+      usesChromeDevtoolsMcpPackage: usesChromeDevtoolsMcpPackage(config.chromeMcp || DEFAULT_CHROME_MCP)
+    },
+    readsChromeToken: false
   };
 }
 
@@ -818,8 +847,19 @@ async function main(): Promise<void> {
   const bridge = new ProductTokenBridge(config);
   const server = new McpServer({
     name: 'product-token-bridge',
-    version: '0.1.0'
+    version: LOCAL_BRIDGE_VERSION
   });
+
+  server.registerTool(
+    'product_bridge_config_status',
+    {
+      title: 'Product bridge config status',
+      description:
+        'Return the effective local bridge configuration without reading Chrome, token cache, or the remote ERP backend. Use this for runtime self-checks before asking users for browser actions.',
+      inputSchema: {}
+    },
+    async () => textResult(bridgeConfigStatus(config, configPath))
+  );
 
   server.registerTool(
     'product_auth_status',

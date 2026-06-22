@@ -18,6 +18,7 @@ Product MCP 是一个面向 ERP 商品业务的 MCP 服务，包含远程 HTTP M
 ### 你应该做什么
 
 - Codex/本地资料包场景优先连接本地 bridge 作为统一入口；分类、供应商、区域、字典、创建、详情等 ERP 业务工具由 bridge 代理到远程 MCP。
+- 需要确认本地 bridge 实际加载的环境、`projectUrl`、`matchUrlPrefixes` 或配置文件时，先调用 `product_bridge_config_status`；它不会读取 Chrome、token 或远程 ERP。
 - 先调用 `product_auth_status`，它会预检并自动预热 `chrome-devtools-mcp`，再确认本地 Chrome 中存在 ERP 登录态。
 - 只有当 `product_auth_status` 返回 `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` 时，才按返回步骤提示用户打开 Chrome 的 “Allow remote debugging for this browser instance”，完成后重新调用 `product_auth_status`。
 - 使用只读工具查询真实后端 ID，不要让用户手填分类、单位、供应商、区域等 ID。
@@ -39,17 +40,18 @@ Product MCP 是一个面向 ERP 商品业务的 MCP 服务，包含远程 HTTP M
 
 ### 推荐创建流程
 
-1. `product_auth_status`
-2. `product_precheck_package`
-3. `product_list_categories`
-4. `product_get_category_config`
-5. `product_list_suppliers`
-6. `product_list_regions`
-7. `product_get_dict`
-8. `product_upload_file`
-9. 向用户总结并确认写入操作
-10. `product_create`，必须包含 `confirm: true`
-11. `product_get_detail`
+1. `product_bridge_config_status`
+2. `product_auth_status`
+3. `product_precheck_package`
+4. `product_list_categories`
+5. `product_get_category_config`
+6. `product_list_suppliers`
+7. `product_list_regions`
+8. `product_get_dict`
+9. `product_upload_file`
+10. 向用户总结并确认写入操作
+11. `product_create`，必须包含 `confirm: true`
+12. `product_get_detail`
 
 ## 这个仓库做什么
 
@@ -110,6 +112,7 @@ MCP Client
 
 | Tool | 读写 | 用途 |
 | --- | --- | --- |
+| `product_bridge_config_status` | 只读 | 返回本地 bridge 实际生效的环境、URL 前缀和配置路径，不读取 Chrome 或 token |
 | `product_auth_status` | 只读 | 检查 Chrome ERP 登录态是否可用，不返回 token 内容 |
 | `product_precheck_package` | 本地只读 | 解析并校验本地商品资料包 |
 | `product_upload_file` | 上传写入 | 校验、必要时裁剪并上传本地文件到 OSS |
@@ -293,6 +296,28 @@ location /healthz {
 ```
 
 ## 工具细节
+
+### `product_bridge_config_status`
+
+返回本地 bridge 实际生效的配置，不读取 Chrome、不读取 token、不请求远程 ERP。适合插件代理或 AI Agent 在排查旧 URL、环境切换、配置更新是否生效时使用。
+
+成功结果示例：
+
+```json
+{
+  "ok": true,
+  "bridge": {
+    "name": "product-token-bridge",
+    "version": "0.1.1",
+    "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
+  },
+  "environment": "stage",
+  "projectUrl": "https://test.eysscm.com/erp/commodity/commodity",
+  "matchUrlPrefixes": ["https://test.eysscm.com/erp/"],
+  "tokenStorageKey": "Admin-Token",
+  "readsChromeToken": false
+}
+```
 
 ### `product_auth_status`
 
@@ -576,6 +601,7 @@ If you are an AI Agent, read this section first.
 ### What You Should Do
 
 - In Codex/local package workflows, connect to the local bridge as the single entry point; let it proxy ERP business tools such as categories, suppliers, regions, dictionaries, creation, and detail lookup to the remote MCP.
+- To confirm the local bridge's effective environment, `projectUrl`, `matchUrlPrefixes`, or config path, call `product_bridge_config_status` first. It does not read Chrome, the token, or the remote ERP backend.
 - Call `product_auth_status` first. It preflights and warms `chrome-devtools-mcp`, then confirms that the ERP login state is available in local Chrome.
 - Only when `product_auth_status` returns `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED`, stop the task, show the returned steps for enabling Chrome "Allow remote debugging for this browser instance", and call `product_auth_status` again after the user completes those steps.
 - Use read-only lookup tools to resolve real backend IDs. Do not ask the user to manually fill category, unit, supplier, or region IDs.
@@ -597,17 +623,18 @@ If you are an AI Agent, read this section first.
 
 ### Recommended Creation Flow
 
-1. `product_auth_status`
-2. `product_precheck_package`
-3. `product_list_categories`
-4. `product_get_category_config`
-5. `product_list_suppliers`
-6. `product_list_regions`
-7. `product_get_dict`
-8. `product_upload_file`
-9. Summarize the write operation and ask the user to confirm
-10. `product_create` with `confirm: true`
-11. `product_get_detail`
+1. `product_bridge_config_status`
+2. `product_auth_status`
+3. `product_precheck_package`
+4. `product_list_categories`
+5. `product_get_category_config`
+6. `product_list_suppliers`
+7. `product_list_regions`
+8. `product_get_dict`
+9. `product_upload_file`
+10. Summarize the write operation and ask the user to confirm
+11. `product_create` with `confirm: true`
+12. `product_get_detail`
 
 ## What This Repository Does
 
@@ -668,6 +695,7 @@ These tools are available in the local bridge. Local path reads, image preparati
 
 | Tool | Access | Purpose |
 | --- | --- | --- |
+| `product_bridge_config_status` | Read | Return the effective local bridge environment, URL prefixes, and config path without reading Chrome or token |
 | `product_auth_status` | Read | Check whether Chrome ERP login state is available without returning token content |
 | `product_precheck_package` | Local read | Parse and validate a local product package |
 | `product_upload_file` | Upload write | Validate, optionally crop, and upload a local file to OSS |
@@ -851,6 +879,28 @@ location /healthz {
 ```
 
 ## Tool Details
+
+### `product_bridge_config_status`
+
+Returns the effective local bridge configuration without reading Chrome, reading the token, or calling the remote ERP backend. Use it when a plugin proxy or AI Agent needs to diagnose stale URLs, environment switching, or config-update pickup.
+
+Example success result:
+
+```json
+{
+  "ok": true,
+  "bridge": {
+    "name": "product-token-bridge",
+    "version": "0.1.1",
+    "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
+  },
+  "environment": "stage",
+  "projectUrl": "https://test.eysscm.com/erp/commodity/commodity",
+  "matchUrlPrefixes": ["https://test.eysscm.com/erp/"],
+  "tokenStorageKey": "Admin-Token",
+  "readsChromeToken": false
+}
+```
 
 ### `product_auth_status`
 
