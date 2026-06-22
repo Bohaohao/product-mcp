@@ -1,5 +1,6 @@
 import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -103,7 +104,7 @@ const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.9';
+const LOCAL_BRIDGE_VERSION = '0.1.10';
 const DEFAULT_CLIENT_ID = 'e5cd7e4891bf95d1d19206ce24a7b32e';
 
 const POSIX_PATH_ENTRIES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
@@ -285,11 +286,38 @@ function cleanEnv(env: NodeJS.ProcessEnv, overrides: Record<string, string> = {}
   if (process.platform !== 'win32') {
     const delimiter = ':';
     const existingPath = merged.PATH || merged.Path || '';
-    const pathParts = [...POSIX_PATH_ENTRIES, ...existingPath.split(delimiter)].filter(Boolean);
+    const pathParts = [...POSIX_PATH_ENTRIES, ...nodeManagerPathEntries(), ...existingPath.split(delimiter)].filter(Boolean);
     merged.PATH = [...new Set(pathParts)].join(delimiter);
   }
 
   return merged;
+}
+
+function nodeManagerPathEntries(home = homedir()): string[] {
+  const entries = [
+    path.join(home, '.volta', 'bin'),
+    path.join(home, '.asdf', 'shims'),
+    path.join(home, '.nodenv', 'shims'),
+    path.join(home, '.fnm'),
+    path.join(home, '.local', 'bin'),
+    path.join(home, '.local', 'share', 'mise', 'shims')
+  ];
+  const nvmNodeVersions = path.join(home, '.nvm', 'versions', 'node');
+
+  try {
+    if (existsSync(nvmNodeVersions)) {
+      const nodeBins = readdirSync(nvmNodeVersions)
+        .map((version) => path.join(nvmNodeVersions, version, 'bin'))
+        .filter((entry) => existsSync(entry))
+        .sort()
+        .reverse();
+      entries.push(...nodeBins);
+    }
+  } catch {
+    // Ignore unreadable version-manager directories; PATH fallback still includes system locations.
+  }
+
+  return entries.filter((entry) => existsSync(entry));
 }
 
 function defaultChromeMcpConfig(): NonNullable<BridgeConfig['chromeMcp']> {
