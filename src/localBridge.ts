@@ -103,17 +103,10 @@ const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.8';
+const LOCAL_BRIDGE_VERSION = '0.1.9';
 const DEFAULT_CLIENT_ID = 'e5cd7e4891bf95d1d19206ce24a7b32e';
 
-const DEFAULT_CHROME_MCP = {
-  command: 'cmd',
-  args: ['/c', 'npx', '-y', 'chrome-devtools-mcp@latest', '--autoConnect', '--channel=stable', '--no-usage-statistics'],
-  env: {
-    PROGRAMFILES: 'C:\\Program Files',
-    SystemRoot: 'C:\\WINDOWS'
-  }
-};
+const POSIX_PATH_ENTRIES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
 
 const productAuthStatusInputSchema = {
   forceRefresh: z.boolean().default(false).describe('When true, bypass the in-memory token cache and read Admin-Token from Chrome again.')
@@ -252,7 +245,7 @@ function bridgeConfigStatus(config: ResolvedBridgeConfig, configPath: string) {
     },
     chromeMcp: {
       configured: Boolean(config.chromeMcp),
-      usesChromeDevtoolsMcpPackage: usesChromeDevtoolsMcpPackage(config.chromeMcp || DEFAULT_CHROME_MCP)
+      usesChromeDevtoolsMcpPackage: usesChromeDevtoolsMcpPackage(config.chromeMcp || defaultChromeMcpConfig())
     },
     readsChromeToken: false
   };
@@ -284,9 +277,36 @@ function cleanEnv(env: NodeJS.ProcessEnv, overrides: Record<string, string> = {}
     if (value !== undefined) result[key] = value;
   }
 
-  return {
+  const merged = {
     ...result,
     ...overrides
+  };
+
+  if (process.platform !== 'win32') {
+    const delimiter = ':';
+    const existingPath = merged.PATH || merged.Path || '';
+    const pathParts = [...POSIX_PATH_ENTRIES, ...existingPath.split(delimiter)].filter(Boolean);
+    merged.PATH = [...new Set(pathParts)].join(delimiter);
+  }
+
+  return merged;
+}
+
+function defaultChromeMcpConfig(): NonNullable<BridgeConfig['chromeMcp']> {
+  if (process.platform === 'win32') {
+    return {
+      command: 'cmd',
+      args: ['/d', '/s', '/c', 'npx', '-y', 'chrome-devtools-mcp@latest', '--autoConnect', '--channel=stable', '--no-usage-statistics'],
+      env: {
+        PROGRAMFILES: 'C:\\Program Files',
+        SystemRoot: 'C:\\WINDOWS'
+      }
+    };
+  }
+
+  return {
+    command: 'npx',
+    args: ['-y', 'chrome-devtools-mcp@latest', '--autoConnect', '--channel=stable', '--no-usage-statistics']
   };
 }
 
@@ -547,7 +567,7 @@ class ProductTokenBridge {
       return getTokenCacheMetadata(this.cachedToken, true);
     }
 
-    const chromeConfig = this.config.chromeMcp || DEFAULT_CHROME_MCP;
+    const chromeConfig = this.config.chromeMcp || defaultChromeMcpConfig();
     await this.ensureChromeDevtoolsMcp(chromeConfig);
 
     let chrome: Client;
@@ -835,7 +855,7 @@ class ProductTokenBridge {
   private async getChromeClient(): Promise<Client> {
     if (this.chromeClient) return this.chromeClient;
 
-    const chromeConfig = this.config.chromeMcp || DEFAULT_CHROME_MCP;
+    const chromeConfig = this.config.chromeMcp || defaultChromeMcpConfig();
     await this.ensureChromeDevtoolsMcp(chromeConfig);
     const transport = new StdioClientTransport({
       command: chromeConfig.command,
