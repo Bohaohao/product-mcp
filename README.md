@@ -238,7 +238,7 @@ product-token-bridge.config.json
 
 第一次需要读取 Chrome 登录态时，bridge 会先通过 npm 预检并自动解析 `chrome-devtools-mcp@latest`。如果当前机器缺少该 npm 包但 npm 网络可用，会自动安装/缓存后继续；如果 npm、网络或代理不可用，`product_auth_status` 会返回 `CHROME_DEVTOOLS_MCP_UNAVAILABLE` 和恢复建议。
 
-没有有效 token 缓存时，bridge 会正常尝试连接 Chrome 并读取 ERP 页面的 token。它会优先直接读取当前选中的 Chrome 页面；如果当前页不是 ERP 页面或没有 token，才回退到页面列表匹配。回退时会在 `select_page` 后校验 `evaluate_script` 实际运行的 `location.href`，如果没有落到匹配页，会用 `bringToFront: true` 再选中一次并重试；仍不一致时返回页面上下文不匹配原因。只有在 `chrome-devtools-mcp` 已可用但无法连接 Chrome 时，才返回 `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` 和远程调试操作步骤；如果 Chrome 可连接但 ERP 未登录或 token 不存在，则按登录态缺失处理。
+没有有效 token 缓存时，bridge 会正常尝试连接 Chrome 并读取 ERP 页面的 token。它会优先直接读取当前选中的 Chrome 页面；如果当前页不是 ERP 页面或没有 token，才回退到页面列表匹配。回退时会在 `select_page` 后校验 `evaluate_script` 实际运行的 `location.href`，如果没有落到匹配页，会用 `bringToFront: true` 再选中一次并重试；仍不一致时返回页面上下文不匹配原因。只有在 `chrome-devtools-mcp` 已可用但无法连接 Chrome 时，才返回 `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` 和远程调试操作步骤；如果 Chrome 可连接但 ERP 未登录或 token 不存在，则按登录态缺失处理。`0.1.12` 起，只有在匹配页失败、页上下文错配、token 读取失败等错误路径中，才会附带脱敏后的 `chromePages` 诊断；正常成功结果不会返回页签列表，也不应把列页签作为常规步骤。
 
 缓存失效规则：
 
@@ -274,8 +274,8 @@ curl http://127.0.0.1:8787/healthz
 
 ```bash
 cd product-mcp
-docker build -t product-mcp:0.1.11 .
-docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.11
+docker build -t product-mcp:0.1.12 .
+docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.12
 ```
 
 如需 HTTPS，请放到公司网关或 Nginx 后面。
@@ -307,7 +307,7 @@ location /healthz {
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.11",
+    "version": "0.1.12",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",
@@ -823,7 +823,7 @@ When the cache is valid, later tool calls reuse the token and avoid reopening th
 
 The first time Chrome login state is needed, the bridge preflights and resolves `chrome-devtools-mcp@latest` through npm. If the package is missing and npm network access works, it is installed/cached automatically before continuing. If npm, network, or proxy access fails, `product_auth_status` returns `CHROME_DEVTOOLS_MCP_UNAVAILABLE` with recovery guidance.
 
-When there is no valid token cache, the bridge normally tries to connect to Chrome and read the ERP page token. It first tries to read the currently selected Chrome page directly. If that page is not an ERP page or has no token, it falls back to page-list matching. During fallback, after `select_page`, the bridge verifies the `location.href` where `evaluate_script` actually ran. If it did not land on the matched page, the bridge selects again with `bringToFront: true` and retries; if it is still mismatched, it returns a page-context mismatch reason. It returns `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` with remote-debugging steps only when `chrome-devtools-mcp` is available but cannot connect to Chrome. If Chrome is reachable but ERP is not logged in or no token exists, handle it as a missing login state.
+When there is no valid token cache, the bridge normally tries to connect to Chrome and read the ERP page token. It first tries to read the currently selected Chrome page directly. If that page is not an ERP page or has no token, it falls back to page-list matching. During fallback, after `select_page`, the bridge verifies the `location.href` where `evaluate_script` actually ran. If it did not land on the matched page, the bridge selects again with `bringToFront: true` and retries; if it is still mismatched, it returns a page-context mismatch reason. It returns `CHROME_REMOTE_DEBUGGING_NOT_ALLOWED` with remote-debugging steps only when `chrome-devtools-mcp` is available but cannot connect to Chrome. If Chrome is reachable but ERP is not logged in or no token exists, handle it as a missing login state. Starting in `0.1.12`, redacted `chromePages` diagnostics are attached only on error paths such as no matching tab, page-context mismatch, or token read failure. Normal successful responses do not return tab lists, and tab listing must not become a routine step.
 
 Cache invalidation rules:
 
@@ -859,8 +859,8 @@ curl http://127.0.0.1:8787/healthz
 
 ```bash
 cd product-mcp
-docker build -t product-mcp:0.1.11 .
-docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.11
+docker build -t product-mcp:0.1.12 .
+docker run -d --name product-mcp --env-file deploy.env -p 8787:8787 product-mcp:0.1.12
 ```
 
 For HTTPS, place this service behind a company gateway or Nginx.
@@ -892,7 +892,7 @@ Example success result:
   "ok": true,
   "bridge": {
     "name": "product-token-bridge",
-    "version": "0.1.11",
+    "version": "0.1.12",
     "configPath": "C:\\Users\\user\\.erp-product\\product-token-bridge.config.json"
   },
   "environment": "stage",

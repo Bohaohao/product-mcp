@@ -211,6 +211,10 @@ function assertChromePageParsing() {
   const newSelectedFormat = parsePages('2: ERP 商品管理 (https://test.eysscm.com/erp/commodity/commodity) [selected]');
   assert(newSelectedFormat[0]?.url === 'https://test.eysscm.com/erp/commodity/commodity', 'selected title plus URL parsing failed');
   assert(newSelectedFormat[0]?.selected === true, 'selected title plus URL flag parsing failed');
+
+  const indentedFormat = parsePages('  - 3: 易运盈链界 (https://test.eysscm.com/erp/commodity/commodity) [selected]');
+  assert(indentedFormat[0]?.url === 'https://test.eysscm.com/erp/commodity/commodity', 'indented bullet Chrome page parsing failed');
+  assert(indentedFormat[0]?.selected === true, 'indented bullet selected flag parsing failed');
 }
 
 async function main() {

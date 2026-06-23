@@ -2,6 +2,7 @@ export interface ChromePage {
   id: number;
   url: string;
   selected: boolean;
+  rawText?: string;
 }
 
 function extractPageUrl(rawPageText: string): string {
@@ -19,12 +20,14 @@ export function parsePages(text: string): ChromePage[] {
   const pages: ChromePage[] = [];
 
   for (const line of text.split(/\r?\n/)) {
-    const match = line.match(/^(\d+):\s+(.+?)(\s+\[selected\])?$/);
+    const match = line.match(/^\s*(?:[-*]\s*)?(\d+):\s+(.+?)\s*$/);
     if (!match) continue;
+    const rawPageText = match[2].replace(/\s*\[selected\]\s*/gi, ' ').trim();
     pages.push({
       id: Number(match[1]),
-      url: extractPageUrl(match[2]),
-      selected: Boolean(match[3])
+      url: extractPageUrl(rawPageText),
+      selected: /\[selected\]/i.test(match[2]),
+      rawText: line.trim()
     });
   }
 

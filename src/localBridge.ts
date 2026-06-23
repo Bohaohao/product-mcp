@@ -10,7 +10,7 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import * as z from 'zod/v4';
 import { BackendClient } from './backendClient.js';
 import type { ProductMcpConfig } from './config.js';
-import { toErrorPayload } from './errors.js';
+import { ProductMcpError, toErrorPayload } from './errors.js';
 import { parsePages, type ChromePage } from './chromePages.js';
 import { productListCategories, productListCategoriesInputSchema } from './tools/categories.js';
 import { productCreate, productCreateInputSchema } from './tools/createProduct.js';
@@ -102,11 +102,44 @@ interface BrowserTokenPayload {
   readErrorName?: string;
 }
 
+interface ChromePageSummary {
+  id: number;
+  selected: boolean;
+  url?: string;
+  urlRedacted?: boolean;
+  origin?: string;
+  matchesProject: boolean;
+  sameOrigin: boolean;
+  rawText?: string;
+}
+
+interface ChromePageDiagnostics {
+  tool: 'list_pages';
+  checkedAt: string;
+  projectUrl: string;
+  matchUrlPrefixes: string[];
+  projectOrigin: string | null;
+  rawLineCount: number;
+  parsedPageCount: number;
+  matchingPageCount: number;
+  sameOriginPageCount: number;
+  selectedPageCount: number;
+  matchingPages: ChromePageSummary[];
+  sameOriginPages: ChromePageSummary[];
+  selectedPages: ChromePageSummary[];
+  rawMatchingLines: string[];
+  rawSelectedLines: string[];
+  privacy: {
+    nonMatchingPageUrlsRedacted: boolean;
+  };
+  parseNote?: string;
+}
+
 const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.11';
+const LOCAL_BRIDGE_VERSION = '0.1.12';
 const DEFAULT_CLIENT_ID = 'e5cd7e4891bf95d1d19206ce24a7b32e';
 
 const POSIX_PATH_ENTRIES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
@@ -267,6 +300,102 @@ function extractJsonFromChromeText(text: string): unknown {
 function isMatchingProjectPage(config: ResolvedBridgeConfig, pageUrl: string): boolean {
   const prefixes = config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl];
   return prefixes.some((prefix) => pageUrl.startsWith(prefix));
+}
+
+function projectUrlPrefixes(config: ResolvedBridgeConfig): string[] {
+  return config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl];
+}
+
+function safeUrl(value: string | undefined): URL | undefined {
+  if (!value) return undefined;
+  try {
+    return new URL(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function projectOrigin(config: ResolvedBridgeConfig): string | null {
+  return safeUrl(config.projectUrl)?.origin || null;
+}
+
+function isSameProjectOrigin(config: ResolvedBridgeConfig, pageUrl: string): boolean {
+  const origin = projectOrigin(config);
+  return Boolean(origin && safeUrl(pageUrl)?.origin === origin);
+}
+
+function redactNonProjectUrls(config: ResolvedBridgeConfig, text: string): string {
+  return text.replace(/https?:\/\/[^\s)]+/g, (url) => {
+    if (isMatchingProjectPage(config, url) || isSameProjectOrigin(config, url)) return url;
+    return '<redacted-url>';
+  });
+}
+
+function chromePageSummary(config: ResolvedBridgeConfig, page: ChromePage): ChromePageSummary {
+  const matchesProject = isMatchingProjectPage(config, page.url);
+  const sameOrigin = isSameProjectOrigin(config, page.url);
+  const parsedUrl = safeUrl(page.url);
+  return {
+    id: page.id,
+    selected: page.selected,
+    ...(matchesProject || sameOrigin ? { url: page.url, origin: parsedUrl?.origin } : { urlRedacted: true }),
+    matchesProject,
+    sameOrigin,
+    rawText: page.rawText ? redactNonProjectUrls(config, page.rawText) : undefined
+  };
+}
+
+function buildChromePageDiagnostics(
+  config: ResolvedBridgeConfig,
+  pagesText: string,
+  pages: ChromePage[]
+): ChromePageDiagnostics {
+  const prefixes = projectUrlPrefixes(config);
+  const origin = projectOrigin(config);
+  const rawLines = pagesText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  const rawMatchingLines = rawLines
+    .filter((line) => prefixes.some((prefix) => line.includes(prefix)) || Boolean(origin && line.includes(origin)))
+    .slice(0, 20)
+    .map((line) => redactNonProjectUrls(config, line));
+  const matchingPages = pages.filter((page) => isMatchingProjectPage(config, page.url));
+  const sameOriginPages = pages.filter((page) => isSameProjectOrigin(config, page.url));
+  const selectedPages = pages.filter((page) => page.selected);
+  const diagnostics: ChromePageDiagnostics = {
+    tool: 'list_pages',
+    checkedAt: new Date().toISOString(),
+    projectUrl: config.projectUrl,
+    matchUrlPrefixes: prefixes,
+    projectOrigin: origin,
+    rawLineCount: rawLines.length,
+    parsedPageCount: pages.length,
+    matchingPageCount: matchingPages.length,
+    sameOriginPageCount: sameOriginPages.length,
+    selectedPageCount: selectedPages.length,
+    matchingPages: matchingPages.slice(0, 20).map((page) => chromePageSummary(config, page)),
+    sameOriginPages: sameOriginPages.slice(0, 20).map((page) => chromePageSummary(config, page)),
+    selectedPages: selectedPages.slice(0, 10).map((page) => chromePageSummary(config, page)),
+    rawMatchingLines,
+    rawSelectedLines: selectedPages
+      .map((page) => page.rawText)
+      .filter((line): line is string => Boolean(line))
+      .slice(0, 10)
+      .map((line) => redactNonProjectUrls(config, line)),
+    privacy: {
+      nonMatchingPageUrlsRedacted: true
+    }
+  };
+
+  if (rawMatchingLines.length && !matchingPages.length) {
+    diagnostics.parseNote =
+      'The raw Chrome DevTools MCP output contains the configured ERP origin/prefix, but Product MCP parsed zero matching pages. This points to a page-list format parsing issue.';
+  } else if (!rawLines.length) {
+    diagnostics.parseNote = 'Chrome DevTools MCP returned an empty page list.';
+  }
+
+  return diagnostics;
 }
 
 function asBearer(token: string): string {
@@ -435,6 +564,20 @@ function chromeRemoteDebuggingGuidance(config: ResolvedBridgeConfig) {
 }
 
 function bridgeErrorPayload(error: unknown, config: ResolvedBridgeConfig, defaultCode: string): Record<string, unknown> {
+  if (error instanceof ProductMcpError) {
+    return {
+      ok: false,
+      code: error.code || defaultCode,
+      message: error.message,
+      details: error.details,
+      environment: config.selectedEnvironment,
+      projectUrl: config.projectUrl,
+      matchUrlPrefixes: projectUrlPrefixes(config),
+      tokenStorageKey: config.tokenStorageKey,
+      remoteMcpUrl: config.remoteMcpUrl
+    };
+  }
+
   if (isChromeDevtoolsMcpPreflightError(error)) {
     return {
       ok: false,
@@ -629,6 +772,8 @@ class ProductTokenBridge {
     const pages = parsePages(pagesText);
 
     let page = pages.find((candidate) => isMatchingProjectPage(this.config, candidate.url));
+    let newPageText: string | undefined;
+    let refreshedPages: ChromePage[] | undefined;
 
     if (!page) {
       const newPage = await chrome.callTool({
@@ -638,21 +783,46 @@ class ProductTokenBridge {
           timeout: 30000
         }
       });
-      const newPageText = this.getSingleText(newPage);
-      const refreshed = parsePages(newPageText);
-      page = refreshed.find((candidate) => isMatchingProjectPage(this.config, candidate.url));
+      newPageText = this.getSingleText(newPage);
+      refreshedPages = parsePages(newPageText);
+      page = refreshedPages.find((candidate) => isMatchingProjectPage(this.config, candidate.url));
     }
 
     if (!page) {
-      throw new Error(`No Chrome tab matched configured project URL: ${this.config.projectUrl}`);
+      throw new ProductMcpError('CHROME_TAB_NOT_MATCHED', `No Chrome tab matched configured project URL: ${this.config.projectUrl}`, {
+        details: {
+          chromePages: buildChromePageDiagnostics(this.config, pagesText, pages),
+          chromePagesAfterNewPage:
+            newPageText && refreshedPages ? buildChromePageDiagnostics(this.config, newPageText, refreshedPages) : undefined,
+          agentGuidance: {
+            conclusion:
+              'Product MCP could connect to Chrome DevTools MCP, but its own list_pages result did not produce a page matching the configured ERP URL.',
+            nextAction:
+              'Use details.chromePages to compare Product MCP visible tabs with the user-reported Chrome extension tabs. Do not ask the user to run separate DevTools scripts.'
+          }
+        }
+      });
     }
 
     const tokenPayload = await this.readChromeTokenFromMatchedPage(chrome, page);
 
     if (!tokenPayload.hasToken || !tokenPayload.token) {
       const readError = tokenPayload.readError ? ` localStorage read error: ${tokenPayload.readError}` : '';
-      throw new Error(
-        `Chrome tab ${tokenPayload.href || page.url} does not contain localStorage.${this.config.tokenStorageKey}. Please login in Chrome first.${readError}`
+      throw new ProductMcpError(
+        'AUTH_TOKEN_MISSING',
+        `Chrome tab ${tokenPayload.href || page.url} does not contain localStorage.${this.config.tokenStorageKey}. Please login in Chrome first.${readError}`,
+        {
+          details: {
+            matchedPage: chromePageSummary(this.config, page),
+            evaluatedUrl: tokenPayload.href,
+            localStorageReadError: tokenPayload.readError
+              ? {
+                  name: tokenPayload.readErrorName,
+                  message: tokenPayload.readError
+                }
+              : undefined
+          }
+        }
       );
     }
 
@@ -733,17 +903,24 @@ class ProductTokenBridge {
       return tokenPayload;
     }
 
-    throw new Error(
-      [
-        'Chrome page context mismatch while reading ERP login token.',
-        `matchedPageId=${page.id}`,
-        `matchedPageUrl=${page.url}`,
-        `evaluatedUrl=${tokenPayload.href || '<unknown>'}`,
-        `projectUrl=${this.config.projectUrl}`,
-        `matchUrlPrefixes=${(this.config.matchUrlPrefixes?.length ? this.config.matchUrlPrefixes : [this.config.projectUrl]).join(',')}`,
-        'This means Chrome DevTools MCP listed the ERP tab, but evaluate_script ran in a different page context.'
-      ].join(' ')
-    );
+    const message = [
+      'Chrome page context mismatch while reading ERP login token.',
+      `matchedPageId=${page.id}`,
+      `matchedPageUrl=${page.url}`,
+      `evaluatedUrl=${tokenPayload.href || '<unknown>'}`,
+      `projectUrl=${this.config.projectUrl}`,
+      `matchUrlPrefixes=${projectUrlPrefixes(this.config).join(',')}`,
+      'This means Chrome DevTools MCP listed the ERP tab, but evaluate_script ran in a different page context.'
+    ].join(' ');
+    throw new ProductMcpError('CHROME_PAGE_CONTEXT_MISMATCH', message, {
+      details: {
+        matchedPage: chromePageSummary(this.config, page),
+        evaluatedUrl: tokenPayload.href,
+        evaluatedOrigin: tokenPayload.origin,
+        projectUrl: this.config.projectUrl,
+        matchUrlPrefixes: projectUrlPrefixes(this.config)
+      }
+    });
   }
 
   private cacheBrowserToken(tokenPayload: BrowserTokenPayload, fallbackPageUrl: string): BrowserToken {
