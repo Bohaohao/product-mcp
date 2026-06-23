@@ -135,6 +135,37 @@ function createFakeBackend() {
       return;
     }
 
+    if (req.method === 'POST' && req.url === '/api/user/erp/product/_page') {
+      let rawBody = '';
+      req.on('data', (chunk) => {
+        rawBody += chunk;
+      });
+      req.on('end', () => {
+        const body = JSON.parse(rawBody || '{}');
+        assert(body.pageNum === 1, 'duplicate check pageNum was not forwarded');
+        assert(body.pageSize === 20, 'duplicate check pageSize was not forwarded');
+        assert(body.keyword === 'SmokeTestProduct', 'duplicate check keyword was not normalized');
+        sendJson(res, 200, {
+          code: 200,
+          data: {
+            rows: [
+              {
+                commodityId: 'dup-1',
+                productNameCn: 'Smoke Test Product',
+                productNameEn: 'Smoke Test Product EN',
+                productCode: 'SMOKE-001',
+                categoryFirstName: 'Machinery',
+                categorySecondName: 'Parts',
+                unitName: 'piece'
+              }
+            ],
+            total: 1
+          }
+        });
+      });
+      return;
+    }
+
     if (req.method === 'POST' && req.url === '/api/user/erp/commodity') {
       let rawBody = '';
       req.on('data', (chunk) => {
@@ -429,7 +460,13 @@ async function main() {
       tools.tools.some((tool) => tool.name === 'product_create'),
       'product_create was not listed'
     );
-    for (const toolName of ['product_get_category_config', 'product_list_suppliers', 'product_list_regions', 'product_get_dict']) {
+    for (const toolName of [
+      'product_check_name_duplicate',
+      'product_get_category_config',
+      'product_list_suppliers',
+      'product_list_regions',
+      'product_get_dict'
+    ]) {
       assert(tools.tools.some((tool) => tool.name === toolName), `${toolName} was not listed`);
     }
 
@@ -447,6 +484,20 @@ async function main() {
     const payload = JSON.parse(textContent.text);
     assert(payload.ok === true, 'tool result was not ok');
     assert(payload.categories?.[0]?.children?.[0]?.id === '11', 'category filtering result was unexpected');
+
+    const duplicateResult = await client.callTool({
+      name: 'product_check_name_duplicate',
+      arguments: {
+        productNameCn: 'Smoke Test Product'
+      }
+    });
+    const duplicateText = duplicateResult.content?.find((item) => item.type === 'text');
+    assert(duplicateText?.type === 'text', 'duplicate check result did not contain text content');
+    const duplicatePayload = JSON.parse(duplicateText.text);
+    assert(duplicatePayload.ok === true, 'duplicate check result was not ok');
+    assert(duplicatePayload.exists === true, 'duplicate check should find the existing product');
+    assert(duplicatePayload.blocking === true, 'duplicate check should be blocking when a duplicate exists');
+    assert(duplicatePayload.duplicates?.[0]?.id === 'dup-1', 'duplicate check did not normalize duplicate id');
 
     const createResult = await client.callTool({
       name: 'product_create',

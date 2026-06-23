@@ -16,6 +16,7 @@ import {
   productListSuppliersInputSchema
 } from './tools/references.js';
 import { productGetDetail, productGetDetailInputSchema } from './tools/productDetail.js';
+import { productCheckNameDuplicate, productCheckNameDuplicateInputSchema } from './tools/productSearch.js';
 
 function toolResult(payload: unknown) {
   return {
@@ -67,6 +68,23 @@ export function createProductMcpServer(config: ProductMcpConfig, context: Produc
     async (input) => {
       try {
         return toolResult(await productCreate(backend, input, context.requestId));
+      } catch (error) {
+        return errorToolResult(mapUnknownError(error), context.requestId);
+      }
+    }
+  );
+
+  server.registerTool(
+    'product_check_name_duplicate',
+    {
+      title: 'Check duplicate product name',
+      description:
+        'Search ERP products by Chinese product name and return whether an exact same-name product already exists. Use after package required-field validation passes and before upload/create.',
+      inputSchema: productCheckNameDuplicateInputSchema
+    },
+    async (input) => {
+      try {
+        return toolResult(await productCheckNameDuplicate(backend, input, context.requestId));
       } catch (error) {
         return errorToolResult(mapUnknownError(error), context.requestId);
       }

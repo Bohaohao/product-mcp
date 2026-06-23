@@ -26,6 +26,7 @@ import {
   productListSuppliersInputSchema
 } from './tools/references.js';
 import { productGetDetail, productGetDetailInputSchema } from './tools/productDetail.js';
+import { productCheckNameDuplicate, productCheckNameDuplicateInputSchema } from './tools/productSearch.js';
 import {
   getLocalFileInfo,
   getSuggestedMapping,
@@ -145,7 +146,7 @@ export const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 90_000;
-export const LOCAL_BRIDGE_VERSION = '0.1.14';
+export const LOCAL_BRIDGE_VERSION = '0.1.15';
 const DEFAULT_CLIENT_ID = 'e5cd7e4891bf95d1d19206ce24a7b32e';
 
 const MACOS_PATH_ENTRIES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
@@ -1385,6 +1386,36 @@ async function main(): Promise<void> {
           isChromeRemoteDebuggingNotAllowedError(error)
         ) {
           return textResult(bridgeErrorPayload(error, config, 'PRODUCT_CREATE_FAILED'));
+        }
+
+        return textResult(toErrorPayload(error, requestId));
+      }
+    }
+  );
+
+  server.registerTool(
+    'product_check_name_duplicate',
+    {
+      title: 'Check duplicate product name',
+      description:
+        'Read Admin-Token from the configured Chrome project tab, then search ERP products by Chinese product name and return whether an exact same-name product already exists. After product_precheck_package required-field validation passes, call this before any product_upload_file or product_create call. If exists=true, stop upload/create and report the duplicate.',
+      inputSchema: productCheckNameDuplicateInputSchema
+    },
+    async (input) => {
+      const requestId = createBridgeRequestId('product_check_name_duplicate');
+      try {
+        return await bridge.callBackendTool(
+          'product_check_name_duplicate',
+          requestId,
+          (backend) => productCheckNameDuplicate(backend, input, requestId),
+          'product_check_name_duplicate uses the local bridge to call the ERP backend directly.'
+        );
+      } catch (error) {
+        if (
+          isChromeDevtoolsMcpPreflightError(error) ||
+          isChromeRemoteDebuggingNotAllowedError(error)
+        ) {
+          return textResult(bridgeErrorPayload(error, config, 'PRODUCT_TOKEN_BRIDGE_FAILED'));
         }
 
         return textResult(toErrorPayload(error, requestId));

@@ -24,8 +24,8 @@ export class BackendClient {
     return this.request<T>('GET', path, undefined, query);
   }
 
-  async post<T>(path: string, data: unknown): Promise<T> {
-    return this.request<T>('POST', path, data);
+  async post<T>(path: string, data: unknown, query?: QueryParams): Promise<T> {
+    return this.request<T>('POST', path, data, query);
   }
 
   private async request<T>(method: string, path: string, data?: unknown, query?: QueryParams): Promise<T> {
