@@ -135,15 +135,16 @@ function createFakeBackend() {
       return;
     }
 
-    if (req.method === 'POST' && req.url === '/api/user/erp/product/_page') {
+    if (req.method === 'POST' && req.url?.startsWith('/api/user/erp/commodity/list')) {
+      const url = new URL(req.url, 'http://127.0.0.1');
       let rawBody = '';
       req.on('data', (chunk) => {
         rawBody += chunk;
       });
       req.on('end', () => {
         const body = JSON.parse(rawBody || '{}');
-        assert(body.pageNum === 1, 'duplicate check pageNum was not forwarded');
-        assert(body.pageSize === 20, 'duplicate check pageSize was not forwarded');
+        assert(url.searchParams.get('pageNum') === '1', 'duplicate check pageNum query was not forwarded');
+        assert(url.searchParams.get('pageSize') === '20', 'duplicate check pageSize query was not forwarded');
         assert(body.keyword === 'SmokeTestProduct', 'duplicate check keyword was not normalized');
         sendJson(res, 200, {
           code: 200,

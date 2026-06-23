@@ -114,10 +114,11 @@ export async function productCheckNameDuplicate(
   const input: ProductCheckNameDuplicateInput = productCheckNameDuplicateObjectSchema.parse(rawInput);
   const productNameCn = input.productNameCn.trim();
   const keyword = searchKeyword(productNameCn);
-  const raw = await backend.post<ProductListResponse>('/user/erp/product/_page', {
-    pageNum: 1,
-    pageSize: input.pageSize,
+  const raw = await backend.post<ProductListResponse>('/user/erp/commodity/list', {
     keyword
+  }, {
+    pageNum: 1,
+    pageSize: input.pageSize
   });
 
   const candidates = extractRows(raw).map((row) => normalizeCandidate(row, productNameCn));
@@ -130,7 +131,7 @@ export async function productCheckNameDuplicate(
     blocking: exists,
     productNameCn,
     searchKeyword: keyword,
-    endpoint: '/user/erp/product/_page',
+    endpoint: '/user/erp/commodity/list',
     total: Number(raw.total || 0),
     candidateCount: candidates.length,
     duplicateCount: duplicates.length,

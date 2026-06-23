@@ -419,7 +419,7 @@ node dist/packagePrecheckCli.js "D:/path/to/product-package"
 后端接口：
 
 ```text
-POST /user/erp/product/_page
+POST /user/erp/commodity/list?pageNum=1&pageSize=20
 ```
 
 输入：
@@ -1035,7 +1035,7 @@ Read-only tool. It searches the ERP product management list by Chinese product n
 Backend endpoint:
 
 ```text
-POST /user/erp/product/_page
+POST /user/erp/commodity/list?pageNum=1&pageSize=20
 ```
 
 Input:
