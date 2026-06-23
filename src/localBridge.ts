@@ -145,14 +145,13 @@ export const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 90_000;
-export const LOCAL_BRIDGE_VERSION = '0.1.13';
+export const LOCAL_BRIDGE_VERSION = '0.1.14';
 const DEFAULT_CLIENT_ID = 'e5cd7e4891bf95d1d19206ce24a7b32e';
 
 const MACOS_PATH_ENTRIES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
 
 const CHROME_STAGE_TIMEOUTS_MS = {
   connectChrome: 30_000,
-  readSelectedPageToken: 15_000,
   listPages: 15_000,
   newPage: 40_000,
   selectPage: 10_000,
@@ -585,6 +584,7 @@ function isChromeRemoteDebuggingNotAllowedError(error: unknown): boolean {
 }
 
 function isPotentialChromeRemoteDebuggingError(error: unknown): boolean {
+  if (error instanceof ProductMcpError) return false;
   const message = error instanceof Error ? error.message : String(error);
   return /remote debugging|devtools|chrome|browser|target|websocket|connection|connect|ECONNREFUSED|ECONNRESET/i.test(message);
 }
@@ -613,6 +613,22 @@ function chromeRemoteDebuggingGuidance(config: ResolvedBridgeConfig) {
 }
 
 export function bridgeErrorPayload(error: unknown, config: ResolvedBridgeConfig, defaultCode: string): Record<string, unknown> {
+  if (error instanceof ProductMcpError && error.code === 'CHROME_REMOTE_DEBUGGING_NOT_ALLOWED') {
+    return {
+      ok: false,
+      code: error.code,
+      message: error.message,
+      details: error.details,
+      requiresUserAction: true,
+      ...chromeRemoteDebuggingGuidance(config),
+      environment: config.selectedEnvironment,
+      projectUrl: config.projectUrl,
+      matchUrlPrefixes: projectUrlPrefixes(config),
+      tokenStorageKey: config.tokenStorageKey,
+      remoteMcpUrl: config.remoteMcpUrl
+    };
+  }
+
   if (error instanceof ProductMcpError) {
     return {
       ok: false,
@@ -867,23 +883,7 @@ export class ProductTokenBridge {
     const chromeConfig = this.config.chromeMcp || defaultChromeMcpConfig();
     await this.ensureChromeDevtoolsMcp(chromeConfig);
 
-    let chrome: Client;
-    try {
-      chrome = await this.getChromeClient();
-      const selectedPageToken = await withChromeStageTimeout(
-        'read_selected_page_token',
-        CHROME_STAGE_TIMEOUTS_MS.readSelectedPageToken,
-        () => this.tryGetTokenFromSelectedChromePage(chrome)
-      );
-      if (selectedPageToken) return selectedPageToken;
-    } catch (error) {
-      if (isPotentialChromeRemoteDebuggingError(error)) {
-        throw new ChromeRemoteDebuggingNotAllowedError(
-          `Chrome DevTools MCP is installed but could not connect to Chrome. Open chrome://inspect/#remote-debugging in Chrome and enable "Allow remote debugging for this browser instance". Original error: ${error instanceof Error ? error.message : String(error)}`
-        );
-      }
-      throw error;
-    }
+    const chrome = await this.getChromeClient();
 
     let pagesResult: Awaited<ReturnType<Client['callTool']>>;
     try {
@@ -961,21 +961,6 @@ export class ProductTokenBridge {
     return this.cacheBrowserToken(tokenPayload, page.url);
   }
 
-  private async tryGetTokenFromSelectedChromePage(chrome: Client): Promise<BrowserToken | undefined> {
-    let tokenPayload: BrowserTokenPayload;
-    try {
-      tokenPayload = await this.readChromeTokenPayload(chrome);
-    } catch (error) {
-      if (isPotentialChromeRemoteDebuggingError(error)) throw error;
-      return undefined;
-    }
-
-    if (!tokenPayload.href || !isMatchingProjectPage(this.config, tokenPayload.href)) return undefined;
-    if (!tokenPayload.hasToken || !tokenPayload.token) return undefined;
-
-    return this.cacheBrowserToken(tokenPayload, tokenPayload.href);
-  }
-
   private async readChromeTokenPayload(chrome: Client): Promise<BrowserTokenPayload> {
     const tokenResult = await withChromeStageTimeout('evaluate_token', CHROME_STAGE_TIMEOUTS_MS.evaluateToken, () =>
       chrome.callTool({
@@ -1021,9 +1006,7 @@ export class ProductTokenBridge {
   }
 
   private async readChromeTokenFromMatchedPage(chrome: Client, page: ChromePage): Promise<BrowserTokenPayload> {
-    if (!page.selected) {
-      await this.selectChromePage(chrome, page, false);
-    }
+    await this.selectChromePage(chrome, page, true);
 
     let tokenPayload = await this.readChromeTokenPayload(chrome);
     if (tokenPayload.href && isMatchingProjectPage(this.config, tokenPayload.href)) {
