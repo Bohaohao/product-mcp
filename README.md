@@ -414,7 +414,7 @@ node dist/packagePrecheckCli.js "D:/path/to/product-package"
 
 ### `product_check_name_duplicate`
 
-只读工具。按商品中文名称查询 ERP 商品管理列表，并在 MCP 侧做精确同名判断。
+只读工具。按商品中文名称查询 ERP 商品管理列表，并在 MCP 侧逐条比较返回行的 `productNameCn`；只有 `productNameCn` 全等时才判定为同名。
 
 后端接口：
 
@@ -1030,7 +1030,7 @@ node dist/packagePrecheckCli.js "D:/path/to/product-package"
 
 ### `product_check_name_duplicate`
 
-Read-only tool. It searches the ERP product management list by Chinese product name, then performs exact same-name matching inside MCP.
+Read-only tool. It searches the ERP product management list by Chinese product name, then compares each returned row's `productNameCn` inside MCP. Only exact `productNameCn` equality is treated as a duplicate.
 
 Backend endpoint:
 

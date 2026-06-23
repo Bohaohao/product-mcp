@@ -10,19 +10,21 @@ interface ProductListResponse {
 }
 
 interface ProductListRow {
+  brand?: string;
+  categoryFirstId?: string | number;
   id?: string | number;
-  commodityId?: string | number;
-  productId?: string | number;
-  spuId?: string | number;
-  productName?: string;
+  mainImageUrl?: string;
+  productCode?: string;
+  productModel?: string;
   productNameCn?: string;
   productNameEn?: string;
-  spuName?: string;
-  spuNameCn?: string;
-  spuName_zh?: string;
-  productCode?: string;
+  productType?: string | number;
+  status?: string | number;
+  tags?: string[];
   categoryFirstName?: string;
+  categorySecondId?: string | number;
   categorySecondName?: string;
+  categoryThirdId?: string | number;
   categoryThirdName?: string;
   unitName?: string;
   createTime?: string;
@@ -67,12 +69,8 @@ function searchKeyword(productNameCn: string): string {
   return compactText(productNameCn).slice(0, 100) || productNameCn.slice(0, 100);
 }
 
-function rowChineseName(row: ProductListRow): string | undefined {
-  return normalizeName(row.productNameCn ?? row.spuNameCn ?? row.spuName_zh ?? row.productName ?? row.spuName);
-}
-
 function rowId(row: ProductListRow): string | undefined {
-  const value = row.commodityId ?? row.productId ?? row.id ?? row.spuId;
+  const value = row.id;
   if (value === undefined || value === null || value === '') return undefined;
   return String(value);
 }
@@ -85,20 +83,24 @@ function categoryPath(row: ProductListRow): string | undefined {
 }
 
 function normalizeCandidate(row: ProductListRow, requestedName: string) {
-  const productNameCn = rowChineseName(row);
-  const trimmedNameMatched = productNameCn === requestedName;
-  const compactNameMatched = Boolean(productNameCn && compactText(productNameCn) === compactText(requestedName));
+  const productNameCn = normalizeName(row.productNameCn);
+  const exactNameMatched = productNameCn === requestedName;
 
   return {
     id: rowId(row),
     productNameCn,
     productNameEn: normalizeName(row.productNameEn),
     productCode: normalizeName(row.productCode),
+    productModel: normalizeName(row.productModel),
+    mainImageUrl: normalizeName(row.mainImageUrl),
+    productType: row.productType,
+    status: row.status,
+    tags: row.tags,
     categoryPath: categoryPath(row),
     unitName: normalizeName(row.unitName),
     createTime: normalizeName(row.createTime),
     updateTime: normalizeName(row.updateTime),
-    matchType: trimmedNameMatched ? ('exact' as const) : compactNameMatched ? ('compact' as const) : undefined
+    matchType: exactNameMatched ? ('exact' as const) : undefined
   };
 }
 

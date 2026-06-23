@@ -151,7 +151,13 @@ function createFakeBackend() {
           data: {
             rows: [
               {
-                commodityId: 'dup-1',
+                id: 'candidate-compact-only',
+                productNameCn: 'SmokeTestProduct',
+                productNameEn: 'Compact Candidate',
+                productCode: 'SMOKE-COMPACT'
+              },
+              {
+                id: 'dup-1',
                 productNameCn: 'Smoke Test Product',
                 productNameEn: 'Smoke Test Product EN',
                 productCode: 'SMOKE-001',
@@ -498,6 +504,8 @@ async function main() {
     assert(duplicatePayload.ok === true, 'duplicate check result was not ok');
     assert(duplicatePayload.exists === true, 'duplicate check should find the existing product');
     assert(duplicatePayload.blocking === true, 'duplicate check should be blocking when a duplicate exists');
+    assert(duplicatePayload.candidateCount === 2, 'duplicate check should keep all keyword candidates');
+    assert(duplicatePayload.duplicateCount === 1, 'duplicate check should only count exact productNameCn matches');
     assert(duplicatePayload.duplicates?.[0]?.id === 'dup-1', 'duplicate check did not normalize duplicate id');
 
     const createResult = await client.callTool({
