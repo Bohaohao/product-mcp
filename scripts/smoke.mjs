@@ -3,7 +3,9 @@ import { once } from 'node:events';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { parsePages } from '../dist/chromePages.js';
+import { ProductTokenBridge } from '../dist/localBridge.js';
 import { createProductMcpExpressApp } from '../dist/server.js';
+import { ProductTokenDaemonClient } from '../dist/tokenDaemonClient.js';
 
 const fakeBackendPort = Number(process.env.SMOKE_BACKEND_PORT || 18787);
 const mcpPort = Number(process.env.SMOKE_MCP_PORT || 18788);
@@ -12,6 +14,14 @@ const authorization = 'Bearer smoke-token';
 function sendJson(res, status, body) {
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(body));
+}
+
+async function readJsonBody(req) {
+  let rawBody = '';
+  for await (const chunk of req) {
+    rawBody += chunk;
+  }
+  return rawBody ? JSON.parse(rawBody) : {};
 }
 
 function createFakeBackend() {
@@ -196,8 +206,155 @@ function createFakeBackend() {
   });
 }
 
+function createFakeTokenDaemon(secret) {
+  const stats = {
+    statusCalls: 0,
+    tokenCalls: 0,
+    invalidateCalls: 0,
+    lastTokenForceRefresh: undefined
+  };
+  const now = new Date();
+  const tokenPayload = {
+    ok: true,
+    token: 'smoke-token',
+    pageUrl: 'https://test.eysscm.com/erp/commodity/commodity',
+    origin: 'https://test.eysscm.com',
+    fetchedAt: now.toISOString(),
+    expiresAt: new Date(now.getTime() + 2 * 60 * 60 * 1000).toISOString(),
+    expiresInSeconds: 7200,
+    fromCache: false
+  };
+
+  const server = createServer(async (req, res) => {
+    if (req.headers.authorization !== `Bearer ${secret}`) {
+      sendJson(res, 401, {
+        ok: false,
+        code: 'TOKEN_DAEMON_AUTH_FAILED',
+        message: 'bad secret'
+      });
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/healthz') {
+      sendJson(res, 200, {
+        ok: true,
+        name: 'fake-product-token-bridge-daemon'
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/auth/status') {
+      await readJsonBody(req);
+      stats.statusCalls += 1;
+      sendJson(res, 200, {
+        ok: true,
+        tokenPresent: true,
+        tokenProvider: 'token_bridge_daemon',
+        matchedPageUrl: tokenPayload.pageUrl,
+        origin: tokenPayload.origin,
+        tokenStorageKey: 'Admin-Token',
+        tokenCache: {
+          enabled: true,
+          fromCache: false,
+          expiresInSeconds: 7200
+        }
+      });
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/auth/token') {
+      const body = await readJsonBody(req);
+      stats.tokenCalls += 1;
+      stats.lastTokenForceRefresh = Boolean(body.forceRefresh);
+      sendJson(res, 200, tokenPayload);
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/auth/invalidate') {
+      await readJsonBody(req);
+      stats.invalidateCalls += 1;
+      sendJson(res, 200, {
+        ok: true,
+        invalidated: true
+      });
+      return;
+    }
+
+    sendJson(res, 404, {
+      ok: false,
+      code: 'not_found'
+    });
+  });
+
+  return { server, stats };
+}
+
 function assert(condition, message) {
   if (!condition) throw new Error(message);
+}
+
+async function closeServer(server) {
+  await new Promise((resolve, reject) => {
+    server.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+}
+
+async function assertTokenDaemonClientAndBridge() {
+  const secret = 'smoke-secret';
+  const { server, stats } = createFakeTokenDaemon(secret);
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const address = server.address();
+  const url = `http://127.0.0.1:${address.port}`;
+  const previousUrl = process.env.PRODUCT_TOKEN_DAEMON_URL;
+  const previousSecret = process.env.PRODUCT_TOKEN_DAEMON_SECRET;
+
+  try {
+    const client = new ProductTokenDaemonClient({ url, secret });
+    const health = await client.healthz();
+    assert(health.ok === true, 'daemon healthz failed');
+
+    const status = await client.authStatus();
+    assert(status.ok === true, 'daemon auth status failed');
+    assert(!JSON.stringify(status).includes('smoke-token'), 'daemon auth status leaked token');
+
+    const token = await client.getToken({ forceRefresh: true });
+    assert(token.token === 'smoke-token', 'daemon token response was not returned to local client');
+    assert(stats.lastTokenForceRefresh === true, 'daemon token forceRefresh was not forwarded');
+
+    await client.invalidate();
+    assert(stats.invalidateCalls === 1, 'daemon invalidate was not called');
+
+    process.env.PRODUCT_TOKEN_DAEMON_URL = url;
+    process.env.PRODUCT_TOKEN_DAEMON_SECRET = secret;
+    const bridge = new ProductTokenBridge({
+      projectUrl: 'https://test.eysscm.com/erp/commodity/commodity',
+      matchUrlPrefixes: ['https://test.eysscm.com/erp/commodity'],
+      tokenStorageKey: 'Admin-Token',
+      backendBaseUrl: 'http://127.0.0.1:1/api',
+      clientId: 'e5cd7e4891bf95d1d19206ce24a7b32e',
+      language: 'zh_CN'
+    });
+
+    const bridgeStatus = await bridge.getAuthStatus();
+    assert(bridgeStatus.tokenProvider === 'token_bridge_daemon', 'bridge auth status did not use daemon');
+    assert(!JSON.stringify(bridgeStatus).includes('smoke-token'), 'bridge auth status leaked token');
+
+    const bridgeToken = await bridge.getBrowserToken({ forceRefresh: true });
+    assert(bridgeToken.token === 'smoke-token', 'bridge did not fetch token from daemon');
+    assert(stats.statusCalls >= 2, 'bridge did not call daemon auth status');
+    assert(stats.tokenCalls >= 2, 'bridge did not call daemon token endpoint');
+    await bridge.close();
+  } finally {
+    if (previousUrl === undefined) delete process.env.PRODUCT_TOKEN_DAEMON_URL;
+    else process.env.PRODUCT_TOKEN_DAEMON_URL = previousUrl;
+    if (previousSecret === undefined) delete process.env.PRODUCT_TOKEN_DAEMON_SECRET;
+    else process.env.PRODUCT_TOKEN_DAEMON_SECRET = previousSecret;
+    await closeServer(server);
+  }
 }
 
 function assertChromePageParsing() {
@@ -219,6 +376,7 @@ function assertChromePageParsing() {
 
 async function main() {
   assertChromePageParsing();
+  await assertTokenDaemonClientAndBridge();
 
   const fakeBackend = createFakeBackend();
   fakeBackend.listen(fakeBackendPort, '127.0.0.1');

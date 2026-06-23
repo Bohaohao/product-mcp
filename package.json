@@ -1,6 +1,6 @@
 {
   "name": "product-mcp",
-  "version": "0.1.12",
+  "version": "0.1.13",
   "private": true,
   "type": "module",
   "description": "Remote HTTP MCP server for ERP product operations.",
@@ -8,6 +8,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "token-daemon": "node dist/tokenBridgeDaemon.js",
     "smoke": "node scripts/smoke.mjs"
   },
   "dependencies": {

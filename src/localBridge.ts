@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
@@ -38,15 +39,20 @@ import {
 import { defaultUploadBackendConfig, getOssStsToken, uploadLocalFileToOss } from './upload/ossUploader.js';
 import { precheckProductPackage, productPrecheckPackageInputSchema } from './packagePrecheck.js';
 import { prepareImageForUpload } from './upload/imagePreparer.js';
+import {
+  ProductTokenDaemonClient,
+  createProductTokenDaemonClientFromEnv,
+  describeTokenDaemonEnv
+} from './tokenDaemonClient.js';
 
-interface BridgeEnvironmentConfig {
+export interface BridgeEnvironmentConfig {
   projectUrl?: string;
   matchUrlPrefixes?: string[];
   remoteMcpUrl?: string;
   backendBaseUrl?: string;
 }
 
-interface BridgeConfig extends BridgeEnvironmentConfig {
+export interface BridgeConfig extends BridgeEnvironmentConfig {
   environment?: string;
   environments?: Record<string, BridgeEnvironmentConfig>;
   tokenStorageKey?: string;
@@ -59,7 +65,7 @@ interface BridgeConfig extends BridgeEnvironmentConfig {
   };
 }
 
-interface ResolvedBridgeConfig extends BridgeConfig {
+export interface ResolvedBridgeConfig extends BridgeConfig {
   projectUrl: string;
   tokenStorageKey: string;
   remoteMcpUrl?: string;
@@ -68,7 +74,7 @@ interface ResolvedBridgeConfig extends BridgeConfig {
   selectedEnvironment?: string;
 }
 
-interface BrowserToken {
+export interface BrowserToken {
   token: string;
   pageUrl: string;
   origin: string;
@@ -135,14 +141,23 @@ interface ChromePageDiagnostics {
   parseNote?: string;
 }
 
-const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
+export const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
-const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 60_000;
-const LOCAL_BRIDGE_VERSION = '0.1.12';
+const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 90_000;
+export const LOCAL_BRIDGE_VERSION = '0.1.13';
 const DEFAULT_CLIENT_ID = 'e5cd7e4891bf95d1d19206ce24a7b32e';
 
-const POSIX_PATH_ENTRIES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+const MACOS_PATH_ENTRIES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
+
+const CHROME_STAGE_TIMEOUTS_MS = {
+  connectChrome: 30_000,
+  readSelectedPageToken: 15_000,
+  listPages: 15_000,
+  newPage: 40_000,
+  selectPage: 10_000,
+  evaluateToken: 10_000
+};
 
 const productAuthStatusInputSchema = {
   forceRefresh: z.boolean().default(false).describe('When true, bypass the in-memory token cache and read Admin-Token from Chrome again.')
@@ -162,6 +177,38 @@ class ChromeRemoteDebuggingNotAllowedError extends Error {
   }
 }
 
+async function withChromeStageTimeout<T>(
+  stage: string,
+  timeoutMs: number,
+  run: () => Promise<T>
+): Promise<T> {
+  let timeout: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      run(),
+      new Promise<T>((_, reject) => {
+        timeout = setTimeout(() => {
+          reject(
+            new ProductMcpError(
+              'CHROME_STAGE_TIMEOUT',
+              `Timed out while reading the ERP login token from Chrome during stage: ${stage}.`,
+              {
+                details: {
+                  stage,
+                  timeoutMs,
+                  checkedAt: new Date().toISOString()
+                }
+              }
+            )
+          );
+        }, timeoutMs);
+      })
+    ]);
+  } finally {
+    if (timeout) clearTimeout(timeout);
+  }
+}
+
 function parseArgs(): { configPath: string } {
   const index = process.argv.indexOf('--config');
   const configPath = index >= 0 ? process.argv[index + 1] : process.env.PRODUCT_MCP_BRIDGE_CONFIG;
@@ -173,8 +220,8 @@ function parseArgs(): { configPath: string } {
   return { configPath };
 }
 
-function loadConfig(path: string): ResolvedBridgeConfig {
-  const config = JSON.parse(readFileSync(path, 'utf8')) as BridgeConfig;
+export function loadConfig(path: string): ResolvedBridgeConfig {
+  const config = JSON.parse(readFileSync(path, 'utf8').replace(/^\uFEFF/, '')) as BridgeConfig;
   const resolvedConfig = resolveEnvironmentConfig(config);
 
   if (!resolvedConfig.projectUrl) throw new Error('Bridge config missing projectUrl.');
@@ -259,6 +306,7 @@ function createBridgeRequestId(prefix = 'bridge'): string {
 }
 
 function bridgeConfigStatus(config: ResolvedBridgeConfig, configPath: string) {
+  const tokenDaemon = describeTokenDaemonEnv();
   return {
     ok: true,
     bridge: {
@@ -279,6 +327,7 @@ function bridgeConfigStatus(config: ResolvedBridgeConfig, configPath: string) {
       enabled: true,
       maxTtlSeconds: TOKEN_CACHE_TTL_MS / 1000
     },
+    tokenDaemon,
     chromeMcp: {
       configured: Boolean(config.chromeMcp),
       usesChromeDevtoolsMcpPackage: usesChromeDevtoolsMcpPackage(config.chromeMcp || defaultChromeMcpConfig())
@@ -414,10 +463,10 @@ function cleanEnv(env: NodeJS.ProcessEnv, overrides: Record<string, string> = {}
     ...overrides
   };
 
-  if (process.platform !== 'win32') {
+  if (process.platform === 'darwin') {
     const delimiter = ':';
     const existingPath = merged.PATH || merged.Path || '';
-    const pathParts = [...POSIX_PATH_ENTRIES, ...nodeManagerPathEntries(), ...existingPath.split(delimiter)].filter(Boolean);
+    const pathParts = [...MACOS_PATH_ENTRIES, ...nodeManagerPathEntries(), ...existingPath.split(delimiter)].filter(Boolean);
     merged.PATH = [...new Set(pathParts)].join(delimiter);
   }
 
@@ -563,7 +612,7 @@ function chromeRemoteDebuggingGuidance(config: ResolvedBridgeConfig) {
   };
 }
 
-function bridgeErrorPayload(error: unknown, config: ResolvedBridgeConfig, defaultCode: string): Record<string, unknown> {
+export function bridgeErrorPayload(error: unknown, config: ResolvedBridgeConfig, defaultCode: string): Record<string, unknown> {
   if (error instanceof ProductMcpError) {
     return {
       ok: false,
@@ -625,6 +674,34 @@ function getTokenCacheMetadata(token: CachedBrowserToken, fromCache: boolean): B
     expiresAt: new Date(token.expiresAtMs).toISOString(),
     expiresInSeconds: Math.ceil(expiresInMs / 1000),
     fromCache
+  };
+}
+
+export function browserTokenAuthStatusPayload(
+  config: ResolvedBridgeConfig,
+  token: BrowserToken,
+  tokenProvider: 'local_bridge' | 'token_bridge_daemon'
+): Record<string, unknown> {
+  return {
+    ok: true,
+    environment: config.selectedEnvironment,
+    projectUrl: config.projectUrl,
+    matchUrlPrefixes: config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl],
+    matchedPageUrl: token.pageUrl,
+    origin: token.origin,
+    tokenStorageKey: config.tokenStorageKey,
+    tokenPresent: true,
+    tokenProvider,
+    tokenSource: token.fromCache ? 'cache' : 'chrome',
+    tokenCache: {
+      enabled: true,
+      maxTtlSeconds: TOKEN_CACHE_TTL_MS / 1000,
+      fromCache: token.fromCache,
+      fetchedAt: token.fetchedAt,
+      expiresAt: token.expiresAt,
+      expiresInSeconds: token.expiresInSeconds
+    },
+    remoteMcpUrl: config.remoteMcpUrl
   };
 }
 
@@ -710,21 +787,63 @@ function localBackendToolPayload(result: unknown, toolName: string, reason: stri
   };
 }
 
-class ProductTokenBridge {
+interface ProductTokenBridgeOptions {
+  useTokenDaemon?: boolean;
+  tokenDaemonClient?: ProductTokenDaemonClient;
+}
+
+export class ProductTokenBridge {
   private chromeClient?: Client;
   private cachedToken?: CachedBrowserToken;
   private chromeDevtoolsMcpPreflight?: Promise<void>;
   private lastAuthFailureRefreshAtMs = 0;
   private readonly uploadCache = new Map<string, CachedOssUpload>();
+  private readonly tokenDaemonClient?: ProductTokenDaemonClient;
+  private readonly tokenDaemonConfigError?: ProductMcpError;
 
-  constructor(private readonly config: ResolvedBridgeConfig) {}
+  constructor(private readonly config: ResolvedBridgeConfig, options: ProductTokenBridgeOptions = {}) {
+    if (options.tokenDaemonClient) {
+      this.tokenDaemonClient = options.tokenDaemonClient;
+      return;
+    }
+
+    if (options.useTokenDaemon === false) return;
+
+    try {
+      this.tokenDaemonClient = createProductTokenDaemonClientFromEnv();
+    } catch (error) {
+      if (error instanceof ProductMcpError) {
+        this.tokenDaemonConfigError = error;
+        return;
+      }
+      throw error;
+    }
+  }
 
   async close(): Promise<void> {
     await this.chromeClient?.close();
   }
 
-  invalidateTokenCache(): void {
+  async invalidateTokenCache(): Promise<void> {
+    if (this.tokenDaemonClient) {
+      await this.tokenDaemonClient.invalidate().catch(() => undefined);
+    }
     this.cachedToken = undefined;
+  }
+
+  private getTokenDaemonClient(): ProductTokenDaemonClient | undefined {
+    if (this.tokenDaemonConfigError) throw this.tokenDaemonConfigError;
+    return this.tokenDaemonClient;
+  }
+
+  async getAuthStatus(options: { forceRefresh?: boolean } = {}): Promise<Record<string, unknown>> {
+    const daemon = this.getTokenDaemonClient();
+    if (daemon) {
+      return await daemon.authStatus(options);
+    }
+
+    const token = await this.getBrowserToken(options);
+    return browserTokenAuthStatusPayload(this.config, token, 'local_bridge');
   }
 
   private canRefreshTokenAfterAuthFailure(): boolean {
@@ -736,6 +855,11 @@ class ProductTokenBridge {
   }
 
   async getBrowserToken(options: { forceRefresh?: boolean } = {}): Promise<BrowserToken> {
+    const daemon = this.getTokenDaemonClient();
+    if (daemon) {
+      return await daemon.getToken(options);
+    }
+
     if (!options.forceRefresh && this.cachedToken && this.cachedToken.expiresAtMs > Date.now()) {
       return getTokenCacheMetadata(this.cachedToken, true);
     }
@@ -746,7 +870,11 @@ class ProductTokenBridge {
     let chrome: Client;
     try {
       chrome = await this.getChromeClient();
-      const selectedPageToken = await this.tryGetTokenFromSelectedChromePage(chrome);
+      const selectedPageToken = await withChromeStageTimeout(
+        'read_selected_page_token',
+        CHROME_STAGE_TIMEOUTS_MS.readSelectedPageToken,
+        () => this.tryGetTokenFromSelectedChromePage(chrome)
+      );
       if (selectedPageToken) return selectedPageToken;
     } catch (error) {
       if (isPotentialChromeRemoteDebuggingError(error)) {
@@ -759,7 +887,9 @@ class ProductTokenBridge {
 
     let pagesResult: Awaited<ReturnType<Client['callTool']>>;
     try {
-      pagesResult = await chrome.callTool({ name: 'list_pages', arguments: {} });
+      pagesResult = await withChromeStageTimeout('list_pages', CHROME_STAGE_TIMEOUTS_MS.listPages, () =>
+        chrome.callTool({ name: 'list_pages', arguments: {} })
+      );
     } catch (error) {
       if (isPotentialChromeRemoteDebuggingError(error)) {
         throw new ChromeRemoteDebuggingNotAllowedError(
@@ -776,13 +906,15 @@ class ProductTokenBridge {
     let refreshedPages: ChromePage[] | undefined;
 
     if (!page) {
-      const newPage = await chrome.callTool({
-        name: 'new_page',
-        arguments: {
-          url: this.config.projectUrl,
-          timeout: 30000
-        }
-      });
+      const newPage = await withChromeStageTimeout('new_page', CHROME_STAGE_TIMEOUTS_MS.newPage, () =>
+        chrome.callTool({
+          name: 'new_page',
+          arguments: {
+            url: this.config.projectUrl,
+            timeout: 30000
+          }
+        })
+      );
       newPageText = this.getSingleText(newPage);
       refreshedPages = parsePages(newPageText);
       page = refreshedPages.find((candidate) => isMatchingProjectPage(this.config, candidate.url));
@@ -845,44 +977,52 @@ class ProductTokenBridge {
   }
 
   private async readChromeTokenPayload(chrome: Client): Promise<BrowserTokenPayload> {
-    const tokenResult = await chrome.callTool({
-      name: 'evaluate_script',
-      arguments: {
-        function: `() => {
-          const key = ${JSON.stringify(this.config.tokenStorageKey)};
-          try {
-            const token = window.localStorage.getItem(key);
-            return {
-              href: location.href,
-              origin: location.origin,
-              hasToken: Boolean(token),
-              token
-            };
-          } catch (error) {
-            return {
-              href: location.href,
-              origin: location.origin,
-              hasToken: false,
-              readError: error instanceof Error ? error.message : String(error),
-              readErrorName: error instanceof Error ? error.name : undefined
-            };
-          }
-        }`
-      }
-    });
+    const tokenResult = await withChromeStageTimeout('evaluate_token', CHROME_STAGE_TIMEOUTS_MS.evaluateToken, () =>
+      chrome.callTool({
+        name: 'evaluate_script',
+        arguments: {
+          function: `() => {
+            const key = ${JSON.stringify(this.config.tokenStorageKey)};
+            try {
+              const token = window.localStorage.getItem(key);
+              return {
+                href: location.href,
+                origin: location.origin,
+                hasToken: Boolean(token),
+                token
+              };
+            } catch (error) {
+              return {
+                href: location.href,
+                origin: location.origin,
+                hasToken: false,
+                readError: error instanceof Error ? error.message : String(error),
+                readErrorName: error instanceof Error ? error.name : undefined
+              };
+            }
+          }`
+        }
+      })
+    );
 
     return extractJsonFromChromeText(this.getSingleText(tokenResult)) as BrowserTokenPayload;
   }
 
-  private async readChromeTokenFromMatchedPage(chrome: Client, page: ChromePage): Promise<BrowserTokenPayload> {
-    if (!page.selected) {
+  private async selectChromePage(chrome: Client, page: ChromePage, bringToFront: boolean): Promise<void> {
+    await withChromeStageTimeout('select_page', CHROME_STAGE_TIMEOUTS_MS.selectPage, async () => {
       await chrome.callTool({
         name: 'select_page',
         arguments: {
           pageId: page.id,
-          bringToFront: false
+          bringToFront
         }
       });
+    });
+  }
+
+  private async readChromeTokenFromMatchedPage(chrome: Client, page: ChromePage): Promise<BrowserTokenPayload> {
+    if (!page.selected) {
+      await this.selectChromePage(chrome, page, false);
     }
 
     let tokenPayload = await this.readChromeTokenPayload(chrome);
@@ -890,13 +1030,7 @@ class ProductTokenBridge {
       return tokenPayload;
     }
 
-    await chrome.callTool({
-      name: 'select_page',
-      arguments: {
-        pageId: page.id,
-        bringToFront: true
-      }
-    });
+    await this.selectChromePage(chrome, page, true);
 
     tokenPayload = await this.readChromeTokenPayload(chrome);
     if (tokenPayload.href && isMatchingProjectPage(this.config, tokenPayload.href)) {
@@ -954,7 +1088,7 @@ class ProductTokenBridge {
     }
 
     this.noteAuthFailureRefresh();
-    this.invalidateTokenCache();
+    await this.invalidateTokenCache();
     return await this.callBackendToolOnce(name, requestId, run, reason, true);
   }
 
@@ -1097,7 +1231,7 @@ class ProductTokenBridge {
     }
 
     this.noteAuthFailureRefresh();
-    this.invalidateTokenCache();
+    await this.invalidateTokenCache();
     const refreshedToken = await this.getBrowserToken({ forceRefresh: true });
     return await getOssStsToken(backendConfig, asBearer(refreshedToken.token));
   }
@@ -1113,7 +1247,9 @@ class ProductTokenBridge {
       env: cleanEnv(process.env, chromeConfig.env || {})
     });
     const client = new Client({ name: 'product-token-bridge-chrome-client', version: '0.1.0' });
-    await client.connect(transport);
+    await withChromeStageTimeout('connect_chrome_devtools_mcp', CHROME_STAGE_TIMEOUTS_MS.connectChrome, () =>
+      client.connect(transport)
+    );
     this.chromeClient = client;
     return client;
   }
@@ -1173,28 +1309,7 @@ async function main(): Promise<void> {
     async (input) => {
       try {
         const forceRefresh = Boolean((input as { forceRefresh?: boolean } | undefined)?.forceRefresh);
-        const token = await bridge.getBrowserToken({ forceRefresh });
-        return textResult({
-          ok: true,
-          environment: config.selectedEnvironment,
-          projectUrl: config.projectUrl,
-          matchUrlPrefixes: config.matchUrlPrefixes?.length ? config.matchUrlPrefixes : [config.projectUrl],
-          matchedPageUrl: token.pageUrl,
-          origin: token.origin,
-          tokenStorageKey: config.tokenStorageKey,
-          tokenPresent: true,
-          tokenLength: token.token.length,
-          tokenSource: token.fromCache ? 'cache' : 'chrome',
-          tokenCache: {
-            enabled: true,
-            maxTtlSeconds: TOKEN_CACHE_TTL_MS / 1000,
-            fromCache: token.fromCache,
-            fetchedAt: token.fetchedAt,
-            expiresAt: token.expiresAt,
-            expiresInSeconds: token.expiresInSeconds
-          },
-          remoteMcpUrl: config.remoteMcpUrl
-        });
+        return textResult(await bridge.getAuthStatus({ forceRefresh }));
       } catch (error) {
         return textResult(bridgeErrorPayload(error, config, 'PRODUCT_AUTH_STATUS_FAILED'));
       }
@@ -1459,7 +1574,9 @@ async function main(): Promise<void> {
   await server.connect(new StdioServerTransport());
 }
 
-main().catch((error) => {
-  console.error(error instanceof Error ? error.stack : error);
-  process.exit(1);
-});
+if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
+  main().catch((error) => {
+    console.error(error instanceof Error ? error.stack : error);
+    process.exit(1);
+  });
+}
