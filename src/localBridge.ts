@@ -146,7 +146,7 @@ export const TOKEN_CACHE_TTL_MS = 2 * 60 * 60 * 1000;
 const AUTH_FAILURE_REFRESH_COOLDOWN_MS = 60 * 1000;
 const CHROME_DEVTOOLS_MCP_PACKAGE = 'chrome-devtools-mcp@latest';
 const CHROME_DEVTOOLS_MCP_PREFLIGHT_TIMEOUT_MS = 90_000;
-export const LOCAL_BRIDGE_VERSION = '0.1.17';
+export const LOCAL_BRIDGE_VERSION = '0.1.18';
 const DEFAULT_CLIENT_ID = 'e5cd7e4891bf95d1d19206ce24a7b32e';
 
 const MACOS_PATH_ENTRIES = ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'];
@@ -784,7 +784,43 @@ function isAuthFailureError(error: unknown): boolean {
   );
 }
 
-function localBackendToolPayload(result: unknown, toolName: string, reason: string): Record<string, unknown> {
+function tokenFetchedAtMs(token?: BrowserToken): number | undefined {
+  if (!token?.fetchedAt) return undefined;
+  const fetchedAtMs = Date.parse(token.fetchedAt);
+  return Number.isFinite(fetchedAtMs) ? fetchedAtMs : undefined;
+}
+
+function tokenWasFetchedRecently(token: BrowserToken | undefined, windowMs: number): boolean {
+  const fetchedAtMs = tokenFetchedAtMs(token);
+  return fetchedAtMs !== undefined && Date.now() - fetchedAtMs >= 0 && Date.now() - fetchedAtMs < windowMs;
+}
+
+function authTransportPayload(
+  token: BrowserToken,
+  tokenProvider: 'local_bridge' | 'token_bridge_daemon'
+): Record<string, unknown> {
+  return {
+    tokenProvider,
+    tokenSource: token.fromCache ? 'cache' : 'chrome',
+    matchedPageUrl: token.pageUrl,
+    origin: token.origin,
+    tokenCache: {
+      enabled: true,
+      maxTtlSeconds: TOKEN_CACHE_TTL_MS / 1000,
+      fromCache: token.fromCache,
+      fetchedAt: token.fetchedAt,
+      expiresAt: token.expiresAt,
+      expiresInSeconds: token.expiresInSeconds
+    }
+  };
+}
+
+function localBackendToolPayload(
+  result: unknown,
+  toolName: string,
+  reason: string,
+  auth?: Record<string, unknown>
+): Record<string, unknown> {
   const payload =
     result && typeof result === 'object' && !Array.isArray(result)
       ? { ...(result as Record<string, unknown>) }
@@ -799,7 +835,8 @@ function localBackendToolPayload(result: unknown, toolName: string, reason: stri
       mode: 'local_bridge_backend',
       toolName,
       reason,
-      remoteMcpBypassed: true
+      remoteMcpBypassed: true,
+      auth
     }
   };
 }
@@ -814,6 +851,7 @@ export class ProductTokenBridge {
   private cachedToken?: CachedBrowserToken;
   private chromeDevtoolsMcpPreflight?: Promise<void>;
   private lastAuthFailureRefreshAtMs = 0;
+  private lastBrowserToken?: BrowserToken;
   private readonly uploadCache = new Map<string, CachedOssUpload>();
   private readonly tokenDaemonClient?: ProductTokenDaemonClient;
   private readonly tokenDaemonConfigError?: ProductMcpError;
@@ -871,14 +909,22 @@ export class ProductTokenBridge {
     this.lastAuthFailureRefreshAtMs = Date.now();
   }
 
+  private recentlyReadBrowserToken(): boolean {
+    return tokenWasFetchedRecently(this.lastBrowserToken, AUTH_FAILURE_REFRESH_COOLDOWN_MS);
+  }
+
   async getBrowserToken(options: { forceRefresh?: boolean } = {}): Promise<BrowserToken> {
     const daemon = this.getTokenDaemonClient();
     if (daemon) {
-      return await daemon.getToken(options);
+      const token = await daemon.getToken(options);
+      this.lastBrowserToken = token;
+      return token;
     }
 
     if (!options.forceRefresh && this.cachedToken && this.cachedToken.expiresAtMs > Date.now()) {
-      return getTokenCacheMetadata(this.cachedToken, true);
+      const token = getTokenCacheMetadata(this.cachedToken, true);
+      this.lastBrowserToken = token;
+      return token;
     }
 
     const chromeConfig = this.config.chromeMcp || defaultChromeMcpConfig();
@@ -959,7 +1005,13 @@ export class ProductTokenBridge {
       );
     }
 
-    return this.cacheBrowserToken(tokenPayload, page.url);
+    const token = this.cacheBrowserToken(tokenPayload, page.url);
+    this.lastBrowserToken = token;
+    return token;
+  }
+
+  private tokenProvider(): 'local_bridge' | 'token_bridge_daemon' {
+    return this.tokenDaemonClient ? 'token_bridge_daemon' : 'local_bridge';
   }
 
   private async readChromeTokenPayload(chrome: Client): Promise<BrowserTokenPayload> {
@@ -1068,6 +1120,10 @@ export class ProductTokenBridge {
       return await this.callBackendToolOnce(name, requestId, run, reason, false);
     } catch (error) {
       if (!isAuthFailureError(error)) throw error;
+      if (this.recentlyReadBrowserToken()) {
+        await this.invalidateTokenCache();
+        throw error;
+      }
       if (!this.canRefreshTokenAfterAuthFailure()) throw error;
     }
 
@@ -1091,7 +1147,7 @@ export class ProductTokenBridge {
     });
     const result = await run(backend);
 
-    return textResult(localBackendToolPayload(result, name, reason));
+    return textResult(localBackendToolPayload(result, name, reason, authTransportPayload(browserToken, this.tokenProvider())));
   }
 
   async createProduct(input: unknown, requestId: string): Promise<CallToolResult> {
@@ -1126,6 +1182,7 @@ export class ProductTokenBridge {
     const sourceLocalPath = parsedInput.sourceLocalPath ? path.resolve(parsedInput.sourceLocalPath) : sourceFile.absolutePath;
     let cachedUpload = this.uploadCache.get(cacheKey);
     const reusedUpload = Boolean(cachedUpload);
+    let uploadAuth: Record<string, unknown> | undefined;
 
     if (cachedUpload) {
       cachedUpload.reuseCount += 1;
@@ -1135,8 +1192,9 @@ export class ProductTokenBridge {
         clientId: this.config.clientId,
         language: this.config.language || 'zh_CN'
       });
-      const sts = await this.getOssStsTokenWithCache(backendConfig);
-      const upload = await uploadLocalFileToOss(sts, file, policy);
+      const stsResult = await this.getOssStsTokenWithCache(backendConfig);
+      uploadAuth = stsResult.auth;
+      const upload = await uploadLocalFileToOss(stsResult.sts, file, policy);
       cachedUpload = {
         url: upload.url,
         objectKey: upload.objectKey,
@@ -1181,6 +1239,18 @@ export class ProductTokenBridge {
           },
       suggestedMapping: getSuggestedMapping(policy),
       reusedUpload,
+      transport: {
+        mode: 'local_bridge_upload',
+        toolName: 'product_upload_file',
+        reason: 'product_upload_file uses the local bridge to request OSS STS and upload directly from the user machine.',
+        remoteMcpBypassed: true,
+        auth:
+          uploadAuth ??
+          {
+            tokenRead: false,
+            reason: 'upload cache reused; no OSS STS request was needed for this file.'
+          }
+      },
       dedupe: {
         enabled: true,
         cacheKey,
@@ -1208,16 +1278,26 @@ export class ProductTokenBridge {
   private async getOssStsTokenWithCache(backendConfig: ReturnType<typeof defaultUploadBackendConfig>) {
     try {
       const browserToken = await this.getBrowserToken();
-      return await getOssStsToken(backendConfig, asBearer(browserToken.token));
+      return {
+        sts: await getOssStsToken(backendConfig, asBearer(browserToken.token)),
+        auth: authTransportPayload(browserToken, this.tokenProvider())
+      };
     } catch (error) {
       if (!isAuthFailureError(error)) throw error;
+      if (this.recentlyReadBrowserToken()) {
+        await this.invalidateTokenCache();
+        throw error;
+      }
       if (!this.canRefreshTokenAfterAuthFailure()) throw error;
     }
 
     this.noteAuthFailureRefresh();
     await this.invalidateTokenCache();
     const refreshedToken = await this.getBrowserToken({ forceRefresh: true });
-    return await getOssStsToken(backendConfig, asBearer(refreshedToken.token));
+    return {
+      sts: await getOssStsToken(backendConfig, asBearer(refreshedToken.token)),
+      auth: authTransportPayload(refreshedToken, this.tokenProvider())
+    };
   }
 
   private async getChromeClient(): Promise<Client> {

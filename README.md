@@ -249,8 +249,11 @@ product-token-bridge.config.json
 
 - 超过 2 小时自动失效，下次调用会重新从 Chrome 读取。
 - 远程 Product MCP 或 ERP 后端返回 401/403 时，bridge 会清空缓存，重新从 Chrome 读取 token，并自动重试一次。
+- 如果 token 刚刚才从 Chrome 读取，后端仍返回 401/403，bridge 会清空缓存并返回该后端错误，不会在同一个工具调用里立刻再次唤起 Chrome；用户重新登录或刷新 ERP 页面后，再调用 `product_auth_status` 会重新读取最新 token。
 - 如果短时间内连续出现 401/403，bridge 不会每次都重新唤起 Chrome；它会保留最近一次刷新结果并返回后端错误，避免权限错误或持续失效状态造成反复 Chrome 远程调试确认。
 - `product_auth_status` 支持 `forceRefresh: true`，用于主动绕过缓存并重新读取 Chrome。
+
+后端查询、上传和创建类工具会在返回的 `transport.auth` 中附带脱敏诊断，例如 `tokenProvider`、`tokenSource`、`tokenCache.fromCache` 和 `expiresInSeconds`。这些字段用于判断当前调用是否复用了 token daemon 缓存，永远不包含 token 内容。
 
 ## 部署
 
@@ -865,8 +868,11 @@ Cache invalidation rules:
 
 - The token automatically expires after 2 hours; the next call reads from Chrome again.
 - If the remote Product MCP or ERP backend returns 401/403, the bridge clears the cache, reads the token from Chrome again, and retries once.
+- If the token was just read from Chrome and the backend still returns 401/403, the bridge clears the cache and returns that backend error without reopening Chrome again inside the same tool call. After the user logs in again or refreshes the ERP page, calling `product_auth_status` reads the latest token.
 - If 401/403 keeps happening in a short window, the bridge does not reopen Chrome for every call. It keeps the latest refreshed result and returns the backend error, avoiding repeated Chrome remote-debugging prompts caused by permission errors or a persistently invalid token.
 - `product_auth_status` supports `forceRefresh: true` to bypass the cache and read from Chrome manually.
+
+Backend lookup, upload, and create tools include redacted diagnostics under `transport.auth`, such as `tokenProvider`, `tokenSource`, `tokenCache.fromCache`, and `expiresInSeconds`. These fields show whether the call reused the token daemon cache, and they never include the token value.
 
 ## Deployment
 
