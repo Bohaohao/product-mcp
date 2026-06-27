@@ -6,9 +6,11 @@ import {
   getSuggestedMapping,
   getUploadPolicy,
   validateLocalFile,
-  type ProductUploadFileInput
+  type ProductUploadFileInput,
+  type UploadTarget
 } from './upload/policies.js';
 import { prepareImageForUpload } from './upload/imagePreparer.js';
+import { validateFrontendAlignedSubmission, type SubmissionValidationIssue } from './submissionValidation.js';
 
 export const productPrecheckPackageInputSchema = {
   packagePath: z
@@ -60,6 +62,11 @@ interface FileReference {
   description?: string;
   languageList?: Array<'zh' | 'en'>;
   required?: boolean;
+  rowKey?: string;
+  mediaSubtitle?: string;
+  mediaLanguage?: string;
+  mediaId?: string;
+  mediaRemark?: string;
 }
 
 interface CheckedFileReference extends FileReference {
@@ -96,6 +103,70 @@ interface CheckedFileReference extends FileReference {
   };
   suggestedMapping?: ReturnType<typeof getSuggestedMapping>;
   errors: string[];
+}
+
+/**
+ * Unresolved upload-binding placeholder carried inside draft URL fields
+ * (mediaUrl / fileUrl / mainImageUrl). product_create detects and rejects
+ * these via validateResolvedUploads unless an orchestrator has replaced them
+ * with real OSS URLs. Local filesystem paths are never placed in URL fields.
+ */
+const OSS_BINDING_OPEN = '{{OSS_BINDING:';
+const OSS_BINDING_CLOSE = '}}';
+
+function bindingPlaceholder(rowKey: string): string {
+  return `${OSS_BINDING_OPEN}${rowKey}${OSS_BINDING_CLOSE}`;
+}
+
+type DraftBindingField = 'mediaUrl' | 'fileUrl' | 'mainImageUrl' | 'richTextHtml';
+
+export interface DraftBinding {
+  target: UploadTarget;
+  rowKey: string;
+  field: DraftBindingField;
+  path: string;
+  placeholder: string;
+}
+
+function draftBindingField(target: UploadTarget): DraftBindingField {
+  switch (target) {
+    case 'medias':
+    case 'customerCases.medias':
+      return 'mediaUrl';
+    case 'certifications.fileUrl':
+    case 'salesSupports.fileUrl':
+      return 'fileUrl';
+    case 'certifications.mainImageUrl':
+      return 'mainImageUrl';
+    case 'richTextHtml':
+      return 'richTextHtml';
+  }
+}
+
+function buildDraftBinding(target: UploadTarget, rowKey: string): DraftBinding {
+  const field = draftBindingField(target);
+  let path: string;
+  switch (target) {
+    case 'medias':
+      path = `medias[${rowKey}].mediaUrl`;
+      break;
+    case 'certifications.fileUrl':
+      path = `certifications[${rowKey}].fileUrl`;
+      break;
+    case 'certifications.mainImageUrl':
+      path = `certifications[${rowKey}].mainImageUrl`;
+      break;
+    case 'customerCases.medias':
+      path = `customerCases[${rowKey}].mediaUrl`;
+      break;
+    case 'salesSupports.fileUrl':
+      path = `salesSupports[${rowKey}].fileUrl`;
+      break;
+    case 'richTextHtml':
+      path = `richTextHtml[${rowKey}]`;
+      break;
+  }
+  return { target, rowKey, field, path, placeholder: bindingPlaceholder(rowKey) };
 }
 
 const yesNoMap: Record<string, 0 | 1> = {
@@ -277,8 +348,32 @@ function tableRows(tables: MarkdownTable[], headingIncludes: string, requiredHea
     .flatMap((table) => table.rows);
 }
 
+/**
+ * Header-based table lookup, independent of the preceding markdown heading.
+ * Used for tables whose section label (e.g. 客户案例媒体) is written as plain
+ * text rather than a `#` heading, so row indices stay stable across the file
+ * reference collector and the draft builder.
+ */
+function rowsByHeader(tables: MarkdownTable[], requiredHeader: string): Array<Record<string, string>> {
+  return tables
+    .filter((table) => table.headers.includes(requiredHeader))
+    .flatMap((table) => table.rows);
+}
+
 function addIssue(issues: PrecheckIssue[], issue: PrecheckIssue): void {
   issues.push(issue);
+}
+
+function appendFrontendValidationIssues(issues: PrecheckIssue[], frontendIssues: SubmissionValidationIssue[]): void {
+  for (const issue of frontendIssues) {
+    addIssue(issues, {
+      severity: 'error',
+      code: issue.code,
+      message: issue.message,
+      section: issue.section,
+      row: issue.row
+    });
+  }
 }
 
 function requiredText(
@@ -448,7 +543,14 @@ function addFileReference(
   title?: string,
   description?: string,
   languages?: string,
-  required?: boolean
+  required?: boolean,
+  extra?: {
+    rowKey?: string;
+    mediaSubtitle?: string;
+    mediaLanguage?: string;
+    mediaId?: string;
+    mediaRemark?: string;
+  }
 ): void {
   references.push({
     section,
@@ -460,7 +562,12 @@ function addFileReference(
     title: optionalText(title),
     description: optionalText(description),
     languageList: languageList(languages),
-    required
+    required,
+    rowKey: extra?.rowKey,
+    mediaSubtitle: optionalText(extra?.mediaSubtitle),
+    mediaLanguage: optionalText(extra?.mediaLanguage),
+    mediaId: optionalText(extra?.mediaId),
+    mediaRemark: optionalText(extra?.mediaRemark)
   });
 }
 
@@ -471,10 +578,10 @@ function collectFileReferences(
 ): FileReference[] {
   const references: FileReference[] = [];
 
-  for (const row of tableRows(tables, '商品图片', '图片用途')) {
+  tableRows(tables, '商品图片', '图片用途').forEach((row, index) => {
     const label = cleanCell(row['图片用途']);
     const relativePath = cleanCell(row['文件路径']);
-    if (!relativePath) continue;
+    if (!relativePath) return;
     const usage = fileUsageByLabel[label];
     if (!usage) {
       addIssue(issues, {
@@ -483,15 +590,34 @@ function collectFileReferences(
         section: '商品图片',
         message: `未识别的图片用途：${label}。`
       });
-      continue;
+      return;
     }
-    addFileReference(references, packageDir, '商品图片', references.length + 1, usage, label, relativePath, row['标题'], row['描述'], row['语言'], label === '商品主图');
-  }
+    addFileReference(
+      references,
+      packageDir,
+      '商品图片',
+      references.length + 1,
+      usage,
+      label,
+      relativePath,
+      row['标题'],
+      row['描述'],
+      row['语言'],
+      label === '商品主图',
+      {
+        rowKey: `media-img-${index + 1}`,
+        mediaSubtitle: row['副标题'],
+        mediaLanguage: row['语言代码'],
+        mediaId: row['原图文ID'],
+        mediaRemark: row['备注']
+      }
+    );
+  });
 
-  for (const row of tableRows(tables, '商品视频、3D 与附件', '资料用途')) {
+  tableRows(tables, '商品视频、3D 与附件', '资料用途').forEach((row, index) => {
     const label = cleanCell(row['资料用途']);
     const relativePath = cleanCell(row['文件路径']);
-    if (!relativePath) continue;
+    if (!relativePath) return;
     const usage = fileUsageByLabel[label];
     if (!usage) {
       addIssue(issues, {
@@ -500,15 +626,34 @@ function collectFileReferences(
         section: '商品视频、3D 与附件',
         message: `未识别的资料用途：${label}。`
       });
-      continue;
+      return;
     }
-    addFileReference(references, packageDir, '商品视频、3D 与附件', references.length + 1, usage, label, relativePath, row['标题'], row['描述'], row['语言']);
-  }
+    addFileReference(
+      references,
+      packageDir,
+      '商品视频、3D 与附件',
+      references.length + 1,
+      usage,
+      label,
+      relativePath,
+      row['标题'],
+      row['描述'],
+      row['语言'],
+      undefined,
+      {
+        rowKey: `media-vid-${index + 1}`,
+        mediaSubtitle: row['副标题'],
+        mediaLanguage: row['语言代码'],
+        mediaId: row['原图文ID'],
+        mediaRemark: row['备注']
+      }
+    );
+  });
 
-  for (const row of tableRows(tables, '图文详情', '资料用途')) {
+  tableRows(tables, '图文详情', '资料用途').forEach((row, index) => {
     const label = cleanCell(row['资料用途']);
     const relativePath = cleanCell(row['文件路径或内容']);
-    if (!isPathLike(relativePath)) continue;
+    if (!isPathLike(relativePath)) return;
     const usage = fileUsageByLabel[label];
     if (!usage) {
       addIssue(issues, {
@@ -517,55 +662,161 @@ function collectFileReferences(
         section: '图文详情',
         message: `未识别的图文详情资料用途：${label}。`
       });
-      continue;
+      return;
     }
-    addFileReference(references, packageDir, '图文详情', references.length + 1, usage, label, relativePath, row['标题'], row['描述']);
-  }
+    addFileReference(
+      references,
+      packageDir,
+      '图文详情',
+      references.length + 1,
+      usage,
+      label,
+      relativePath,
+      row['标题'],
+      row['描述'],
+      undefined,
+      undefined,
+      { rowKey: `media-detail-${index + 1}` }
+    );
+  });
 
-  for (const row of tableRows(tables, '认证资料', '证书名称')) {
+  tableRows(tables, '认证资料', '证书名称').forEach((row, index) => {
+    const certRowKey = `cert-${index + 1}`;
     const filePath = cleanCell(row['文件路径']);
     if (filePath) {
-      addFileReference(references, packageDir, '认证资料', references.length + 1, 'certificateFile', '认证资料文件', filePath, row['证书名称'], row['备注']);
+      addFileReference(
+        references,
+        packageDir,
+        '认证资料',
+        references.length + 1,
+        'certificateFile',
+        '认证资料文件',
+        filePath,
+        row['证书名称'],
+        row['备注'],
+        undefined,
+        undefined,
+        { rowKey: `${certRowKey}-fileUrl` }
+      );
     }
     const mainImagePath = cleanCell(row['主图路径']);
     if (mainImagePath) {
-      addFileReference(references, packageDir, '认证资料', references.length + 1, 'certificateMainImage', '认证资料主图', mainImagePath, row['证书名称'], row['备注']);
+      addFileReference(
+        references,
+        packageDir,
+        '认证资料',
+        references.length + 1,
+        'certificateMainImage',
+        '认证资料主图',
+        mainImagePath,
+        row['证书名称'],
+        row['备注'],
+        undefined,
+        undefined,
+        { rowKey: `${certRowKey}-mainImageUrl` }
+      );
     }
-  }
+  });
 
-  for (const row of tableRows(tables, '销售支持', '类型')) {
+  tableRows(tables, '销售支持', '类型').forEach((row, index) => {
     const relativePath = cleanCell(row['文件路径']);
-    if (!relativePath) continue;
+    if (!relativePath) return;
     const type = cleanCell(row['类型']);
     const usage = salesSupportFileUsageByType[type] || 'serviceSupportFile';
-    addFileReference(references, packageDir, '销售支持', references.length + 1, usage, `${type}文件`, relativePath, row['标题/问题/异议'], row['文件描述']);
-  }
+    addFileReference(
+      references,
+      packageDir,
+      '销售支持',
+      references.length + 1,
+      usage,
+      `${type}文件`,
+      relativePath,
+      row['标题/问题/异议'],
+      row['文件描述'],
+      undefined,
+      undefined,
+      { rowKey: `sales-${index + 1}` }
+    );
+  });
 
-  for (const row of tableRows(tables, '客户案例媒体', '所属客户名称')) {
+  rowsByHeader(tables, '所属客户名称').forEach((row, index) => {
     const relativePath = cleanCell(row['文件路径']);
-    if (!relativePath) continue;
+    if (!relativePath) return;
     const mediaType = cleanCell(row['媒体类型']);
     const usage: UploadUsage = mediaType === '视频' ? 'caseVideo' : 'caseImage';
-    addFileReference(references, packageDir, '客户案例媒体', references.length + 1, usage, `客户案例${mediaType || '图片'}`, relativePath, row['媒体名称'], row['备注']);
-  }
+    addFileReference(
+      references,
+      packageDir,
+      '客户案例媒体',
+      references.length + 1,
+      usage,
+      `客户案例${mediaType || '图片'}`,
+      relativePath,
+      row['媒体名称'],
+      row['备注'],
+      undefined,
+      undefined,
+      { rowKey: `case-media-${index + 1}` }
+    );
+  });
 
-  for (const row of tableRows(tables, '配件、备件、易损件', '类型')) {
+  tableRows(tables, '配件、备件、易损件', '类型').forEach((row, index) => {
+    const partsRowKey = `parts-${index + 1}`;
     const imagePath = cleanCell(row['图片路径']);
     if (imagePath) {
-      addFileReference(references, packageDir, '配件、备件、易损件', references.length + 1, 'partsImage', '配件图片', imagePath, row['名称'], row['备注']);
+      addFileReference(
+        references,
+        packageDir,
+        '配件、备件、易损件',
+        references.length + 1,
+        'partsImage',
+        '配件图片',
+        imagePath,
+        row['名称'],
+        row['备注'],
+        undefined,
+        undefined,
+        { rowKey: `${partsRowKey}-img` }
+      );
     }
     const attachmentPath = cleanCell(row['附件路径']);
     if (attachmentPath) {
-      addFileReference(references, packageDir, '配件、备件、易损件', references.length + 1, 'partsAttachment', '配件附件', attachmentPath, row['名称'], row['备注']);
+      addFileReference(
+        references,
+        packageDir,
+        '配件、备件、易损件',
+        references.length + 1,
+        'partsAttachment',
+        '配件附件',
+        attachmentPath,
+        row['名称'],
+        row['备注'],
+        undefined,
+        undefined,
+        { rowKey: `${partsRowKey}-att` }
+      );
     }
-  }
+  });
 
-  for (const row of tableRows(tables, '配件文件明细', '文件类型')) {
+  tableRows(tables, '配件文件明细', '文件类型').forEach((row, index) => {
     const relativePath = cleanCell(row['文件路径']);
-    if (!relativePath) continue;
+    if (!relativePath) return;
     const usage: UploadUsage = cleanCell(row['文件类型']) === '图片' ? 'partsImage' : 'partsAttachment';
-    addFileReference(references, packageDir, '配件文件明细', references.length + 1, usage, cleanCell(row['文件类型']) || '配件文件', relativePath, row['名称'], row['备注']);
-  }
+    addFileReference(
+      references,
+      packageDir,
+      '配件文件明细',
+      references.length + 1,
+      usage,
+      cleanCell(row['文件类型']) || '配件文件',
+      relativePath,
+      row['名称'],
+      row['备注'],
+      undefined,
+      undefined,
+      { rowKey: `parts-file-${index + 1}` }
+    );
+  });
 
   return references;
 }
@@ -682,6 +933,154 @@ function compactRows(rows: Array<Record<string, unknown>>): Array<Record<string,
   return filtered.length ? filtered : undefined;
 }
 
+function validateCertificationTables(tables: MarkdownTable[], issues: PrecheckIssue[]): void {
+  const rows = tableRows(tables, '认证资料', '证书名称');
+  rows.forEach((row, index) => {
+    const rowNumber = index + 1;
+    const hasContent = [
+      '证书名称',
+      '证书类型',
+      '证书编号',
+      '覆盖区域',
+      '覆盖区域ID',
+      '生效日期',
+      '到期日期',
+      '是否永久有效',
+      '文件路径',
+      '主图路径',
+      '文件分类'
+    ].some((field) => cleanCell(row[field]));
+    if (!hasContent) return;
+
+    if (!cleanCell(row['文件分类'])) {
+      addIssue(issues, { severity: 'error', code: 'CERT_FILE_CATEGORY_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写文件分类。` });
+    }
+    if (!cleanCell(row['文件路径'])) {
+      addIssue(issues, { severity: 'error', code: 'CERT_FILE_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写文件路径。` });
+    }
+    if (!cleanCell(row['主图路径'])) {
+      addIssue(issues, { severity: 'error', code: 'CERT_MAIN_IMAGE_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写主图路径。` });
+    }
+    if (!cleanCell(row['证书名称'])) {
+      addIssue(issues, { severity: 'error', code: 'CERT_NAME_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写证书名称。` });
+    }
+    if (!cleanCell(row['证书类型'])) {
+      addIssue(issues, { severity: 'error', code: 'CERT_TYPE_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写证书类型。` });
+    }
+    if (!cleanCell(row['覆盖区域']) && !cleanCell(row['覆盖区域ID'])) {
+      addIssue(issues, { severity: 'error', code: 'CERT_REGION_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写覆盖区域。` });
+    }
+    if (!cleanCell(row['证书编号'])) {
+      addIssue(issues, { severity: 'error', code: 'CERT_NO_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写证书编号。` });
+    }
+
+    const isPermanent = cleanCell(row['是否永久有效']) === '是';
+    const effectiveDate = cleanCell(row['生效日期']);
+    const expiryDate = cleanCell(row['到期日期']);
+    if (!isPermanent) {
+      if (!effectiveDate) {
+        addIssue(issues, { severity: 'error', code: 'CERT_EFFECTIVE_DATE_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写生效日期。` });
+      }
+      if (!expiryDate) {
+        addIssue(issues, { severity: 'error', code: 'CERT_EXPIRY_DATE_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写到期日期。` });
+      }
+      if (effectiveDate && expiryDate) {
+        const effectiveTime = Date.parse(effectiveDate);
+        const expiryTime = Date.parse(expiryDate);
+        if (Number.isFinite(effectiveTime) && Number.isFinite(expiryTime) && expiryTime <= effectiveTime) {
+          addIssue(issues, { severity: 'error', code: 'CERT_DATE_ORDER_INVALID', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行到期日期必须晚于生效日期。` });
+        }
+      }
+    }
+  });
+}
+
+function validateSalesSupportTables(tables: MarkdownTable[], issues: PrecheckIssue[]): void {
+  const rows = tableRows(tables, '销售支持', '类型');
+  rows.forEach((row, index) => {
+    const rowNumber = index + 1;
+    const type = cleanCell(row['类型']);
+    const title = cleanCell(row['标题/问题/异议']);
+    const content = cleanCell(row['内容/回答/处理方式']);
+    const filePath = cleanCell(row['文件路径']);
+
+    if (type === '核心优势' || type === '应用场景') {
+      const hasContent = Boolean(title || content || filePath);
+      if (hasContent && !(title && content && filePath)) {
+        addIssue(issues, {
+          severity: 'error',
+          code: 'SALES_IMAGE_TEXT_ROW_INCOMPLETE',
+          section: '销售支持',
+          row: rowNumber,
+          message: `销售支持第 ${rowNumber} 行（${type}）必须同时填写标题、内容、文件路径。`
+        });
+      }
+    }
+
+    if (type === '常见问题与标准回答' || type === '常见问题&标准回答' || type === '异议处理') {
+      const hasContent = Boolean(title || content);
+      if (hasContent && !(title && content)) {
+        addIssue(issues, {
+          severity: 'error',
+          code: 'SALES_QA_ROW_INCOMPLETE',
+          section: '销售支持',
+          row: rowNumber,
+          message: `销售支持第 ${rowNumber} 行（${type}）必须同时填写标题和内容。`
+        });
+      }
+    }
+  });
+}
+
+function validateCustomerCaseTables(tables: MarkdownTable[], issues: PrecheckIssue[]): void {
+  const caseRows = tableRows(tables, '客户案例', '客户名称');
+  const mediaRows = rowsByHeader(tables, '所属客户名称');
+  caseRows.forEach((row, index) => {
+    const rowNumber = index + 1;
+    const customerName = cleanCell(row['客户名称']);
+    const productName = cleanCell(row['产品名称']);
+    const purchaseQuantity = cleanCell(row['采购数量']);
+    const applicationScene = cleanCell(row['应用场景']);
+    const caseHighlight = cleanCell(row['案例亮点']);
+    const hasContent = Boolean(customerName || productName || purchaseQuantity || applicationScene || caseHighlight);
+    if (!hasContent) return;
+
+    const linkedMediaRows = mediaRows.filter((mediaRow) => cleanCell(mediaRow['所属客户名称']) === customerName);
+    const imageCount = linkedMediaRows.filter((mediaRow) => cleanCell(mediaRow['媒体类型']) !== '视频' && cleanCell(mediaRow['文件路径'])).length;
+    if (imageCount === 0) {
+      addIssue(issues, {
+        severity: 'error',
+        code: 'CUSTOMER_CASE_IMAGE_REQUIRED',
+        section: '客户案例',
+        row: rowNumber,
+        message: `客户案例第 ${rowNumber} 行至少需要 1 张图片。`
+      });
+    }
+    if (!productName) {
+      addIssue(issues, { severity: 'error', code: 'CUSTOMER_CASE_PRODUCT_REQUIRED', section: '客户案例', row: rowNumber, message: `客户案例第 ${rowNumber} 行必须填写产品名称。` });
+    }
+    if (!customerName) {
+      addIssue(issues, { severity: 'error', code: 'CUSTOMER_CASE_CUSTOMER_REQUIRED', section: '客户案例', row: rowNumber, message: `客户案例第 ${rowNumber} 行必须填写客户名称。` });
+    }
+    const quantity = purchaseQuantity ? Number(purchaseQuantity) : undefined;
+    if (!purchaseQuantity || quantity === undefined || !Number.isFinite(quantity) || quantity <= 0 || !Number.isInteger(quantity)) {
+      addIssue(issues, {
+        severity: 'error',
+        code: 'CUSTOMER_CASE_QUANTITY_INVALID',
+        section: '客户案例',
+        row: rowNumber,
+        message: `客户案例第 ${rowNumber} 行采购数量必须为正整数。`
+      });
+    }
+    if (!applicationScene) {
+      addIssue(issues, { severity: 'error', code: 'CUSTOMER_CASE_SCENE_REQUIRED', section: '客户案例', row: rowNumber, message: `客户案例第 ${rowNumber} 行必须填写应用场景。` });
+    }
+    if (!caseHighlight) {
+      addIssue(issues, { severity: 'error', code: 'CUSTOMER_CASE_HIGHLIGHT_REQUIRED', section: '客户案例', row: rowNumber, message: `客户案例第 ${rowNumber} 行必须填写案例亮点。` });
+    }
+  });
+}
+
 type CategoryConfigForPrecheck = NonNullable<ProductPrecheckPackageInput['categoryConfig']>;
 
 function normalizeLookupText(value: unknown): string {
@@ -785,7 +1184,7 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
 
   const draft: Record<string, unknown> = {
     productNameCn: requiredText(issues, basic['商品中文名称'], '商品中文名称', '基础信息'),
-    productNameEn: requiredText(issues, basic['商品英文名称'], '商品英文名称', '基础信息'),
+    productNameEn: optionalText(basic['商品英文名称']),
     productType: mappedValue(issues, basic['产品类型'], productTypeMap, '产品类型', '基础信息', true),
     status: mappedValue(issues, basic['上架状态'], statusMap, '上架状态', '基础信息', true),
     id: optionalText(basic['商品主键ID']),
@@ -807,7 +1206,7 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
     isInnerTreasury: mappedValue(issues, basic['是否内库商品'], yesNoMap, '是否内库商品', '基础信息'),
     externalAddress: optionalText(basic['外库上架位置']),
     externalStatus: mappedValue(issues, basic['外库状态'], statusMap, '外库状态', '基础信息'),
-    categoryFirstName: requiredText(issues, refs['一级分类'], '一级分类', '分类、单位、供应商'),
+    categoryFirstName: optionalText(refs['一级分类']),
     categorySecondName: optionalText(refs['二级分类']),
     categoryThirdName: optionalText(refs['三级分类']),
     unitName: requiredText(issues, refs['计量单位'], '计量单位', '分类、单位、供应商'),
@@ -815,22 +1214,22 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
     supplierProductionCycle: numberValue(issues, refs['供应商预计生产周期'], '供应商预计生产周期', '分类、单位、供应商'),
     supplierCycleUnit: mappedValue(issues, refs['生产周期单位'], cycleUnitMap, '生产周期单位', '分类、单位、供应商'),
     useAllRegions: cleanCell(region['适用范围']) === '全球',
-    supportConsolidation: mappedValue(issues, sales['是否支持拼柜'], yesNoMap, '是否支持拼柜', '销售、交付、售后'),
-    canExhibit: mappedValue(issues, sales['是否可做展品'], yesNoMap, '是否可做展品', '销售、交付、售后'),
-    needInstallation: mappedValue(issues, sales['是否需要安装'], yesNoMap, '是否需要安装', '销售、交付、售后'),
-    hasAfterSalesThreshold: mappedValue(issues, sales['是否有售后门槛'], yesNoMap, '是否有售后门槛', '销售、交付、售后'),
-    supportSample: mappedValue(issues, sales['是否支持样品'], yesNoMap, '是否支持样品', '销售、交付、售后'),
+    supportConsolidation: mappedValue(issues, sales['是否支持拼柜'], yesNoMap, '是否支持拼柜', '销售、交付、售后', true),
+    canExhibit: mappedValue(issues, sales['是否可做展品'], yesNoMap, '是否可做展品', '销售、交付、售后', true),
+    needInstallation: mappedValue(issues, sales['是否需要安装'], yesNoMap, '是否需要安装', '销售、交付、售后', true),
+    hasAfterSalesThreshold: mappedValue(issues, sales['是否有售后门槛'], yesNoMap, '是否有售后门槛', '销售、交付、售后', true),
+    supportSample: mappedValue(issues, sales['是否支持样品'], yesNoMap, '是否支持样品', '销售、交付、售后', true),
     samplePrice: numberValue(issues, sales['样品价'], '样品价', '销售、交付、售后'),
-    supportPartsAlone: mappedValue(issues, sales['是否支持配件单买'], yesNoMap, '是否支持配件单买', '销售、交付、售后'),
-    supportOem: mappedValue(issues, sales['是否支持 OEM'], yesNoMap, '是否支持 OEM', '销售、交付、售后'),
-    supportOdm: mappedValue(issues, sales['是否支持 ODM'], yesNoMap, '是否支持 ODM', '销售、交付、售后'),
+    supportPartsAlone: mappedValue(issues, sales['是否支持配件单买'], yesNoMap, '是否支持配件单买', '销售、交付、售后', true),
+    supportOem: mappedValue(issues, sales['是否支持 OEM'], yesNoMap, '是否支持 OEM', '销售、交付、售后', true),
+    supportOdm: mappedValue(issues, sales['是否支持 ODM'], yesNoMap, '是否支持 ODM', '销售、交付、售后', true),
     moq: numberValue(issues, sales['最小起订量 MOQ'], '最小起订量 MOQ', '销售、交付、售后'),
     warrantyPeriod: numberValue(issues, sales['质保期限'], '质保期限', '销售、交付、售后'),
     warrantyPeriodUnit: mappedValue(issues, sales['质保期限单位'], warrantyPeriodUnitMap, '质保期限单位', '销售、交付、售后'),
-    supportSmallTrial: mappedValue(issues, sales['是否支持小批量试单'], yesNoMap, '是否支持小批量试单', '销售、交付、售后'),
+    supportSmallTrial: mappedValue(issues, sales['是否支持小批量试单'], yesNoMap, '是否支持小批量试单', '销售、交付、售后', true),
     minTrialQuantity: numberValue(issues, sales['最小试单量'], '最小试单量', '销售、交付、售后'),
-    hasSpotStock: mappedValue(issues, sales['是否现货备货'], yesNoMap, '是否现货备货', '销售、交付、售后'),
-    hasOverseasWarehouseStock: mappedValue(issues, sales['是否海外仓备货'], yesNoMap, '是否海外仓备货', '销售、交付、售后'),
+    hasSpotStock: mappedValue(issues, sales['是否现货备货'], yesNoMap, '是否现货备货', '销售、交付、售后', true),
+    hasOverseasWarehouseStock: mappedValue(issues, sales['是否海外仓备货'], yesNoMap, '是否海外仓备货', '销售、交付、售后', true),
     standardDeliveryDays: numberValue(issues, sales['标准交期 天'], '标准交期 天', '销售、交付、售后'),
     shortestDeliveryDays: numberValue(issues, sales['最短交期 天'], '最短交期 天', '销售、交付、售后'),
     urgentOrderDays: numberValue(issues, sales['紧急单交期 天'], '紧急单交期 天', '销售、交付、售后'),
@@ -966,6 +1365,175 @@ function unresolvedReferences(draft: Record<string, unknown>) {
   };
 }
 
+const MEDIA_SECTIONS = new Set(['商品图片', '商品视频、3D 与附件', '图文详情']);
+
+/**
+ * Populate draftCreateInput.medias / certifications / customerCases from the
+ * checked file references and the markdown tables. URL fields carry unresolved
+ * `{{OSS_BINDING:<rowKey>}}` placeholders that match the `draftBinding.rowKey`
+ * on the corresponding uploadQueue item, so an orchestrator can apply uploaded
+ * OSS URLs deterministically. Only valid (ok) files receive a placeholder;
+ * product_create rejects any placeholder that survives into submission.
+ */
+function attachDraftMediaAndBindings(
+  draft: Record<string, unknown> | undefined,
+  tables: MarkdownTable[],
+  checkedFiles: CheckedFileReference[]
+): void {
+  if (!draft) return;
+
+  const okRowKeys = new Set<string>();
+  const fileByRowKey = new Map<string, CheckedFileReference>();
+  for (const file of checkedFiles) {
+    if (file.ok && file.rowKey) {
+      okRowKeys.add(file.rowKey);
+      fileByRowKey.set(file.rowKey, file);
+    }
+  }
+
+  const medias: Array<Record<string, unknown>> = [];
+  for (const file of checkedFiles) {
+    if (!file.ok || !file.rowKey || !MEDIA_SECTIONS.has(file.section)) continue;
+    const policy = getUploadPolicy(file.usage);
+    if (policy.target !== 'medias') continue;
+    const entry: Record<string, unknown> = {
+      mediaType: policy.mediaType,
+      mediaUrl: bindingPlaceholder(file.rowKey),
+      mediaName: path.basename(file.relativePath),
+      sort: medias.length + 1
+    };
+    if (file.title) entry.mediaTitle = file.title;
+    if (file.mediaSubtitle) entry.mediaSubtitle = file.mediaSubtitle;
+    if (file.description) entry.mediaDesc = file.description;
+    if (file.mediaLanguage) entry.language = file.mediaLanguage;
+    if (file.languageList) entry.languageList = file.languageList;
+    if (file.mediaId) entry.mediaId = file.mediaId;
+    if (policy.imageCategory) entry.imageCategory = policy.imageCategory;
+    if (policy.videoCategory) entry.videoCategory = policy.videoCategory;
+    if (policy.otherCategory) entry.otherCategory = policy.otherCategory;
+    if (file.mediaRemark) entry.remark = file.mediaRemark;
+    medias.push(entry);
+  }
+  if (medias.length) draft.medias = medias;
+
+  const certifications: Array<Record<string, unknown>> = [];
+  tableRows(tables, '认证资料', '证书名称').forEach((row, index) => {
+    // Skip the 认证覆盖区域明细 sub-table, which only carries 证书名称/覆盖区域.
+    const isCertRow = [
+      '证书类型',
+      '证书编号',
+      '文件路径',
+      '主图路径',
+      '文件分类',
+      '生效日期',
+      '到期日期',
+      '是否永久有效',
+      '适用范围',
+      '适用特定型号',
+      '状态',
+      '排序',
+      '备注'
+    ].some((field) => cleanCell(row[field]));
+    if (!isCertRow) return;
+
+    const ci = index + 1;
+    const entry: Record<string, unknown> = {};
+    const name = optionalText(row['证书名称']);
+    if (name) entry.name = name;
+    const certificateType = optionalText(row['证书类型']);
+    if (certificateType) entry.certificateType = certificateType;
+    const certificateNo = optionalText(row['证书编号']);
+    if (certificateNo) entry.certificateNo = certificateNo;
+    const coverRegions = optionalText(row['覆盖区域']);
+    if (coverRegions) entry.coverRegions = coverRegions;
+    const coverRegionIds = optionalText(row['覆盖区域ID']);
+    if (coverRegionIds) entry.coverRegionIds = coverRegionIds;
+    const effectiveDate = optionalText(row['生效日期']);
+    if (effectiveDate) entry.effectiveDate = effectiveDate;
+    const expiryDate = optionalText(row['到期日期']);
+    if (expiryDate) entry.expiryDate = expiryDate;
+    entry.isPermanent = cleanCell(row['是否永久有效']) === '是' ? 1 : 0;
+    const fileCategory = optionalText(row['文件分类']);
+    if (fileCategory) entry.fileCategory = fileCategory;
+    const status = optionalText(row['状态']);
+    if (status) entry.status = status;
+    const sortValue = cleanCell(row['排序']);
+    if (sortValue) {
+      const parsed = Number(sortValue);
+      if (Number.isFinite(parsed)) entry.sort = parsed;
+    }
+    const remark = optionalText(row['备注']);
+    if (remark) entry.remark = remark;
+
+    const fileRowKey = `cert-${ci}-fileUrl`;
+    const mainRowKey = `cert-${ci}-mainImageUrl`;
+    if (okRowKeys.has(fileRowKey)) entry.fileUrl = bindingPlaceholder(fileRowKey);
+    if (okRowKeys.has(mainRowKey)) entry.mainImageUrl = bindingPlaceholder(mainRowKey);
+
+    certifications.push(entry);
+  });
+  if (certifications.length) draft.certifications = certifications;
+
+  const caseRows = tableRows(tables, '客户案例', '客户名称');
+  const caseMediaRows = rowsByHeader(tables, '所属客户名称');
+  const caseMediaByCustomer = new Map<string, Array<string>>();
+  caseMediaRows.forEach((mrow, index) => {
+    const owner = cleanCell(mrow['所属客户名称']);
+    if (!owner) return;
+    if (!cleanCell(mrow['文件路径'])) return;
+    const rowKey = `case-media-${index + 1}`;
+    const list = caseMediaByCustomer.get(owner) || [];
+    list.push(rowKey);
+    caseMediaByCustomer.set(owner, list);
+  });
+
+  const customerCases: Array<Record<string, unknown>> = [];
+  for (const row of caseRows) {
+    const customerName = cleanCell(row['客户名称']);
+    const hasContent = ['客户名称', '产品名称', '采购数量', '应用场景', '案例亮点'].some((field) => cleanCell(row[field]));
+    if (!hasContent) continue;
+
+    const entry: Record<string, unknown> = {};
+    if (customerName) entry.customerName = customerName;
+    const productName = optionalText(row['产品名称']);
+    if (productName) entry.productName = productName;
+    const quantityText = cleanCell(row['采购数量']);
+    if (quantityText) {
+      const quantity = Number(quantityText);
+      if (Number.isFinite(quantity)) entry.purchaseQuantity = quantity;
+    }
+    const applicationScene = optionalText(row['应用场景']);
+    if (applicationScene) entry.applicationScene = applicationScene;
+    const caseHighlight = optionalText(row['案例亮点']);
+    if (caseHighlight) entry.caseHighlight = caseHighlight;
+    const remark = optionalText(row['备注']);
+    if (remark) entry.remark = remark;
+
+    const mediaRowKeys = caseMediaByCustomer.get(customerName) || [];
+    const caseMedias: Array<Record<string, unknown>> = [];
+    for (const rowKey of mediaRowKeys) {
+      const file = fileByRowKey.get(rowKey);
+      if (!file) continue;
+      const policy = getUploadPolicy(file.usage);
+      const mediaEntry: Record<string, unknown> = {
+        mediaType: policy.mediaType,
+        mediaUrl: bindingPlaceholder(rowKey),
+        mediaName: path.basename(file.relativePath),
+        sort: caseMedias.length + 1
+      };
+      if (file.title) mediaEntry.mediaTitle = file.title;
+      if (file.description) mediaEntry.mediaDesc = file.description;
+      if (policy.imageCategory) mediaEntry.imageCategory = policy.imageCategory;
+      if (policy.videoCategory) mediaEntry.videoCategory = policy.videoCategory;
+      caseMedias.push(mediaEntry);
+    }
+    if (caseMedias.length) entry.medias = caseMedias;
+
+    customerCases.push(entry);
+  }
+  if (customerCases.length) draft.customerCases = customerCases;
+}
+
 export async function precheckProductPackage(rawInput: unknown) {
   const input = productPrecheckPackageObjectSchema.parse(rawInput);
   const issues: PrecheckIssue[] = [];
@@ -973,16 +1541,40 @@ export async function precheckProductPackage(rawInput: unknown) {
   const markdown = await readFile(markdownPath, 'utf8');
   const tables = parseMarkdownTables(markdown);
   const draft = input.includeDraft ? parseDraft(markdown, tables, issues) : undefined;
+  if (draft) {
+    appendFrontendValidationIssues(
+      issues,
+      validateFrontendAlignedSubmission(draft, {
+        skipCertificationValidation: true,
+        skipMediaValidation: true,
+        skipSalesValidation: true
+      })
+    );
+  }
   validateDraftAgainstCategoryConfig(draft, input.categoryConfig, issues);
+  validateCertificationTables(tables, issues);
+  validateSalesSupportTables(tables, issues);
+  validateCustomerCaseTables(tables, issues);
   const fileReferences = collectFileReferences(tables, packageDir, issues);
   const checkedFiles = await checkFiles(fileReferences, issues);
+  attachDraftMediaAndBindings(draft, tables, checkedFiles);
   const requiredFileOk = checkedFiles.some((file) => file.usage === 'productMainImage' && file.ok);
   if (!requiredFileOk) {
     addIssue(issues, {
-      severity: 'error',
-      code: 'PRODUCT_MAIN_IMAGE_MISSING',
+      severity: 'warning',
+      code: 'PRODUCT_MAIN_IMAGE_OPTIONAL',
       section: '商品图片',
-      message: '未找到可用的商品主图。'
+      message: '未找到可用的商品主图，建议补充以提升前台展示效果。'
+    });
+  }
+
+  const bannerFileOk = checkedFiles.some((file) => file.usage === 'bannerImage' && file.ok);
+  if (!bannerFileOk) {
+    addIssue(issues, {
+      severity: 'warning',
+      code: 'BANNER_IMAGE_OPTIONAL',
+      section: '商品图片',
+      message: '未找到可用的 Banner 图，建议补充以提升前台展示效果。'
     });
   }
 
@@ -991,24 +1583,28 @@ export async function precheckProductPackage(rawInput: unknown) {
   const invalidOptionalFileCount = checkedFiles.filter((file) => !file.ok && !file.required).length;
   const uploadQueue = checkedFiles
     .filter((file) => file.ok)
-    .map((file) => ({
-      localPath: file.uploadedLocalPath || file.absolutePath,
-      usage: file.usage,
-      title: file.title,
-      description: file.description,
-      languageList: file.languageList,
-      dedupeKey: buildUploadDedupeKey(file),
-      sourceRelativePath: file.relativePath,
-      sourceLocalPath: file.absolutePath,
-      imagePreparation: file.imagePreparation,
-      source: {
-        section: file.section,
-        row: file.row,
-        relativePath: file.relativePath,
-        usageLabel: file.usageLabel
-      },
-      suggestedMapping: file.suggestedMapping
-    }));
+    .map((file) => {
+      const policy = getUploadPolicy(file.usage);
+      return {
+        localPath: file.uploadedLocalPath || file.absolutePath,
+        usage: file.usage,
+        title: file.title,
+        description: file.description,
+        languageList: file.languageList,
+        dedupeKey: buildUploadDedupeKey(file),
+        sourceRelativePath: file.relativePath,
+        sourceLocalPath: file.absolutePath,
+        imagePreparation: file.imagePreparation,
+        source: {
+          section: file.section,
+          row: file.row,
+          relativePath: file.relativePath,
+          usageLabel: file.usageLabel
+        },
+        suggestedMapping: file.suggestedMapping,
+        draftBinding: file.rowKey ? buildDraftBinding(policy.target, file.rowKey) : undefined
+      };
+    });
 
   return {
     ok: errorCount === 0,

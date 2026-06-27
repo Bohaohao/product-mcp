@@ -4,8 +4,10 @@ import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { parsePages } from '../dist/chromePages.js';
 import { ProductTokenBridge } from '../dist/localBridge.js';
+import { ProductMcpError } from '../dist/errors.js';
 import { createProductMcpExpressApp } from '../dist/server.js';
 import { ProductTokenDaemonClient } from '../dist/tokenDaemonClient.js';
+import { productCreate } from '../dist/tools/createProduct.js';
 
 const fakeBackendPort = Number(process.env.SMOKE_BACKEND_PORT || 18787);
 const mcpPort = Number(process.env.SMOKE_MCP_PORT || 18788);
@@ -199,8 +201,9 @@ function createFakeBackend() {
         assert(body.optionalConfigs?.[0]?.configValue === 'Red', 'optional config value was not normalized');
         assert(body.medias?.[0]?.imageCategory === 1, 'main image media was not created');
         assert(body.medias?.[0]?.mediaUrl === 'https://example.test/main.png', 'main image url was not mapped');
-        assert(body.medias?.[1]?.language === 'cn', 'media language was not preserved');
-        assert(body.medias?.[1]?.mediaId === 'media-zh-1', 'mediaId was not preserved');
+        assert(body.medias?.[1]?.imageCategory === 8, 'banner media was not forwarded');
+        assert(body.medias?.[2]?.language === 'cn', 'media language was not preserved');
+        assert(body.medias?.[2]?.mediaId === 'media-zh-1', 'mediaId was not preserved');
         assert(body.palletInfo === 'Smoke pallet', 'package text field was not preserved');
         assert(body.packLength === 101, 'top-level packLength should override packageInfo');
         assert(body.bulkCarrier === 3, 'top-level bulkCarrier was not forwarded');
@@ -340,6 +343,145 @@ async function closeServer(server) {
   });
 }
 
+function createValidationBackendStub() {
+  return {
+    async get(path) {
+      if (path === '/user/erp/productCategory/tree') {
+        return [
+          {
+            id: 1,
+            status: '0',
+            children: [{ id: 11, status: '0', children: [] }]
+          }
+        ];
+      }
+      if (path === '/user/erp/productCategory/configList') {
+        return {
+          baseList: [],
+          fieldList: [],
+          optionalList: []
+        };
+      }
+      throw new Error(`Unexpected GET path in validation stub: ${path}`);
+    },
+    async post() {
+      throw new Error('Validation stub should not reach backend POST.');
+    }
+  };
+}
+
+async function assertCreateValidationFailure(argumentsPayload, expectedIssueCode) {
+  try {
+    await productCreate(createValidationBackendStub(), argumentsPayload, 'smoke-validation');
+    throw new Error(`Expected productCreate to fail with ${expectedIssueCode}.`);
+  } catch (error) {
+    assert(error instanceof ProductMcpError, 'validation error was not mapped to ProductMcpError');
+    assert(error.code === 'MCP_INPUT_INVALID', `unexpected validation error code: ${error.code}`);
+    const issues = error.details?.issues || [];
+    assert(Array.isArray(issues), 'validation error details did not include issues');
+    assert(
+      issues.some((issue) => issue.code === expectedIssueCode),
+      `expected validation issue ${expectedIssueCode}, got ${JSON.stringify(issues)}`
+    );
+  }
+}
+
+async function assertCreateSchemaFailure(argumentsPayload, expectedPath) {
+  try {
+    await productCreate(createValidationBackendStub(), argumentsPayload, 'smoke-schema-validation');
+    throw new Error(`Expected productCreate schema validation to fail for ${expectedPath}.`);
+  } catch (error) {
+    const issues = error?.issues || [];
+    assert(Array.isArray(issues), 'schema validation error did not include zod issues');
+    assert(
+      issues.some((issue) => issue.path?.join('.') === expectedPath),
+      `expected schema issue at ${expectedPath}, got ${JSON.stringify(issues)}`
+    );
+  }
+}
+
+const dtoRequiredFlags = {
+  supportConsolidation: 0,
+  canExhibit: 0,
+  needInstallation: 0,
+  hasAfterSalesThreshold: 0,
+  supportSample: 0,
+  supportPartsAlone: 0,
+  supportOem: 0,
+  supportOdm: 0,
+  supportSmallTrial: 0,
+  hasSpotStock: 0,
+  hasOverseasWarehouseStock: 0
+};
+
+function createMinimalDtoInput(overrides = {}) {
+  return {
+    confirm: true,
+    productNameCn: 'Smoke Test Product',
+    productType: 1,
+    status: 1,
+    unitId: '9',
+    suppliers: [{ supplierId: '88', supplierName: 'Smoke Supplier' }],
+    ...dtoRequiredFlags,
+    ...overrides
+  };
+}
+
+function createSuccessBackendStub(assertBody) {
+  return {
+    async get(path) {
+      if (path === '/user/erp/productCategory/tree') {
+        return [
+          {
+            id: 1,
+            status: '0',
+            children: [{ id: 11, status: '0', children: [] }]
+          }
+        ];
+      }
+      if (path === '/user/erp/productCategory/configList') {
+        return {
+          baseList: [],
+          fieldList: [],
+          optionalList: []
+        };
+      }
+      throw new Error(`Unexpected GET path in success stub: ${path}`);
+    },
+    async post(path, body) {
+      assert(path === '/user/erp/commodity', `unexpected POST path in success stub: ${path}`);
+      assertBody(body);
+      return { id: 999001 };
+    }
+  };
+}
+
+async function assertCreateSucceedsWithoutEnglishName() {
+  const result = await productCreate(
+    createSuccessBackendStub((body) => {
+      assert(body.productNameCn === 'Smoke Test Product', 'productNameCn was not forwarded');
+      assert(body.productNameEn === undefined, 'productNameEn should stay optional');
+      assert(body.spuNameEn === undefined, 'spuNameEn compatibility field should stay optional');
+      assert(Array.isArray(body.i18nList) && body.i18nList.length === 1, 'i18nList should only include zh when english name is missing');
+      assert(body.i18nList?.[0]?.langCode === 'zh', 'zh i18n row was not preserved');
+      assert(body.productType === 1, 'productType was not forwarded');
+      assert(body.status === 1, 'status was not forwarded');
+      assert(body.unitId === 9, 'unitId was not normalized');
+      assert(body.suppliers?.[0]?.supplierId === 88, 'supplier was not normalized');
+      assert(body.categoryFirstId === undefined, 'categoryFirstId should stay optional');
+      assert(body.packLength === undefined, 'packaging fields should stay optional');
+      assert(body.medias.length === 0, 'medias should stay optional for minimal DTO create');
+      assert(body.supportConsolidation === 0, 'supportConsolidation was not forwarded');
+      assert(body.hasOverseasWarehouseStock === 0, 'hasOverseasWarehouseStock was not forwarded');
+    }),
+    createMinimalDtoInput(),
+    'smoke-success-no-en'
+  );
+
+  assert(result.ok === true, 'productCreate should succeed without english name');
+  assert(result.id === '999001', 'productCreate should return stubbed id');
+}
+
 async function assertTokenDaemonClientAndBridge() {
   const secret = 'smoke-secret';
   const { server, stats } = createFakeTokenDaemon(secret);
@@ -415,6 +557,44 @@ function assertChromePageParsing() {
 async function main() {
   assertChromePageParsing();
   await assertTokenDaemonClientAndBridge();
+  await assertCreateSucceedsWithoutEnglishName();
+
+  const chineseModelResult = await productCreate(
+    createSuccessBackendStub((body) => {
+      assert(body.productModel === '中文-Model', 'productModel with Chinese characters should be forwarded');
+    }),
+    createMinimalDtoInput({ productModel: '中文-Model' }),
+    'smoke-success-cn-model'
+  );
+  assert(chineseModelResult.ok === true, 'productCreate should not regex-block Chinese productModel');
+
+  await assertCreateSchemaFailure(
+    (() => {
+      const payload = createMinimalDtoInput();
+      delete payload.supportOem;
+      return payload;
+    })(),
+    'supportOem'
+  );
+
+  await assertCreateValidationFailure(
+    createMinimalDtoInput({
+      medias: [{ mediaType: 1, imageCategory: 1, mediaUrl: '{{OSS_BINDING:product-main-image-1}}' }]
+    }),
+    'UNRESOLVED_UPLOAD_BINDING'
+  );
+  await assertCreateValidationFailure(
+    createMinimalDtoInput({
+      independentPkg: 1,
+      skuList: [{ skuCode: 'SKU-1', pkgLength: 100, pkgWidth: 100, pkgHeight: 100, grossWeight: 2, pkgWeight: 1 }],
+      categoryFirstId: '1',
+      categorySecondId: '11',
+      useAllRegions: true,
+      productMainImageUrl: 'https://example.test/main.png',
+      medias: [{ mediaType: 1, imageCategory: 8, mediaUrl: 'https://example.test/banner.png' }]
+    }),
+    'SKU_PACKAGE_FEE_REQUIRED'
+  );
 
   const fakeBackend = createFakeBackend();
   fakeBackend.listen(fakeBackendPort, '127.0.0.1');
@@ -514,18 +694,27 @@ async function main() {
         confirm: true,
         productNameCn: 'Smoke Test Product',
         productNameEn: 'Smoke Test Product EN',
+        productType: 1,
+        status: 1,
+        level: 'A',
         tenantId: 'tenant-smoke',
         relatedCommodityId: '456,789',
         categoryFirstId: '1',
         categorySecondId: '11',
         unitId: '9',
         suppliers: [{ supplierId: '88', supplierName: 'Smoke Supplier', productionCycle: '7', cycleUnit: '1' }],
+        ...dtoRequiredFlags,
         useAllRegions: true,
         productMainImageUrl: 'https://example.test/main.png',
-        medias: [{ mediaType: 1, imageCategory: 2, mediaUrl: 'https://example.test/detail.png', language: 'cn', mediaId: 'media-zh-1' }],
+        medias: [
+          { mediaType: 1, imageCategory: 8, mediaUrl: 'https://example.test/banner.png' },
+          { mediaType: 1, imageCategory: 2, mediaUrl: 'https://example.test/detail.png', language: 'cn', mediaId: 'media-zh-1' }
+        ],
         baseConfigs: [{ name: 'Power', configValue: '100W' }],
         technicalParams: [{ name: 'Length', paramValue: '10cm' }],
         optionalConfigs: [{ name: 'Color', configValue: 'Red', status: 0 }],
+        referenceCostCny: 100,
+        profitMargin: 15,
         packLength: 101,
         bulkCarrier: '3',
         packingListTemplate: 'Smoke template',

@@ -1,13 +1,29 @@
 import * as z from 'zod/v4';
 import type { BackendClient } from '../backendClient.js';
 import { ProductMcpError } from '../errors.js';
+import { throwValidationIssues, validateFrontendAlignedSubmission, validateResolvedUploads } from '../submissionValidation.js';
 
 const idSchema = z.union([z.string().trim().min(1), z.number()]);
 const optionalIdSchema = idSchema.optional();
 const scalarSchema = z.union([z.string(), z.number(), z.boolean()]).optional();
 const numberLikeSchema = z.union([z.number(), z.string().trim().min(1)]).optional();
 const zeroOneSchema = z.union([z.literal(0), z.literal(1)]);
+const zeroOneLikeSchema = z.union([z.literal(0), z.literal(1), z.literal('0'), z.literal('1'), z.boolean()]);
 const objectArraySchema = z.array(z.record(z.string(), z.any())).optional();
+
+const skuPackageSchema = z.looseObject({
+  id: optionalIdSchema,
+  skuId: optionalIdSchema,
+  skuCode: z.string().trim().optional(),
+  skuModel: z.string().trim().optional(),
+  pkgLength: numberLikeSchema,
+  pkgWidth: numberLikeSchema,
+  pkgHeight: numberLikeSchema,
+  pkgVolume: numberLikeSchema,
+  pkgWeight: numberLikeSchema,
+  grossWeight: numberLikeSchema,
+  pkgFee: numberLikeSchema
+});
 
 const regionSchema = z.looseObject({
   id: optionalIdSchema,
@@ -97,12 +113,12 @@ export const productCreateInputSchema = {
   createDept: optionalIdSchema,
   language: z.string().trim().optional(),
   productNameCn: z.string().trim().min(1).describe('Product Chinese name.'),
-  productNameEn: z.string().trim().min(1).describe('Product English name.'),
-  productType: z.union([z.literal(1), z.literal(2), z.literal(3)]).default(1).describe('1=whole machine, 2=part, 3=service.'),
-  status: z.union([z.literal(1), z.literal(2), z.literal(3)]).default(1).describe('1=on shelf, 2=off shelf, 3=void.'),
+  productNameEn: z.string().trim().optional().describe('Optional product English name.'),
+  productType: z.union([z.literal(1), z.literal(2), z.literal(3)]).describe('1=whole machine, 2=part, 3=service.'),
+  status: z.union([z.literal(1), z.literal(2), z.literal(3)]).describe('1=on shelf, 2=off shelf, 3=void.'),
   level: scalarSchema,
 
-  categoryFirstId: idSchema,
+  categoryFirstId: optionalIdSchema.describe('Optional first-level category id. Category hierarchy is validated only when category ids are provided.'),
   categorySecondId: optionalIdSchema,
   categoryThirdId: optionalIdSchema,
   unitId: idSchema,
@@ -129,27 +145,29 @@ export const productCreateInputSchema = {
   remark: z.string().optional(),
   usagePurpose: z.string().trim().optional(),
   relatedCommodityId: z.string().trim().optional(),
-  supportConsolidation: zeroOneSchema.default(0),
-  canExhibit: zeroOneSchema.default(0),
-  needInstallation: zeroOneSchema.default(0),
-  hasAfterSalesThreshold: zeroOneSchema.default(0),
-  supportSample: zeroOneSchema.default(0),
+  supportConsolidation: zeroOneSchema,
+  canExhibit: zeroOneSchema,
+  needInstallation: zeroOneSchema,
+  hasAfterSalesThreshold: zeroOneSchema,
+  supportSample: zeroOneSchema,
   samplePrice: numberLikeSchema,
   taxRefundRate: numberLikeSchema,
+  independentPkg: zeroOneLikeSchema.optional().describe('Whether SKU rows use independent package info.'),
+  skuList: z.array(skuPackageSchema).optional().describe('Optional SKU list when independentPkg is enabled.'),
 
   standardDeliveryDays: numberLikeSchema,
   shortestDeliveryDays: numberLikeSchema,
   urgentOrderDays: numberLikeSchema,
-  supportPartsAlone: zeroOneSchema.default(0),
-  supportOem: zeroOneSchema.default(0),
-  supportOdm: zeroOneSchema.default(0),
+  supportPartsAlone: zeroOneSchema,
+  supportOem: zeroOneSchema,
+  supportOdm: zeroOneSchema,
   moq: numberLikeSchema,
   warrantyPeriod: numberLikeSchema,
   warrantyPeriodUnit: z.union([z.literal(1), z.literal(2), z.literal('month'), z.literal('year')]).optional(),
-  supportSmallTrial: zeroOneSchema.default(0),
+  supportSmallTrial: zeroOneSchema,
   minTrialQuantity: numberLikeSchema,
-  hasSpotStock: zeroOneSchema.default(0),
-  hasOverseasWarehouseStock: zeroOneSchema.default(0),
+  hasSpotStock: zeroOneSchema,
+  hasOverseasWarehouseStock: zeroOneSchema,
 
   suggestedPrice: numberLikeSchema,
   minPrice: numberLikeSchema,
@@ -218,6 +236,12 @@ interface CategoryConfigResponse {
   fieldList?: CategoryConfigItem[];
   optionalList?: CategoryConfigItem[];
   [key: string]: unknown;
+}
+
+interface ProductCategoryNode {
+  id?: string | number;
+  status?: string | number;
+  children?: ProductCategoryNode[];
 }
 
 function isPresent(value: unknown): boolean {
@@ -382,7 +406,7 @@ function fileNameFromUrl(url: string): string {
   }
 }
 
-function normalizeRegions(input: ProductCreateInput): Array<Record<string, unknown>> {
+function normalizeRegions(input: ProductCreateInput): Array<Record<string, unknown>> | undefined {
   if (input.useAllRegions) {
     return [
       {
@@ -398,10 +422,7 @@ function normalizeRegions(input: ProductCreateInput): Array<Record<string, unkno
 
   const regions = input.regions || [];
   if (!regions.length) {
-    throw new ProductMcpError(
-      'MCP_INPUT_INVALID',
-      'product_create requires either useAllRegions=true or at least one regions item.'
-    );
+    return undefined;
   }
 
   return regions.map((region, index) => {
@@ -418,6 +439,49 @@ function normalizeRegions(input: ProductCreateInput): Array<Record<string, unkno
       remark: region.remark
     };
   });
+}
+
+function isEnabledCategory(node: ProductCategoryNode): boolean {
+  return String(node.status ?? '0') === '0';
+}
+
+function findCategoryNode(nodes: ProductCategoryNode[] | undefined, id: string): ProductCategoryNode | undefined {
+  for (const node of nodes || []) {
+    if (node.id !== undefined && String(node.id) === id) return node;
+    const found = findCategoryNode(node.children, id);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+async function validateCategorySelection(backend: BackendClient, input: ProductCreateInput): Promise<void> {
+  if (!isPresent(input.categoryFirstId) && !isPresent(input.categorySecondId) && !isPresent(input.categoryThirdId)) {
+    return;
+  }
+
+  const rawTree = await backend.get<ProductCategoryNode[]>('/user/erp/productCategory/tree');
+  const firstId = String(toRequiredIdValue(input.categoryFirstId, 'categoryFirstId'));
+  const firstNode = findCategoryNode(rawTree, firstId);
+  if (!firstNode) {
+    throw new ProductMcpError('MCP_INPUT_INVALID', `categoryFirstId not found: ${firstId}.`);
+  }
+
+  const enabledSecondLevel = (firstNode.children || []).filter(isEnabledCategory);
+  if (enabledSecondLevel.length > 0 && !isPresent(input.categorySecondId)) {
+    throw new ProductMcpError('MCP_INPUT_INVALID', '当前一级分类下仍有可用二级分类，categorySecondId 必填。');
+  }
+
+  if (!isPresent(input.categorySecondId)) return;
+  const secondId = String(toRequiredIdValue(input.categorySecondId, 'categorySecondId'));
+  const secondNode = enabledSecondLevel.find((node) => node.id !== undefined && String(node.id) === secondId) || findCategoryNode(enabledSecondLevel, secondId);
+  if (!secondNode) {
+    throw new ProductMcpError('MCP_INPUT_INVALID', `categorySecondId not found under selected categoryFirstId: ${secondId}.`);
+  }
+
+  const enabledThirdLevel = (secondNode.children || []).filter(isEnabledCategory);
+  if (enabledThirdLevel.length > 0 && !isPresent(input.categoryThirdId)) {
+    throw new ProductMcpError('MCP_INPUT_INVALID', '当前二级分类下仍有可用三级分类，categoryThirdId 必填。');
+  }
 }
 
 function normalizeTags(tags: ProductCreateInput['tags']): Array<{ tagName: string }> {
@@ -596,21 +660,49 @@ function normalizeOptionalConfigs(input: ProductCreateInput, categoryConfig?: Ca
   });
 }
 
+function normalizeIndependentPkg(value: ProductCreateInput['independentPkg']): 0 | 1 | undefined {
+  if (value === undefined) return undefined;
+  return value === true || value === 1 || value === '1' ? 1 : 0;
+}
+
+function normalizeSkuList(input: ProductCreateInput): Array<Record<string, unknown>> | undefined {
+  if (!input.skuList?.length) return undefined;
+  return input.skuList.map((row, index) => ({
+    ...row,
+    id: toOptionalIdValue(row.id),
+    skuId: toOptionalIdValue(row.skuId),
+    skuCode: row.skuCode,
+    skuModel: row.skuModel,
+    pkgLength: toOptionalNumberValue(row.pkgLength, `skuList[${index}].pkgLength`),
+    pkgWidth: toOptionalNumberValue(row.pkgWidth, `skuList[${index}].pkgWidth`),
+    pkgHeight: toOptionalNumberValue(row.pkgHeight, `skuList[${index}].pkgHeight`),
+    pkgVolume: toOptionalNumberValue(row.pkgVolume, `skuList[${index}].pkgVolume`),
+    pkgWeight: toOptionalNumberValue(row.pkgWeight, `skuList[${index}].pkgWeight`),
+    grossWeight: toOptionalNumberValue(row.grossWeight, `skuList[${index}].grossWeight`),
+    pkgFee: toOptionalNumberValue(row.pkgFee, `skuList[${index}].pkgFee`)
+  }));
+}
+
 function buildProductI18nList(input: ProductCreateInput): Array<Record<string, unknown>> {
-  return [
+  const rows: Array<Record<string, unknown>> = [
     {
       langCode: 'zh',
       spuName: input.productNameCn,
       productName: input.productNameCn,
       unitName: input.unitName
-    },
-    {
+    }
+  ];
+
+  if (isPresent(input.productNameEn)) {
+    rows.push({
       langCode: 'en',
       spuName: input.productNameEn,
       productName: input.productNameEn,
       unitName: input.unitName
-    }
-  ];
+    });
+  }
+
+  return rows;
 }
 
 function buildRequestBody(input: ProductCreateInput, categoryConfig?: CategoryConfigResponse): Record<string, unknown> {
@@ -640,7 +732,7 @@ function buildRequestBody(input: ProductCreateInput, categoryConfig?: CategoryCo
     brand: input.brand,
     remark: input.remark,
     relatedCommodityId: input.relatedCommodityId,
-    categoryFirstId: toRequiredIdValue(input.categoryFirstId, 'categoryFirstId'),
+    categoryFirstId: toOptionalIdValue(input.categoryFirstId),
     categorySecondId: toOptionalIdValue(input.categorySecondId),
     categoryThirdId: toOptionalIdValue(input.categoryThirdId),
     usagePurpose: input.usagePurpose,
@@ -651,6 +743,8 @@ function buildRequestBody(input: ProductCreateInput, categoryConfig?: CategoryCo
     supportSample: input.supportSample,
     samplePrice: toNumberValue(input.samplePrice, 'samplePrice'),
     taxRefundRate: toTaxRefundRate(input.taxRefundRate),
+    independentPkg: normalizeIndependentPkg(input.independentPkg),
+    skuList: normalizeSkuList(input),
     standardDeliveryDays: toNumberValue(input.standardDeliveryDays, 'standardDeliveryDays'),
     shortestDeliveryDays: toNumberValue(input.shortestDeliveryDays, 'shortestDeliveryDays'),
     urgentOrderDays: toNumberValue(input.urgentOrderDays, 'urgentOrderDays'),
@@ -716,10 +810,17 @@ function findId(value: unknown): string | undefined {
 
 export async function productCreate(backend: BackendClient, rawInput: unknown, requestId: string) {
   const input = productCreateObjectSchema.parse(rawInput);
+  const validationIssues = [
+    ...validateFrontendAlignedSubmission(input as unknown as Record<string, unknown>, { skipMediaValidation: true }),
+    ...validateResolvedUploads(input as unknown as Record<string, unknown>)
+  ];
+  throwValidationIssues('商品创建参数未通过前端硬拦截校验。', validationIssues);
+  await validateCategorySelection(backend, input);
   const needsCategoryConfig = Boolean(input.baseConfigs?.length || input.technicalParams?.length || input.optionalConfigs?.length);
-  const categoryConfig = needsCategoryConfig
+  const categoryConfigId = input.categoryThirdId || input.categorySecondId || input.categoryFirstId;
+  const categoryConfig = needsCategoryConfig && isPresent(categoryConfigId)
     ? await backend.get<CategoryConfigResponse>('/user/erp/productCategory/configList', {
-        categoryId: input.categoryThirdId || input.categorySecondId || input.categoryFirstId
+        categoryId: categoryConfigId
       })
     : undefined;
   const body = buildRequestBody(input, categoryConfig);

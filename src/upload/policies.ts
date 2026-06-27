@@ -182,7 +182,7 @@ export const UPLOAD_POLICIES: Record<ProductUploadFileInput['usage'], UploadPoli
   workVideo: videoPolicy('workVideo', '作业视频', 200, 5, 'medias', { mediaType: 2, videoCategory: 3 }),
   installVideo: videoPolicy('installVideo', '安装视频', 200, 5, 'medias', { mediaType: 2, videoCategory: 5 }),
   packingVideo: videoPolicy('packingVideo', '包装视频', 200, 5, 'medias', { mediaType: 2, videoCategory: 7 }),
-  linkActualTestingVideo: videoPolicy('linkActualTestingVideo', '链接实测视频', 500, 5, 'medias', { mediaType: 2, videoCategory: 4 }),
+  linkActualTestingVideo: videoPolicy('linkActualTestingVideo', '链界实测视频', 500, 5, 'medias', { mediaType: 2, videoCategory: 4 }),
   thirdActualTestingVideo: videoPolicy('thirdActualTestingVideo', '三方实测视频', 500, 5, 'medias', { mediaType: 2, videoCategory: 6 }),
   model3d: {
     usage: 'model3d',
@@ -230,10 +230,11 @@ export const UPLOAD_POLICIES: Record<ProductUploadFileInput['usage'], UploadPoli
     aspectRatioText: '3:4'
   }),
   caseImage: imagePolicy('caseImage', '客户案例图片', 10, 'customerCases.medias', {
+    mediaType: 1,
     aspectRatio: 16 / 9,
     aspectRatioText: '16:9'
   }),
-  caseVideo: videoPolicy('caseVideo', '客户案例视频', 500, 5, 'customerCases.medias'),
+  caseVideo: videoPolicy('caseVideo', '客户案例视频', 500, 5, 'customerCases.medias', { mediaType: 2 }),
   serviceSupportFile: {
     usage: 'serviceSupportFile',
     label: '故障处理与质保附件',
