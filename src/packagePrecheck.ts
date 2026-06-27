@@ -1545,6 +1545,7 @@ export async function precheckProductPackage(rawInput: unknown) {
     appendFrontendValidationIssues(
       issues,
       validateFrontendAlignedSubmission(draft, {
+        allowReferenceNames: true,
         skipCertificationValidation: true,
         skipMediaValidation: true,
         skipSalesValidation: true
@@ -1561,10 +1562,10 @@ export async function precheckProductPackage(rawInput: unknown) {
   const requiredFileOk = checkedFiles.some((file) => file.usage === 'productMainImage' && file.ok);
   if (!requiredFileOk) {
     addIssue(issues, {
-      severity: 'warning',
-      code: 'PRODUCT_MAIN_IMAGE_OPTIONAL',
+      severity: 'error',
+      code: 'PRODUCT_MAIN_IMAGE_REQUIRED',
       section: '商品图片',
-      message: '未找到可用的商品主图，建议补充以提升前台展示效果。'
+      message: '未找到可用的商品主图，商品主图是创建前硬拦截字段。'
     });
   }
 

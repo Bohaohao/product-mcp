@@ -11,6 +11,7 @@ export interface SubmissionValidationIssue {
 type UnknownRecord = Record<string, unknown>;
 
 interface FrontendValidationOptions {
+  allowReferenceNames?: boolean;
   skipCertificationValidation?: boolean;
   skipMediaValidation?: boolean;
   skipSalesValidation?: boolean;
@@ -38,6 +39,11 @@ function normalizeFlag(value: unknown): boolean {
   return value === true || value === 1 || value === '1';
 }
 
+function productTypeValue(input: UnknownRecord): number | undefined {
+  const parsed = numberValue(input.productType);
+  return parsed === undefined ? undefined : parsed;
+}
+
 function addIssue(
   issues: SubmissionValidationIssue[],
   code: string,
@@ -52,6 +58,68 @@ function addIssue(
 function rowHasAnyValue(row: UnknownRecord | undefined, fields: string[]): boolean {
   if (!row) return false;
   return fields.some((field) => hasValue(row[field]));
+}
+
+function rawOptionalText(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  return String(value);
+}
+
+function validateProductModel(input: UnknownRecord, issues: SubmissionValidationIssue[]): void {
+  for (const field of ['productModel', 'spuModel']) {
+    const value = rawOptionalText(input[field]);
+    if (value === undefined) continue;
+    if (value !== value.trim() || /[\u4e00-\u9fa5]/.test(value) || /[^A-Za-z0-9 ]/.test(value)) {
+      addIssue(
+        issues,
+        'PRODUCT_MODEL_FORMAT_INVALID',
+        `${field} 仅支持英文大小写、数字和空格，且不能有首尾空格、中文或特殊符号。`,
+        '基础信息',
+        undefined,
+        field
+      );
+    }
+  }
+}
+
+function validateReferences(input: UnknownRecord, issues: SubmissionValidationIssue[], options: FrontendValidationOptions): void {
+  const hasFirstCategory = hasValue(input.categoryFirstId) || (options.allowReferenceNames && hasValue(input.categoryFirstName));
+  if (!hasFirstCategory) {
+    addIssue(issues, 'CATEGORY_FIRST_REQUIRED', '一级分类必填。', '分类、单位、供应商', undefined, 'categoryFirstId');
+  }
+
+  const suppliers = Array.isArray(input.suppliers) ? (input.suppliers as UnknownRecord[]) : [];
+  const hasSupplier =
+    suppliers.some((supplier) => hasValue(supplier.supplierId) || (options.allowReferenceNames && hasValue(supplier.supplierName))) ||
+    hasValue(input.supplierId) ||
+    (options.allowReferenceNames && hasValue(input.supplierName));
+  if (!hasSupplier) {
+    addIssue(issues, 'SUPPLIER_REQUIRED', '供应商必填。', '分类、单位、供应商', undefined, 'suppliers');
+  }
+}
+
+function validateRegions(input: UnknownRecord, issues: SubmissionValidationIssue[], options: FrontendValidationOptions): void {
+  if (input.useAllRegions === true) return;
+  const regions = Array.isArray(input.regions) ? (input.regions as UnknownRecord[]) : [];
+  if (!regions.length) {
+    addIssue(issues, 'REGION_REQUIRED', '适用范围/适用区域必填；可使用 useAllRegions=true 表示全球。', '适用区域', undefined, 'regions');
+    return;
+  }
+
+  regions.forEach((region, index) => {
+    if (normalizeFlag(region.isAll)) return;
+    const hasRegionRef = hasValue(region.regionId) || (options.allowReferenceNames && hasValue(region.regionName));
+    if (!hasRegionRef) {
+      addIssue(
+        issues,
+        'REGION_ID_REQUIRED',
+        `适用区域第 ${index + 1} 行必须有 regionId${options.allowReferenceNames ? ' 或区域名称' : ''}。`,
+        '适用区域',
+        index + 1,
+        'regions'
+      );
+    }
+  });
 }
 
 function detectMainImage(input: UnknownRecord): boolean {
@@ -79,6 +147,87 @@ function validateSamplePrice(input: UnknownRecord, issues: SubmissionValidationI
       'samplePrice'
     );
   }
+}
+
+function valueFromPackage(input: UnknownRecord, field: string): unknown {
+  if (hasValue(input[field])) return input[field];
+  const packageInfo = input.packageInfo;
+  if (packageInfo && typeof packageInfo === 'object') {
+    return (packageInfo as UnknownRecord)[field];
+  }
+  return undefined;
+}
+
+function validateRequiredPositiveField(
+  input: UnknownRecord,
+  issues: SubmissionValidationIssue[],
+  field: string,
+  label: string,
+  code: string
+): void {
+  const value = valueFromPackage(input, field);
+  const parsed = numberValue(value);
+  if (!hasValue(value) || parsed === undefined || parsed <= 0) {
+    addIssue(issues, code, `${label}必填，且必须为大于 0 的数字。`, '包装与物流', undefined, field);
+  }
+}
+
+function validateRequiredNonNegativeField(
+  input: UnknownRecord,
+  issues: SubmissionValidationIssue[],
+  field: string,
+  label: string,
+  code: string
+): void {
+  const value = valueFromPackage(input, field);
+  const parsed = numberValue(value);
+  if (!hasValue(value) || parsed === undefined || parsed < 0) {
+    addIssue(issues, code, `${label}必填，且必须为不小于 0 的数字。`, '包装与物流', undefined, field);
+  }
+}
+
+function validateUnifiedPackage(input: UnknownRecord, issues: SubmissionValidationIssue[]): void {
+  const productType = productTypeValue(input);
+  if (productType !== 1 && productType !== 2) return;
+  if (normalizeFlag(input.independentPkg)) return;
+
+  validateRequiredPositiveField(input, issues, 'packLength', '包装长 mm', 'PACKAGE_LENGTH_REQUIRED');
+  validateRequiredPositiveField(input, issues, 'packWidth', '包装宽 mm', 'PACKAGE_WIDTH_REQUIRED');
+  validateRequiredPositiveField(input, issues, 'packHeight', '包装高 mm', 'PACKAGE_HEIGHT_REQUIRED');
+  validateRequiredNonNegativeField(input, issues, 'packingFee', '包装费', 'PACKAGE_FEE_REQUIRED');
+  validateRequiredNonNegativeField(input, issues, 'packWeight', '包装重量 kg', 'PACKAGE_WEIGHT_REQUIRED');
+  validateRequiredNonNegativeField(input, issues, 'netWeight', '净重 kg', 'NET_WEIGHT_REQUIRED');
+}
+
+function validateWholeMachineConfig(input: UnknownRecord, issues: SubmissionValidationIssue[]): void {
+  if (productTypeValue(input) !== 1) return;
+  const requiredFields = [
+    ['level', '产品等级', 'PRODUCT_LEVEL_REQUIRED'],
+    ['referenceCostCny', '参考成本价（人民币）', 'REFERENCE_COST_CNY_REQUIRED'],
+    ['profitMargin', '利润率', 'PROFIT_MARGIN_REQUIRED']
+  ] as const;
+  for (const [field, label, code] of requiredFields) {
+    if (!hasValue(input[field])) {
+      addIssue(issues, code, `整机商品必须填写${label}。`, '商品配置', undefined, field);
+    }
+  }
+
+  const baseConfigs = Array.isArray(input.baseConfigs) ? (input.baseConfigs as UnknownRecord[]) : [];
+  if (!baseConfigs.length) {
+    addIssue(issues, 'BASE_CONFIG_REQUIRED', '整机商品至少需要填写一行基础配置。', '商品配置', undefined, 'baseConfigs');
+  }
+  baseConfigs.forEach((row, index) => {
+    if (!hasValue(row.configValue)) {
+      addIssue(issues, 'BASE_CONFIG_VALUE_REQUIRED', `基础配置第 ${index + 1} 行必须填写配置值。`, '商品配置', index + 1, 'baseConfigs');
+    }
+  });
+
+  const technicalParams = Array.isArray(input.technicalParams) ? (input.technicalParams as UnknownRecord[]) : [];
+  technicalParams.forEach((row, index) => {
+    if (!hasValue(row.paramValue)) {
+      addIssue(issues, 'TECHNICAL_PARAM_VALUE_REQUIRED', `技术参数第 ${index + 1} 行必须填写参数值。`, '商品配置', index + 1, 'technicalParams');
+    }
+  });
 }
 
 function validateTags(input: UnknownRecord, issues: SubmissionValidationIssue[]): void {
@@ -118,13 +267,13 @@ function validatePartLists(input: UnknownRecord, issues: SubmissionValidationIss
     }
 
     const costPrice = numberValue(row.costPrice);
-    if (!hasValue(row.costPrice) || costPrice === undefined || costPrice < 0) {
-      addIssue(issues, 'PART_COST_PRICE_INVALID', `配件第 ${rowNumber} 行成本价必须为不小于 0 的数字。`, '配件、备件、易损件', rowNumber, 'partLists');
+    if (!hasValue(row.costPrice) || costPrice === undefined || costPrice <= 0) {
+      addIssue(issues, 'PART_COST_PRICE_INVALID', `配件第 ${rowNumber} 行成本价必须为正数。`, '配件、备件、易损件', rowNumber, 'partLists');
     }
 
     const suggestedPrice = numberValue(row.suggestedPrice);
-    if (!hasValue(row.suggestedPrice) || suggestedPrice === undefined || suggestedPrice < 0) {
-      addIssue(issues, 'PART_SUGGESTED_PRICE_INVALID', `配件第 ${rowNumber} 行建议售价必须为不小于 0 的数字。`, '配件、备件、易损件', rowNumber, 'partLists');
+    if (!hasValue(row.suggestedPrice) || suggestedPrice === undefined || suggestedPrice <= 0) {
+      addIssue(issues, 'PART_SUGGESTED_PRICE_INVALID', `配件第 ${rowNumber} 行建议售价必须为正数。`, '配件、备件、易损件', rowNumber, 'partLists');
     }
 
     const suggestedStock = numberValue(row.suggestedStock);
@@ -179,7 +328,7 @@ function validateNonNegativeNumber(
 }
 
 function validateSkuPackages(input: UnknownRecord, issues: SubmissionValidationIssue[]): void {
-  if (!normalizeFlag(input.independentPkg)) return;
+  if (!normalizeFlag(input.independentPkg) && !Array.isArray(input.skuList)) return;
 
   const rows = Array.isArray(input.skuList) ? (input.skuList as UnknownRecord[]) : [];
   if (!rows.length) {
@@ -192,9 +341,8 @@ function validateSkuPackages(input: UnknownRecord, issues: SubmissionValidationI
     validatePositiveNumber(row, issues, 'pkgLength', 'SKU_PACKAGE_LENGTH_REQUIRED', '包装长', rowNumber);
     validatePositiveNumber(row, issues, 'pkgWidth', 'SKU_PACKAGE_WIDTH_REQUIRED', '包装宽', rowNumber);
     validatePositiveNumber(row, issues, 'pkgHeight', 'SKU_PACKAGE_HEIGHT_REQUIRED', '包装高', rowNumber);
-    validatePositiveNumber(row, issues, 'pkgVolume', 'SKU_PACKAGE_VOLUME_REQUIRED', '包装方数', rowNumber);
-    validatePositiveNumber(row, issues, 'pkgWeight', 'SKU_PACKAGE_WEIGHT_REQUIRED', '包装重量', rowNumber);
-    validatePositiveNumber(row, issues, 'grossWeight', 'SKU_GROSS_WEIGHT_REQUIRED', '毛重', rowNumber);
+    validateNonNegativeNumber(row, issues, 'grossWeight', 'SKU_GROSS_WEIGHT_REQUIRED', '毛重', rowNumber);
+    validateNonNegativeNumber(row, issues, 'pkgWeight', 'SKU_PACKAGE_WEIGHT_REQUIRED', '净重', rowNumber);
     validateNonNegativeNumber(row, issues, 'pkgFee', 'SKU_PACKAGE_FEE_REQUIRED', '包装费', rowNumber);
   });
 }
@@ -380,8 +528,13 @@ export function validateFrontendAlignedSubmission(
   options: FrontendValidationOptions = {}
 ): SubmissionValidationIssue[] {
   const issues: SubmissionValidationIssue[] = [];
+  validateProductModel(input, issues);
+  validateReferences(input, issues, options);
+  validateRegions(input, issues, options);
   validateSamplePrice(input, issues);
   validateTags(input, issues);
+  validateWholeMachineConfig(input, issues);
+  validateUnifiedPackage(input, issues);
   validatePartLists(input, issues);
   validateSkuPackages(input, issues);
   if (!options.skipMediaValidation) {

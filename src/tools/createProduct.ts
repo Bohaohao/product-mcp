@@ -118,7 +118,7 @@ export const productCreateInputSchema = {
   status: z.union([z.literal(1), z.literal(2), z.literal(3)]).describe('1=on shelf, 2=off shelf, 3=void.'),
   level: scalarSchema,
 
-  categoryFirstId: optionalIdSchema.describe('Optional first-level category id. Category hierarchy is validated only when category ids are provided.'),
+  categoryFirstId: optionalIdSchema.describe('Required first-level category id. Kept schema-optional so product_create can return a grouped MCP validation issue.'),
   categorySecondId: optionalIdSchema,
   categoryThirdId: optionalIdSchema,
   unitId: idSchema,
@@ -140,7 +140,8 @@ export const productCreateInputSchema = {
   productCode: z.string().trim().optional(),
   commodityId: z.number().int().positive().optional(),
   hsCode: z.string().trim().optional(),
-  productModel: z.string().trim().optional(),
+  productModel: z.string().optional().describe('Optional product model. If present, only English letters, digits, and spaces are allowed.'),
+  spuModel: z.string().optional().describe('Compatibility alias for productModel. productModel wins when both are present.'),
   brand: z.string().trim().optional(),
   remark: z.string().optional(),
   usagePurpose: z.string().trim().optional(),
@@ -683,6 +684,13 @@ function normalizeSkuList(input: ProductCreateInput): Array<Record<string, unkno
   }));
 }
 
+function normalizeProductModel(input: ProductCreateInput): string | undefined {
+  const value = input.productModel ?? input.spuModel;
+  if (value === undefined || value === null) return undefined;
+  const text = String(value).trim();
+  return text || undefined;
+}
+
 function buildProductI18nList(input: ProductCreateInput): Array<Record<string, unknown>> {
   const rows: Array<Record<string, unknown>> = [
     {
@@ -728,7 +736,7 @@ function buildRequestBody(input: ProductCreateInput, categoryConfig?: CategoryCo
     spuNameCn: input.productNameCn,
     spuNameEn: input.productNameEn,
     i18nList: buildProductI18nList(input),
-    productModel: input.productModel,
+    productModel: normalizeProductModel(input),
     brand: input.brand,
     remark: input.remark,
     relatedCommodityId: input.relatedCommodityId,
@@ -811,7 +819,7 @@ function findId(value: unknown): string | undefined {
 export async function productCreate(backend: BackendClient, rawInput: unknown, requestId: string) {
   const input = productCreateObjectSchema.parse(rawInput);
   const validationIssues = [
-    ...validateFrontendAlignedSubmission(input as unknown as Record<string, unknown>, { skipMediaValidation: true }),
+    ...validateFrontendAlignedSubmission(input as unknown as Record<string, unknown>),
     ...validateResolvedUploads(input as unknown as Record<string, unknown>)
   ];
   throwValidationIssues('商品创建参数未通过前端硬拦截校验。', validationIssues);

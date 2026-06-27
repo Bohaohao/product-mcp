@@ -418,10 +418,14 @@ function createMinimalDtoInput(overrides = {}) {
   return {
     confirm: true,
     productNameCn: 'Smoke Test Product',
-    productType: 1,
+    productType: 3,
     status: 1,
+    categoryFirstId: '1',
+    categorySecondId: '11',
     unitId: '9',
     suppliers: [{ supplierId: '88', supplierName: 'Smoke Supplier' }],
+    useAllRegions: true,
+    productMainImageUrl: 'https://example.test/main.png',
     ...dtoRequiredFlags,
     ...overrides
   };
@@ -464,13 +468,15 @@ async function assertCreateSucceedsWithoutEnglishName() {
       assert(body.spuNameEn === undefined, 'spuNameEn compatibility field should stay optional');
       assert(Array.isArray(body.i18nList) && body.i18nList.length === 1, 'i18nList should only include zh when english name is missing');
       assert(body.i18nList?.[0]?.langCode === 'zh', 'zh i18n row was not preserved');
-      assert(body.productType === 1, 'productType was not forwarded');
+      assert(body.productType === 3, 'productType was not forwarded');
       assert(body.status === 1, 'status was not forwarded');
       assert(body.unitId === 9, 'unitId was not normalized');
       assert(body.suppliers?.[0]?.supplierId === 88, 'supplier was not normalized');
-      assert(body.categoryFirstId === undefined, 'categoryFirstId should stay optional');
-      assert(body.packLength === undefined, 'packaging fields should stay optional');
-      assert(body.medias.length === 0, 'medias should stay optional for minimal DTO create');
+      assert(body.categoryFirstId === 1, 'categoryFirstId was not normalized');
+      assert(body.categorySecondId === 11, 'categorySecondId was not normalized');
+      assert(body.regions?.[0]?.isAll === 1, 'global region was not mapped');
+      assert(body.packLength === undefined, 'service product should not require package fields');
+      assert(body.medias?.[0]?.imageCategory === 1, 'main image media was not created');
       assert(body.supportConsolidation === 0, 'supportConsolidation was not forwarded');
       assert(body.hasOverseasWarehouseStock === 0, 'hasOverseasWarehouseStock was not forwarded');
     }),
@@ -559,14 +565,19 @@ async function main() {
   await assertTokenDaemonClientAndBridge();
   await assertCreateSucceedsWithoutEnglishName();
 
-  const chineseModelResult = await productCreate(
+  const modelAliasResult = await productCreate(
     createSuccessBackendStub((body) => {
-      assert(body.productModel === '中文-Model', 'productModel with Chinese characters should be forwarded');
+      assert(body.productModel === 'ABC 123', 'spuModel alias should normalize to productModel');
     }),
-    createMinimalDtoInput({ productModel: '中文-Model' }),
-    'smoke-success-cn-model'
+    createMinimalDtoInput({ spuModel: 'ABC 123' }),
+    'smoke-success-model-alias'
   );
-  assert(chineseModelResult.ok === true, 'productCreate should not regex-block Chinese productModel');
+  assert(modelAliasResult.ok === true, 'productCreate should accept valid spuModel alias');
+
+  await assertCreateValidationFailure(
+    createMinimalDtoInput({ productModel: '中文-Model' }),
+    'PRODUCT_MODEL_FORMAT_INVALID'
+  );
 
   await assertCreateSchemaFailure(
     (() => {
@@ -587,13 +598,39 @@ async function main() {
     createMinimalDtoInput({
       independentPkg: 1,
       skuList: [{ skuCode: 'SKU-1', pkgLength: 100, pkgWidth: 100, pkgHeight: 100, grossWeight: 2, pkgWeight: 1 }],
-      categoryFirstId: '1',
-      categorySecondId: '11',
-      useAllRegions: true,
-      productMainImageUrl: 'https://example.test/main.png',
       medias: [{ mediaType: 1, imageCategory: 8, mediaUrl: 'https://example.test/banner.png' }]
     }),
     'SKU_PACKAGE_FEE_REQUIRED'
+  );
+  await assertCreateValidationFailure(
+    createMinimalDtoInput({ categoryFirstId: undefined, categorySecondId: undefined }),
+    'CATEGORY_FIRST_REQUIRED'
+  );
+  await assertCreateValidationFailure(
+    createMinimalDtoInput({ useAllRegions: false, regions: [] }),
+    'REGION_REQUIRED'
+  );
+  await assertCreateValidationFailure(
+    createMinimalDtoInput({ productMainImageUrl: undefined }),
+    'PRODUCT_MAIN_IMAGE_REQUIRED'
+  );
+  await assertCreateValidationFailure(
+    createMinimalDtoInput({ productType: 2 }),
+    'PACKAGE_LENGTH_REQUIRED'
+  );
+  await assertCreateValidationFailure(
+    createMinimalDtoInput({
+      productType: 1,
+      packageInfo: {
+        packLength: 100,
+        packWidth: 100,
+        packHeight: 100,
+        packingFee: 1,
+        packWeight: 2,
+        netWeight: 1
+      }
+    }),
+    'PRODUCT_LEVEL_REQUIRED'
   );
 
   const fakeBackend = createFakeBackend();
