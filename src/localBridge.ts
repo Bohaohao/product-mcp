@@ -39,6 +39,7 @@ import {
 } from './upload/policies.js';
 import { defaultUploadBackendConfig, getOssStsToken, uploadLocalFileToOss } from './upload/ossUploader.js';
 import { precheckProductPackage, productPrecheckPackageInputSchema } from './packagePrecheck.js';
+import { productCreateFromPackage, productCreateFromPackageInputSchema } from './workflows/createFromPackage.js';
 import { prepareImageForUpload } from './upload/imagePreparer.js';
 import {
   ProductTokenDaemonClient,
@@ -1159,6 +1160,18 @@ export class ProductTokenBridge {
     );
   }
 
+  async createProductFromPackage(input: unknown, requestId: string): Promise<CallToolResult> {
+    return this.callBackendTool(
+      'product_create_from_package',
+      requestId,
+      (backend) =>
+        productCreateFromPackage(backend, input, requestId, {
+          uploadLocalFile: (uploadInput) => this.uploadLocalFile(uploadInput)
+        }),
+      'product_create_from_package runs the local package workflow inside Product MCP: precheck, duplicate gate, reference resolution, upload binding, create, and detail verification.'
+    );
+  }
+
   private localBackendConfig(): ProductMcpConfig {
     return {
       port: 0,
@@ -1453,7 +1466,7 @@ async function main(): Promise<void> {
     {
       title: 'Create product',
       description:
-        'Read Admin-Token from the configured Chrome project tab, then create a real product by calling the ERP backend directly from the local bridge. This avoids the remote MCP gateway request-size limit for large but valid product payloads. Use product_upload_file first for local files, and pass only returned OSS URLs plus business fields here; never pass local paths, file bytes, or large base64 payloads.',
+        'Read Admin-Token from the configured Chrome project tab, then create a real product by calling the ERP backend directly from the local bridge. Use previewOnly=true to validate and inspect the final submission preview without creating. For real creation pass confirm=true, use product_upload_file first for local files, and pass only returned OSS URLs plus business fields here; never pass local paths, file bytes, or large base64 payloads.',
       inputSchema: productCreateInputSchema
     },
     async (input) => {
@@ -1466,6 +1479,31 @@ async function main(): Promise<void> {
           isChromeRemoteDebuggingNotAllowedError(error)
         ) {
           return textResult(bridgeErrorPayload(error, config, 'PRODUCT_CREATE_FAILED'));
+        }
+
+        return textResult(toErrorPayload(error, requestId));
+      }
+    }
+  );
+
+  server.registerTool(
+    'product_create_from_package',
+    {
+      title: 'Create product from package',
+      description:
+        'High-level local workflow for 商品资料.md packages. Preview mode validates, checks duplicates, resolves references, and returns a final submission preview without upload/create. Create mode requires confirm=true, uploads every valid uploadQueue item sequentially with one retry per failed file, binds OSS URLs, creates the product, verifies detail, and returns a diff report.',
+      inputSchema: productCreateFromPackageInputSchema
+    },
+    async (input) => {
+      const requestId = createBridgeRequestId('product_create_from_package');
+      try {
+        return await bridge.createProductFromPackage(input, requestId);
+      } catch (error) {
+        if (
+          isChromeDevtoolsMcpPreflightError(error) ||
+          isChromeRemoteDebuggingNotAllowedError(error)
+        ) {
+          return textResult(bridgeErrorPayload(error, config, 'PRODUCT_CREATE_FROM_PACKAGE_FAILED'));
         }
 
         return textResult(toErrorPayload(error, requestId));

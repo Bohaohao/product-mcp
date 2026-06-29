@@ -14,8 +14,10 @@ async function main() {
   const { packagePath, summary } = parseArgs();
   const result = await precheckProductPackage({
     packagePath,
-    includeDraft: true
+    includeDraft: true,
+    responseMode: 'standard'
   });
+  const uploadQueue = 'uploadQueue' in result ? result.uploadQueue : [];
   const output = summary
     ? {
         ok: result.ok,
@@ -24,7 +26,7 @@ async function main() {
         summary: result.summary,
         readiness: result.readiness,
         issues: result.issues,
-        uploadQueue: result.uploadQueue.map((item) => ({
+        uploadQueue: uploadQueue.map((item) => ({
           usage: item.usage,
           localPath: item.localPath,
           title: item.title,

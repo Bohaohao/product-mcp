@@ -1,6 +1,7 @@
 import * as z from 'zod/v4';
 import type { BackendClient } from '../backendClient.js';
 import { ProductMcpError } from '../errors.js';
+import { buildFieldCoverage, buildProtocolTrace, buildSubmissionPreview, toActionableIssues } from '../protocol.js';
 import { throwValidationIssues, validateFrontendAlignedSubmission, validateResolvedUploads } from '../submissionValidation.js';
 
 const idSchema = z.union([z.string().trim().min(1), z.number()]);
@@ -104,7 +105,9 @@ const tagObjectSchema = z.looseObject({
 });
 
 export const productCreateInputSchema = {
-  confirm: z.literal(true).describe('Required confirmation. This tool creates a real product.'),
+  confirm: z.boolean().optional().describe('Required true unless previewOnly=true. This tool creates a real product when previewOnly is not enabled.'),
+  previewOnly: z.boolean().default(false).describe('When true, validate and build the final submission preview but do not call the ERP create API.'),
+  mode: z.enum(['create', 'retry', 'update', 'clone']).default('create').describe('Execution mode. product_create currently only executes create/retry; update/clone are rejected for safety.'),
   clientRequestId: z.string().trim().max(100).optional(),
 
   id: optionalIdSchema,
@@ -862,6 +865,16 @@ function findId(value: unknown): string | undefined {
 export async function productCreate(backend: BackendClient, rawInput: unknown, requestId: string) {
   const input = productCreateObjectSchema.parse(rawInput);
   const validationIssues = [
+    ...(input.previewOnly || input.confirm === true
+      ? []
+      : [
+          {
+            code: 'CONFIRM_REQUIRED',
+            message: 'product_create 会创建真实商品；除 previewOnly=true 外必须传入 confirm=true。',
+            section: '创建确认',
+            field: 'confirm'
+          }
+        ]),
     ...validateFrontendAlignedSubmission(input as unknown as Record<string, unknown>),
     ...validateResolvedUploads(input as unknown as Record<string, unknown>)
   ];
@@ -879,6 +892,49 @@ export async function productCreate(backend: BackendClient, rawInput: unknown, r
       })
     : undefined;
   const body = buildRequestBody(input, categoryConfig);
+  const submissionPreview = buildSubmissionPreview(input as unknown as Record<string, unknown>, body);
+  const fieldCoverage = buildFieldCoverage(input as unknown as Record<string, unknown>, {
+    knownTopLevelFields: Object.keys(productCreateInputSchema)
+  });
+  const previewTrace = buildProtocolTrace('product_create', requestId, [
+    {
+      name: 'validate_input',
+      ok: true,
+      counts: {
+        validationIssues: 0
+      }
+    },
+    {
+      name: 'resolve_category_config',
+      ok: true,
+      summary: categoryConfig ? 'Category config loaded for ID/name normalization.' : 'Category config was not required.',
+      counts: {
+        baseConfigs: input.baseConfigs?.length || 0,
+        technicalParams: input.technicalParams?.length || 0,
+        optionalConfigs: input.optionalConfigs?.length || 0
+      }
+    },
+    {
+      name: 'build_submission_preview',
+      ok: true,
+      counts: submissionPreview.counts
+    }
+  ]);
+
+  if (input.previewOnly) {
+    return {
+      ok: true as const,
+      previewOnly: true,
+      requestId,
+      clientRequestId: input.clientRequestId,
+      submissionPreview,
+      fieldCoverage,
+      actionableIssues: toActionableIssues([]),
+      trace: previewTrace,
+      note: 'previewOnly=true, no ERP create API call was made.'
+    };
+  }
+
   const response = await backend.post<ProductCreateResponse>('/user/erp/commodity', body);
   const id = findId(response);
 
@@ -890,6 +946,16 @@ export async function productCreate(backend: BackendClient, rawInput: unknown, r
     frontendViewPath: id ? `/erp/commodity/viewCommodity/${id}` : undefined,
     requestId,
     clientRequestId: input.clientRequestId,
+    submissionPreview,
+    fieldCoverage,
+    trace: buildProtocolTrace('product_create', requestId, [
+      ...previewTrace.stages,
+      {
+        name: 'post_create',
+        ok: true,
+        summary: id ? `Created product ${id}.` : 'Backend returned success without a discoverable product id.'
+      }
+    ]),
     warning: id ? undefined : 'Backend returned success but product id was not found in the response. Verify the product list before retrying.',
     backendResponse: response
   };

@@ -1,4 +1,5 @@
 import { ProductMcpError } from './errors.js';
+import { toActionableIssues } from './protocol.js';
 
 export interface SubmissionValidationIssue {
   code: string;
@@ -79,6 +80,31 @@ function validateProductModel(input: UnknownRecord, issues: SubmissionValidation
         field
       );
     }
+  }
+}
+
+function validateCreateMode(input: UnknownRecord, issues: SubmissionValidationIssue[]): void {
+  const mode = stringValue(input.mode) || 'create';
+  if (mode !== 'create' && mode !== 'retry') {
+    addIssue(
+      issues,
+      'CREATE_MODE_UNSUPPORTED',
+      `product_create 当前只支持 create/retry 模式，不能用 ${mode} 模式创建商品。`,
+      '创建模式',
+      undefined,
+      'mode'
+    );
+  }
+
+  if (mode === 'create' && hasValue(input.id)) {
+    addIssue(
+      issues,
+      'CREATE_MODE_ID_FORBIDDEN',
+      '创建新商品时不能携带顶层 id，避免把旧商品资料误当作更新/复制提交。',
+      '创建模式',
+      undefined,
+      'id'
+    );
   }
 }
 
@@ -618,6 +644,7 @@ export function validateFrontendAlignedSubmission(
   options: FrontendValidationOptions = {}
 ): SubmissionValidationIssue[] {
   const issues: SubmissionValidationIssue[] = [];
+  validateCreateMode(input, issues);
   validateProductModel(input, issues);
   validateReferences(input, issues, options);
   validateRegions(input, issues, options);
@@ -741,7 +768,8 @@ export function throwValidationIssues(summary: string, issues: SubmissionValidat
   throw new ProductMcpError('MCP_INPUT_INVALID', `${summary} ${preview}`, {
     details: {
       issueCount: issues.length,
-      issues
+      issues,
+      actionableIssues: toActionableIssues(issues)
     }
   });
 }

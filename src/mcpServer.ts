@@ -62,7 +62,7 @@ export function createProductMcpServer(config: ProductMcpConfig, context: Produc
     {
       title: 'Create product',
       description:
-        'Create a real ERP product through POST /user/erp/commodity. This remote tool accepts business fields and already-uploaded OSS URLs only. For local files, use the local bridge product_upload_file first; never send local paths, file bytes, or large base64 payloads here.',
+        'Create a real ERP product through POST /user/erp/commodity. Use previewOnly=true to validate and inspect the final submission preview without creating. For real creation pass confirm=true. This remote tool accepts business fields and already-uploaded OSS URLs only; never send local paths, file bytes, or large base64 payloads here.',
       inputSchema: productCreateInputSchema
     },
     async (input) => {

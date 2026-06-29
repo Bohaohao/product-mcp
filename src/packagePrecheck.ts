@@ -10,6 +10,7 @@ import {
   type UploadTarget
 } from './upload/policies.js';
 import { prepareImageForUpload } from './upload/imagePreparer.js';
+import { buildFieldCoverage, buildProtocolTrace, buildSubmissionPreview, toActionableIssues } from './protocol.js';
 import { validateFrontendAlignedSubmission, type SubmissionValidationIssue } from './submissionValidation.js';
 
 export const productPrecheckPackageInputSchema = {
@@ -19,6 +20,10 @@ export const productPrecheckPackageInputSchema = {
     .describe('Local product package directory, or a direct path to 商品资料.md on the Codex user machine.'),
   markdownFileName: z.string().trim().default('商品资料.md').describe('Markdown file name when packagePath is a directory.'),
   includeDraft: z.boolean().default(true).describe('When true, include a draft payload skeleton parsed from 商品资料.md.'),
+  responseMode: z
+    .enum(['standard', 'summary', 'debug'])
+    .default('standard')
+    .describe('standard keeps the existing full response, summary returns only business summaries/coverage/issues, debug keeps all diagnostics.'),
   categoryConfig: z
     .object({
       units: z.array(z.record(z.string(), z.any())).optional(),
@@ -43,6 +48,7 @@ interface PrecheckIssue {
   message: string;
   section?: string;
   row?: number;
+  field?: string;
   path?: string;
 }
 
@@ -632,7 +638,8 @@ function appendFrontendValidationIssues(issues: PrecheckIssue[], frontendIssues:
       code: issue.code,
       message: issue.message,
       section: issue.section,
-      row: issue.row
+      row: issue.row,
+      field: issue.field
     });
   }
 }
@@ -2100,35 +2107,99 @@ export async function precheckProductPackage(rawInput: unknown) {
       };
     });
 
-  return {
+  const summary = {
+    productNameCn: draft?.productNameCn,
+    productNameEn: draft?.productNameEn,
+    productType: draft?.productType,
+    status: draft?.status,
+    categoryFirstName: draft?.categoryFirstName,
+    categorySecondName: draft?.categorySecondName,
+    categoryThirdName: draft?.categoryThirdName,
+    unitName: draft?.unitName,
+    supplierName: draft?.supplierName,
+    useAllRegions: draft?.useAllRegions
+  };
+  const readiness = {
+    canUploadAllReferencedFiles: checkedFiles.every((file) => file.ok),
+    canCreateAfterSkippingInvalidOptionalFiles: errorCount === 0,
+    requiresUserDecision: invalidOptionalFileCount > 0,
+    errorCount,
+    warningCount,
+    validUploadCount: uploadQueue.length,
+    invalidFileCount: checkedFiles.filter((file) => !file.ok).length
+  };
+  const fieldCoverage = draft ? buildFieldCoverage(draft) : undefined;
+  const submissionPreview = draft ? buildSubmissionPreview(draft) : undefined;
+  const actionableIssues = toActionableIssues(issues);
+  const trace = buildProtocolTrace('product_precheck_package', undefined, [
+    {
+      name: 'parse_markdown',
+      ok: Boolean(draft),
+      counts: {
+        markdownTables: tables.length
+      }
+    },
+    {
+      name: 'validate_fields',
+      ok: errorCount === 0,
+      counts: {
+        errors: errorCount,
+        warnings: warningCount
+      }
+    },
+    {
+      name: 'validate_files',
+      ok: checkedFiles.every((file) => file.ok),
+      counts: {
+        referencedFiles: checkedFiles.length,
+        validUploadCount: uploadQueue.length,
+        invalidFileCount: checkedFiles.filter((file) => !file.ok).length
+      }
+    },
+    {
+      name: 'build_draft',
+      ok: Boolean(draft),
+      counts: submissionPreview?.counts
+    }
+  ]);
+
+  const result = {
     ok: errorCount === 0,
     packageDir,
     markdownPath,
-    summary: {
-      productNameCn: draft?.productNameCn,
-      productNameEn: draft?.productNameEn,
-      productType: draft?.productType,
-      status: draft?.status,
-      categoryFirstName: draft?.categoryFirstName,
-      categorySecondName: draft?.categorySecondName,
-      categoryThirdName: draft?.categoryThirdName,
-      unitName: draft?.unitName,
-      supplierName: draft?.supplierName,
-      useAllRegions: draft?.useAllRegions
+    protocol: {
+      version: 'product-mcp-protocol-2026-06-29.1',
+      contract: 'CommoditySaveDTO + frontend hard blockers',
+      responseMode: input.responseMode
     },
-    readiness: {
-      canUploadAllReferencedFiles: checkedFiles.every((file) => file.ok),
-      canCreateAfterSkippingInvalidOptionalFiles: errorCount === 0,
-      requiresUserDecision: invalidOptionalFileCount > 0,
-      errorCount,
-      warningCount,
-      validUploadCount: uploadQueue.length,
-      invalidFileCount: checkedFiles.filter((file) => !file.ok).length
-    },
+    trace,
+    summary,
+    readiness,
+    fieldCoverage,
+    submissionPreview,
+    actionableIssues,
     unresolvedReferences: draft ? unresolvedReferences(draft) : undefined,
     uploadQueue,
     files: checkedFiles,
     draftCreateInput: draft,
     issues
   };
+
+  if (input.responseMode === 'summary') {
+    return {
+      ok: result.ok,
+      packageDir,
+      markdownPath,
+      protocol: result.protocol,
+      trace,
+      summary,
+      readiness,
+      fieldCoverage,
+      submissionPreview,
+      actionableIssues,
+      issues
+    };
+  }
+
+  return result;
 }

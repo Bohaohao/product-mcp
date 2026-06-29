@@ -1,5 +1,8 @@
 import { createServer } from 'node:http';
 import { once } from 'node:events';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { parsePages } from '../dist/chromePages.js';
@@ -8,6 +11,7 @@ import { ProductMcpError } from '../dist/errors.js';
 import { createProductMcpExpressApp } from '../dist/server.js';
 import { ProductTokenDaemonClient } from '../dist/tokenDaemonClient.js';
 import { productCreate } from '../dist/tools/createProduct.js';
+import { productCreateFromPackage } from '../dist/workflows/createFromPackage.js';
 
 const fakeBackendPort = Number(process.env.SMOKE_BACKEND_PORT || 18787);
 const mcpPort = Number(process.env.SMOKE_MCP_PORT || 18788);
@@ -147,7 +151,17 @@ function createFakeBackend() {
         const body = JSON.parse(rawBody || '{}');
         assert(url.searchParams.get('pageNum') === '1', 'duplicate check pageNum query was not forwarded');
         assert(url.searchParams.get('pageSize') === '20', 'duplicate check pageSize query was not forwarded');
-        assert(body.keyword === 'SmokeTestProduct', 'duplicate check keyword was not normalized');
+        assert(['SmokeTestProduct', 'WorkflowUniqueProduct'].includes(body.keyword), 'duplicate check keyword was not normalized');
+        if (body.keyword === 'WorkflowUniqueProduct') {
+          sendJson(res, 200, {
+            code: 200,
+            data: {
+              rows: [],
+              total: 0
+            }
+          });
+          return;
+        }
         sendJson(res, 200, {
           code: 200,
           data: {
@@ -460,6 +474,26 @@ function createSuccessBackendStub(assertBody) {
   };
 }
 
+function createPreviewBackendStub() {
+  return {
+    async get(path) {
+      if (path === '/user/erp/productCategory/tree') {
+        return [
+          {
+            id: 1,
+            status: '0',
+            children: [{ id: 11, status: '0', children: [] }]
+          }
+        ];
+      }
+      throw new Error(`Unexpected GET path in preview stub: ${path}`);
+    },
+    async post() {
+      throw new Error('previewOnly=true must not call the create API');
+    }
+  };
+}
+
 async function assertCreateSucceedsWithoutEnglishName() {
   const result = await productCreate(
     createSuccessBackendStub((body) => {
@@ -486,6 +520,282 @@ async function assertCreateSucceedsWithoutEnglishName() {
 
   assert(result.ok === true, 'productCreate should succeed without english name');
   assert(result.id === '999001', 'productCreate should return stubbed id');
+  assert(result.submissionPreview?.counts?.medias === 1, 'productCreate should return a final submission media count');
+  assert(result.fieldCoverage?.counts?.recognizedFields > 0, 'productCreate should return field coverage');
+  assert(result.trace?.operation === 'product_create', 'productCreate should return a protocol trace');
+}
+
+async function assertPreviewOnlySkipsCreate() {
+  const result = await productCreate(
+    createPreviewBackendStub(),
+    createMinimalDtoInput({ confirm: undefined, previewOnly: true }),
+    'smoke-preview-only'
+  );
+
+  assert(result.ok === true, 'previewOnly should return ok');
+  assert(result.previewOnly === true, 'previewOnly flag was not returned');
+  assert(result.submissionPreview?.product?.productNameCn === 'Smoke Test Product', 'preview should include business product summary');
+  assert(result.submissionPreview?.counts?.medias === 1, 'preview should include normalized media counts');
+  assert(result.note?.includes('no ERP create API call'), 'preview should state that no create call was made');
+}
+
+function createWorkflowBackendStub(options = {}) {
+  let createPostCount = 0;
+  return {
+    get createPostCount() {
+      return createPostCount;
+    },
+    async get(requestPath) {
+      if (requestPath === '/user/erp/productCategory/tree') {
+        return [
+          {
+            id: 'cat-1',
+            status: '0',
+            categoryName: 'Construction Machinery',
+            children: [{ id: 'cat-11', status: '0', categoryName: 'Excavator Parts', children: [] }]
+          }
+        ];
+      }
+      if (requestPath === '/user/erp/productCategory/configList') {
+        return {
+          unitList: [{ id: 'unit-piece', unitName: 'piece', status: 0 }],
+          baseList: [],
+          fieldList: [],
+          optionalList: []
+        };
+      }
+      if (requestPath === '/user/erp/supplier/classification/tree') {
+        return [
+          {
+            id: 'supplier-class',
+            classificationName: 'Smoke',
+            status: 0,
+            supplierList: [{ id: 'supplier-88', name: 'Smoke Supplier' }]
+          }
+        ];
+      }
+      if (requestPath.startsWith('/user/regionalOrganizations/continents')) {
+        return [];
+      }
+      if (requestPath.startsWith('/user/erp/commodity/')) {
+        return [];
+      }
+      throw new Error(`Unexpected workflow GET path: ${requestPath}`);
+    },
+    async post(requestPath, body) {
+      if (requestPath === '/user/erp/commodity/list') {
+        assert(body.keyword === 'WorkflowUniqueProduct', 'workflow duplicate keyword was not normalized');
+        return { rows: [], total: 0 };
+      }
+      if (requestPath === '/user/erp/commodity') {
+        createPostCount += 1;
+        if (options.allowCreate) {
+          return { id: 'workflow-product-1', productId: 'workflow-product-1', ok: true };
+        }
+        throw new Error('workflow upload failure test must not call create');
+      }
+      throw new Error(`Unexpected workflow POST path: ${requestPath}`);
+    }
+  };
+}
+
+async function createWorkflowPackage() {
+  const dir = await mkdtemp(path.join(tmpdir(), 'product-mcp-workflow-'));
+  await mkdir(path.join(dir, 'images'), { recursive: true });
+  const onePixelPng = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
+    'base64'
+  );
+  await writeFile(path.join(dir, 'images', 'main.png'), onePixelPng);
+  await writeFile(path.join(dir, 'images', 'detail.png'), onePixelPng);
+  await writeFile(
+    path.join(dir, '商品资料.md'),
+    `# 商品资料
+
+## 1. 基础信息
+
+### 1.1 商品身份
+
+| 字段 | 填写值 | 填写说明 |
+|---|---|---|
+| 商品中文名称 | Workflow Unique Product | 必填 |
+| 产品类型 | 服务 | 整机 / 配件 / 服务 |
+| 上架状态 | 上架 | 上架 / 下架 / 作废 |
+
+### 1.2 分类、单位、供应商
+
+| 字段 | 填写值 | 填写说明 |
+|---|---|---|
+| 一级分类 | Construction Machinery | 必填 |
+| 二级分类 | Excavator Parts | 必填 |
+| 计量单位 | piece | 必填 |
+| 供应商 | Smoke Supplier | 必填 |
+
+### 1.3 地域信息
+
+| 字段 | 填写值 | 填写说明 |
+|---|---|---|
+| 适用范围 | 全球 | 必填 |
+
+### 1.4 服务属性与样品设置
+
+| 字段 | 填写值 | 填写说明 |
+|---|---|---|
+| 是否支持拼柜 | 否 | 是 / 否 |
+| 是否可做展品 | 否 | 是 / 否 |
+| 是否需要安装 | 否 | 是 / 否 |
+| 是否有售后门槛 | 否 | 是 / 否 |
+| 是否支持样品 | 否 | 是 / 否 |
+
+## 4. 库存与物流
+
+### 4.2 交付、库存、售后
+
+| 字段 | 填写值 | 填写说明 |
+|---|---|---|
+| 是否支持配件单买 | 否 | 是 / 否 |
+| 是否支持 OEM | 否 | 是 / 否 |
+| 是否支持 ODM | 否 | 是 / 否 |
+| 是否支持小批量试单 | 否 | 是 / 否 |
+| 是否现货备货 | 否 | 是 / 否 |
+| 是否海外仓备货 | 否 | 是 / 否 |
+
+## 6. 图文信息
+
+### 6.1 商品图片
+
+| 图片用途 | 文件路径 | 数量/比例说明 | 标题 | 副标题 | 描述 | 语言 | 语言代码 | 原图文ID | 备注 |
+|---|---|---|---|---|---|---|---|---|---|
+| 商品主图 | ./images/main.png | 1:1 | 主图 |  |  |  |  |  |  |
+| 细节图 | ./images/detail.png | 1:1 | 细节 |  |  |  |  |  |  |
+`,
+    'utf8'
+  );
+  return dir;
+}
+
+async function assertCreateFromPackageWorkflow() {
+  const packageDir = await createWorkflowPackage();
+  const tracePaths = [];
+  try {
+    const previewBackend = createWorkflowBackendStub();
+    let previewUploadCalled = false;
+    const previewResult = await productCreateFromPackage(
+      previewBackend,
+      {
+        packagePath: packageDir,
+        runMode: 'preview',
+        clientRequestId: `smoke-preview-${Date.now()}`,
+        responseMode: 'standard'
+      },
+      'smoke-create-from-package-preview',
+      {
+        async uploadLocalFile() {
+          previewUploadCalled = true;
+          throw new Error('preview mode must not upload');
+        }
+      }
+    );
+    assert(previewResult.ok === true, 'create_from_package preview should pass');
+    assert(previewResult.previewOnly === true, 'create_from_package preview flag missing');
+    assert(previewUploadCalled === false, 'preview mode called upload');
+    assert(previewBackend.createPostCount === 0, 'preview mode called create');
+    assert(previewResult.referenceResolution?.ok === true, 'preview should resolve references');
+    if (previewResult.tracePath) tracePaths.push(previewResult.tracePath);
+
+    const createBackend = createWorkflowBackendStub();
+    const attempts = new Map();
+    const createResult = await productCreateFromPackage(
+      createBackend,
+      {
+        packagePath: packageDir,
+        runMode: 'create',
+        confirm: true,
+        clientRequestId: `smoke-create-${Date.now()}`,
+        responseMode: 'standard'
+      },
+      'smoke-create-from-package-create',
+      {
+        async uploadLocalFile(input) {
+          const key = input.sourceRelativePath || input.localPath;
+          const count = (attempts.get(key) || 0) + 1;
+          attempts.set(key, count);
+          if (String(key).includes('detail.png')) {
+            throw new Error(`forced upload failure ${count}`);
+          }
+          return {
+            ok: true,
+            url: `https://oss.example.test/${path.basename(input.localPath)}`,
+            objectKey: `smoke/${path.basename(input.localPath)}`
+          };
+        }
+      }
+    );
+    assert(createResult.ok === false, 'upload failure workflow should be blocked');
+    assert(createResult.code === 'UPLOAD_FAILED', 'upload failure code was not returned');
+    assert(createResult.uploadSummary?.total === 2, 'all valid uploadQueue items should be attempted');
+    assert(createResult.uploadSummary?.successCount === 1, 'successful uploads should be counted');
+    assert(createResult.uploadSummary?.errorCount === 1, 'failed uploads should be counted');
+    assert([...attempts.entries()].some(([key, count]) => String(key).includes('detail.png') && count === 2), 'failed upload should retry once');
+    assert([...attempts.entries()].some(([key, count]) => String(key).includes('main.png') && count === 1), 'successful upload should run once');
+    assert(createBackend.createPostCount === 0, 'workflow must not create after upload errors');
+    if (createResult.tracePath) tracePaths.push(createResult.tracePath);
+
+    const successBackend = createWorkflowBackendStub({ allowCreate: true });
+    const successClientRequestId = `smoke-success-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const successUploads = [];
+    const successResult = await productCreateFromPackage(
+      successBackend,
+      {
+        packagePath: packageDir,
+        runMode: 'create',
+        confirm: true,
+        clientRequestId: successClientRequestId,
+        responseMode: 'standard'
+      },
+      'smoke-create-from-package-success',
+      {
+        async uploadLocalFile(input) {
+          successUploads.push(input.sourceRelativePath || input.localPath);
+          return {
+            ok: true,
+            url: `https://oss.example.test/${path.basename(input.localPath)}`,
+            objectKey: `smoke/${path.basename(input.localPath)}`
+          };
+        }
+      }
+    );
+    assert(successResult.ok === true, 'successful workflow create should pass');
+    assert(successResult.productId === 'workflow-product-1', 'successful workflow should return productId');
+    assert(successResult.uploadSummary?.successCount === 2, 'successful workflow should upload every valid item');
+    assert(successUploads.length === 2, 'successful workflow should invoke upload for every valid item');
+    assert(successBackend.createPostCount === 1, 'successful workflow should call create once');
+    assert(successResult.diffReport, 'successful workflow should return a detail diff report');
+    if (successResult.tracePath) tracePaths.push(successResult.tracePath);
+
+    const replayResult = await productCreateFromPackage(
+      successBackend,
+      {
+        packagePath: packageDir,
+        runMode: 'create',
+        confirm: true,
+        clientRequestId: successClientRequestId,
+        responseMode: 'standard'
+      },
+      'smoke-create-from-package-replay',
+      {
+        async uploadLocalFile() {
+          throw new Error('idempotent replay must not upload');
+        }
+      }
+    );
+    assert(replayResult.ok === true && replayResult.reused === true, 'idempotent replay should return existing product');
+    assert(successBackend.createPostCount === 1, 'idempotent replay must not call create again');
+    if (replayResult.tracePath) tracePaths.push(replayResult.tracePath);
+  } finally {
+    await rm(packageDir, { recursive: true, force: true });
+    await Promise.all(tracePaths.map((tracePath) => rm(tracePath, { force: true })));
+  }
 }
 
 async function assertTokenDaemonClientAndBridge() {
@@ -564,6 +874,8 @@ async function main() {
   assertChromePageParsing();
   await assertTokenDaemonClientAndBridge();
   await assertCreateSucceedsWithoutEnglishName();
+  await assertPreviewOnlySkipsCreate();
+  await assertCreateFromPackageWorkflow();
 
   const modelAliasResult = await productCreate(
     createSuccessBackendStub((body) => {
@@ -577,6 +889,15 @@ async function main() {
   await assertCreateValidationFailure(
     createMinimalDtoInput({ productModel: '中文-Model' }),
     'PRODUCT_MODEL_FORMAT_INVALID'
+  );
+
+  await assertCreateValidationFailure(
+    createMinimalDtoInput({ confirm: undefined }),
+    'CONFIRM_REQUIRED'
+  );
+  await assertCreateValidationFailure(
+    createMinimalDtoInput({ id: 'old-product-id' }),
+    'CREATE_MODE_ID_FORBIDDEN'
   );
 
   await assertCreateSchemaFailure(
