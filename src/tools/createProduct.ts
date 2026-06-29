@@ -576,15 +576,11 @@ function stripCreateIds(rows: Array<Record<string, unknown>> | undefined): Array
   return rows.map((row) => stripCreateId(row));
 }
 
-function normalizePartLists(input: ProductCreateInput, categoryConfig?: CategoryConfigResponse): Array<Record<string, unknown>> | undefined {
+function normalizePartLists(input: ProductCreateInput): Array<Record<string, unknown>> | undefined {
   if (!input.partLists?.length) return undefined;
-  return input.partLists.map((row, index) => {
+  return input.partLists.map((row) => {
     const normalized = stripCreateId(row);
-    if (!isPresent(normalized.unitId) && isPresent(normalized.unitName)) {
-      const unit = findCategoryConfigItem(categoryConfig?.unitList, normalized, [], ['unitName'], `partLists[${index}].unitId`);
-      if (unit?.id !== undefined && unit.id !== null) normalized.unitId = toStringId(unit.id);
-      if (!normalized.unitName) normalized.unitName = itemLabel(unit || {});
-    }
+    delete normalized.unitId;
     return normalized;
   });
 }
@@ -835,7 +831,7 @@ function buildRequestBody(input: ProductCreateInput, categoryConfig?: CategoryCo
     baseConfigs: normalizeBaseConfigs(input, categoryConfig),
     technicalParams: normalizeTechnicalParams(input, categoryConfig),
     optionalConfigs: normalizeOptionalConfigs(input, categoryConfig),
-    partLists: normalizePartLists(input, categoryConfig),
+    partLists: normalizePartLists(input),
     medias: normalizeMedias(input),
     certifications: stripCreateIds(input.certifications),
     salesSupports: stripCreateIds(input.salesSupports),
@@ -880,8 +876,7 @@ export async function productCreate(backend: BackendClient, rawInput: unknown, r
   ];
   throwValidationIssues('商品创建参数未通过前端硬拦截校验。', validationIssues);
   await validateCategorySelection(backend, input);
-  const needsUnitLookup = (!isPresent(input.unitId) && isPresent(input.unitName)) ||
-    Boolean(input.partLists?.some((row) => !isPresent(row.unitId) && isPresent(row.unitName)));
+  const needsUnitLookup = !isPresent(input.unitId) && isPresent(input.unitName);
   const needsCategoryConfig = Boolean(
     needsUnitLookup || input.baseConfigs?.length || input.technicalParams?.length || input.optionalConfigs?.length
   );

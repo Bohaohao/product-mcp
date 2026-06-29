@@ -525,6 +525,34 @@ async function assertCreateSucceedsWithoutEnglishName() {
   assert(result.trace?.operation === 'product_create', 'productCreate should return a protocol trace');
 }
 
+async function assertPartListUnitStaysString() {
+  const result = await productCreate(
+    createSuccessBackendStub((body) => {
+      const part = body.partLists?.[0];
+      assert(part?.unitName === 'piece', 'partLists[].unitName should be forwarded as plain text');
+      assert(!Object.prototype.hasOwnProperty.call(part, 'unitId'), 'partLists[].unitId must not be submitted during create');
+    }),
+    createMinimalDtoInput({
+      partLists: [
+        {
+          id: 'edit-only-part-id',
+          partType: 1,
+          partName: 'Filter Kit',
+          specAttr: 'FK 100',
+          costPrice: 1,
+          suggestedPrice: 2,
+          suggestedStock: 3,
+          unitName: 'piece',
+          unitId: 'should-be-stripped'
+        }
+      ]
+    }),
+    'smoke-part-unit-string'
+  );
+
+  assert(result.ok === true, 'productCreate should accept part unit as a string-only field');
+}
+
 async function assertPreviewOnlySkipsCreate() {
   const result = await productCreate(
     createPreviewBackendStub(),
@@ -874,6 +902,7 @@ async function main() {
   assertChromePageParsing();
   await assertTokenDaemonClientAndBridge();
   await assertCreateSucceedsWithoutEnglishName();
+  await assertPartListUnitStaysString();
   await assertPreviewOnlySkipsCreate();
   await assertCreateFromPackageWorkflow();
 

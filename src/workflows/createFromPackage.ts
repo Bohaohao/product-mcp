@@ -314,7 +314,6 @@ function resolveConfigRows(draft: UnknownRecord, categoryConfig: UnknownRecord |
   const baseList = Array.isArray(categoryConfig?.baseConfigs) ? (categoryConfig.baseConfigs as UnknownRecord[]) : [];
   const fieldList = Array.isArray(categoryConfig?.technicalParams) ? (categoryConfig.technicalParams as UnknownRecord[]) : [];
   const optionalList = Array.isArray(categoryConfig?.optionalConfigs) ? (categoryConfig.optionalConfigs as UnknownRecord[]) : [];
-  const units = Array.isArray(categoryConfig?.units) ? (categoryConfig.units as UnknownRecord[]) : [];
 
   for (const row of Array.isArray(draft.baseConfigs) ? (draft.baseConfigs as UnknownRecord[]) : []) {
     if (hasValue(row.categoryBaseId)) continue;
@@ -368,13 +367,6 @@ function resolveConfigRows(draft: UnknownRecord, categoryConfig: UnknownRecord |
       if (matches.length === 1 && hasValue(matches[0].id)) row.categoryOptionalConfigId = String(matches[0].id);
       else issues.push(issue(matches.length ? 'OPTIONAL_VALUE_AMBIGUOUS' : 'OPTIONAL_VALUE_NOT_FOUND', `可选配置值 ${row.configValue} 无法唯一解析。`, 'optionalConfigs[].configValue', '可选配置', matches));
     }
-  }
-
-  for (const row of Array.isArray(draft.partLists) ? (draft.partLists as UnknownRecord[]) : []) {
-    if (hasValue(row.unitId) || !hasValue(row.unitName)) continue;
-    const matches = exactMatches(units, row.unitName, ['name', 'unitName']);
-    if (matches.length === 1 && hasValue(matches[0].id)) row.unitId = String(matches[0].id);
-    else issues.push(issue(matches.length ? 'PART_UNIT_AMBIGUOUS' : 'PART_UNIT_NOT_FOUND', `配件单位 ${row.unitName} 无法唯一解析。`, 'partLists[].unitName', '配件清单', matches));
   }
 }
 

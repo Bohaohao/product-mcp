@@ -287,7 +287,7 @@ function validatePartLists(input: UnknownRecord, issues: SubmissionValidationIss
   const rows = Array.isArray(input.partLists) ? (input.partLists as UnknownRecord[]) : [];
   rows.forEach((row, index) => {
     const rowNumber = index + 1;
-    const hasContent = rowHasAnyValue(row, ['partType', 'partName', 'specAttr', 'costPrice', 'suggestedPrice', 'suggestedStock', 'unitId', 'unitName']);
+    const hasContent = rowHasAnyValue(row, ['partType', 'partName', 'specAttr', 'costPrice', 'suggestedPrice', 'suggestedStock', 'unitName']);
     if (!hasContent) return;
 
     if (!hasValue(row.partType)) {
@@ -327,7 +327,7 @@ function validatePartLists(input: UnknownRecord, issues: SubmissionValidationIss
       );
     }
 
-    if (!hasValue(row.unitId) && !hasValue(row.unitName)) {
+    if (!hasValue(row.unitName)) {
       addIssue(issues, 'PART_UNIT_REQUIRED', `配件第 ${rowNumber} 行必须填写单位。`, '配件、备件、易损件', rowNumber, 'partLists');
     }
   });
