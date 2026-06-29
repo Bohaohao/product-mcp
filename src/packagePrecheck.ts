@@ -260,6 +260,7 @@ const salesSupportFileUsageByType: Record<string, UploadUsage> = {
   核心优势: 'advantageImage',
   应用场景: 'scenarioImage',
   售后服务与支持: 'serviceSupportFile',
+  故障处理与质保: 'serviceSupportFile',
   质保政策: 'serviceSupportFile'
 };
 
@@ -361,10 +362,18 @@ function fieldMap(tables: MarkdownTable[], headingIncludes: string): Record<stri
   return result;
 }
 
+function fieldMapAny(tables: MarkdownTable[], headingIncludesList: string[]): Record<string, string> {
+  return Object.assign({}, ...headingIncludesList.map((heading) => fieldMap(tables, heading)));
+}
+
 function tableRows(tables: MarkdownTable[], headingIncludes: string, requiredHeader: string): Array<Record<string, string>> {
   return tablesFor(tables, headingIncludes)
     .filter((table) => table.headers.includes(requiredHeader))
     .flatMap((table) => table.rows);
+}
+
+function tableRowsAny(tables: MarkdownTable[], headingIncludesList: string[], requiredHeader: string): Array<Record<string, string>> {
+  return headingIncludesList.flatMap((heading) => tableRows(tables, heading, requiredHeader));
 }
 
 /**
@@ -377,6 +386,239 @@ function rowsByHeader(tables: MarkdownTable[], requiredHeader: string): Array<Re
   return tables
     .filter((table) => table.headers.includes(requiredHeader))
     .flatMap((table) => table.rows);
+}
+
+function numberText(value: string | undefined): number | undefined {
+  const cleaned = cleanCell(value).replace(/,/g, '');
+  if (!cleaned) return undefined;
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function firstFilled(row: Record<string, string>, keys: string[]): string | undefined {
+  for (const key of keys) {
+    const value = optionalText(row[key]);
+    if (value) return value;
+  }
+  return undefined;
+}
+
+interface SalesSupportEntry {
+  draft: Record<string, unknown>;
+  filePath?: string;
+  fileTitle?: string;
+  fileDescription?: string;
+  usage?: UploadUsage;
+}
+
+function salesSupportEntryHasDraftContent(entry: SalesSupportEntry): boolean {
+  return Object.values(entry.draft).some((value) => value !== undefined && value !== null && value !== '');
+}
+
+function addSalesEntry(entries: SalesSupportEntry[], entry: SalesSupportEntry): void {
+  if (!salesSupportEntryHasDraftContent(entry) && !entry.filePath) return;
+  entries.push(entry);
+}
+
+function collectSalesSupportEntries(tables: MarkdownTable[]): SalesSupportEntry[] {
+  const entries: SalesSupportEntry[] = [];
+
+  // Backward-compatible generic table: 类型 / 标题/问题/异议 / 内容/回答/处理方式.
+  tableRows(tables, '销售支持', '类型').forEach((row) => {
+    const typeText = cleanCell(row['类型']);
+    const type = salesSupportTypeMap[typeText];
+    if (!type) return;
+    addSalesEntry(entries, {
+      draft: {
+        type,
+        title: optionalText(row['标题/问题/异议']),
+        content: optionalText(row['内容/回答/处理方式']),
+        fileContent: optionalText(row['文件描述']),
+        remark: optionalText(row['备注'])
+      },
+      filePath: optionalText(row['文件路径']),
+      fileTitle: optionalText(row['标题/问题/异议']),
+      fileDescription: optionalText(row['文件描述']),
+      usage: salesSupportFileUsageByType[typeText] || 'serviceSupportFile'
+    });
+  });
+
+  const oneLine = fieldMap(tables, '一句话卖点');
+  addSalesEntry(entries, {
+    draft: {
+      type: 1,
+      title: optionalText(oneLine['标题']),
+      content: optionalText(oneLine['一句话卖点'] || oneLine['内容'])
+    }
+  });
+
+  tableRows(tables, '核心优势', '标题').forEach((row) => {
+    addSalesEntry(entries, {
+      draft: {
+        type: 2,
+        title: optionalText(row['标题']),
+        content: optionalText(row['内容'] || row['描述']),
+        sortNo: numberText(row['排序']),
+        remark: optionalText(row['备注'])
+      },
+      filePath: optionalText(row['图片路径'] || row['文件路径']),
+      fileTitle: optionalText(row['标题']),
+      fileDescription: optionalText(row['内容'] || row['描述']),
+      usage: 'advantageImage'
+    });
+  });
+
+  tableRows(tables, '应用场景', '标题').forEach((row) => {
+    addSalesEntry(entries, {
+      draft: {
+        type: 3,
+        title: optionalText(row['标题']),
+        content: optionalText(row['内容'] || row['描述']),
+        sortNo: numberText(row['排序']),
+        remark: optionalText(row['备注'])
+      },
+      filePath: optionalText(row['图片路径'] || row['文件路径']),
+      fileTitle: optionalText(row['标题']),
+      fileDescription: optionalText(row['内容'] || row['描述']),
+      usage: 'scenarioImage'
+    });
+  });
+
+  tableRows(tables, '常见问题', '问题').forEach((row) => {
+    addSalesEntry(entries, {
+      draft: {
+        type: 4,
+        title: optionalText(row['问题']),
+        content: optionalText(row['回答']),
+        sortNo: numberText(row['排序']),
+        remark: optionalText(row['备注'])
+      }
+    });
+  });
+
+  tableRows(tables, '异议处理', '异议').forEach((row) => {
+    addSalesEntry(entries, {
+      draft: {
+        type: 5,
+        title: optionalText(row['异议']),
+        content: optionalText(row['处理方式']),
+        sortNo: numberText(row['排序']),
+        remark: optionalText(row['备注'])
+      }
+    });
+  });
+
+  tableRows(tables, '合规红线', '不可承诺事项').forEach((row) => {
+    addSalesEntry(entries, {
+      draft: {
+        type: 6,
+        title: optionalText(row['不可承诺事项']),
+        content: optionalText(row['说明']),
+        sortNo: numberText(row['排序']),
+        remark: optionalText(row['备注'])
+      }
+    });
+  });
+
+  tableRows(tables, '售后服务承诺', '承诺事项').forEach((row) => {
+    addSalesEntry(entries, {
+      draft: {
+        type: 7,
+        title: optionalText(row['承诺事项']),
+        content: optionalText(row['说明']),
+        sortNo: numberText(row['排序']),
+        remark: optionalText(row['备注'])
+      }
+    });
+  });
+
+  const serviceSupport = fieldMap(tables, '故障处理与质保');
+  const serviceContent = optionalText(serviceSupport['服务支持说明']);
+  const serviceFilePath = optionalText(serviceSupport['故障处理与质保附件']);
+  const serviceFileDescription = optionalText(serviceSupport['附件说明'] || serviceSupport['服务支持说明']);
+  if (serviceContent || serviceFilePath || serviceFileDescription) {
+    addSalesEntry(entries, {
+      draft: {
+        type: 8,
+        title: '故障处理与质保',
+        content: serviceContent,
+        fileContent: optionalText(serviceSupport['附件说明'])
+      },
+      filePath: serviceFilePath,
+      fileTitle: '故障处理与质保',
+      fileDescription: serviceFileDescription,
+      usage: 'serviceSupportFile'
+    });
+  }
+
+  tableRows(tables, '质保政策', '政策标题').forEach((row) => {
+    addSalesEntry(entries, {
+      draft: {
+        type: 9,
+        title: optionalText(row['政策标题']),
+        content: optionalText(row['政策内容']),
+        sortNo: numberText(row['排序']),
+        remark: optionalText(row['备注'])
+      }
+    });
+  });
+
+  const techSupport = fieldMap(tables, '技术支持联系方式');
+  const techSupportRow: Record<string, unknown> = {
+    type: 10,
+    title: '技术支持与联系方式',
+    techSupportContact: optionalText(techSupport['技术支持联系人']),
+    techSupportPhone: optionalText(techSupport['联系电话']),
+    techSupportEmail: optionalText(techSupport['电子邮箱']),
+    techSupportHours: optionalText(techSupport['服务时间']),
+    techSupportAlternative: optionalText(techSupport['备用联系方式'])
+  };
+  const hasTechSupportContent = ['techSupportContact', 'techSupportPhone', 'techSupportEmail', 'techSupportHours', 'techSupportAlternative'].some(
+    (field) => Boolean(techSupportRow[field])
+  );
+  if (hasTechSupportContent) addSalesEntry(entries, { draft: techSupportRow });
+
+  return entries;
+}
+
+const splitPartSections: Array<{ heading: string; typeLabel: string; typeValue: number }> = [
+  { heading: '配件清单', typeLabel: '配件', typeValue: 1 },
+  { heading: '备件清单', typeLabel: '备件', typeValue: 2 },
+  { heading: '易损件清单', typeLabel: '易损件', typeValue: 3 }
+];
+
+function collectPartListRows(tables: MarkdownTable[], issues: PrecheckIssue[]): Array<Record<string, unknown>> {
+  const rows: Array<Record<string, unknown>> = [];
+
+  tableRows(tables, '配件、备件、易损件', '类型').forEach((row) => {
+    rows.push({
+      partType: mappedValue(issues, row['类型'], partTypeMap, '配件类型', '配件、备件、易损件'),
+      partName: optionalText(row['名称']),
+      specAttr: optionalText(row['规格属性']),
+      costPrice: numberValue(issues, row['成本价'], '配件成本价', '配件、备件、易损件'),
+      suggestedPrice: numberValue(issues, row['建议售价'], '配件建议售价', '配件、备件、易损件'),
+      suggestedStock: numberValue(issues, row['建议库存'], '建议库存', '配件、备件、易损件'),
+      unitName: optionalText(row['单位']),
+      remark: optionalText(row['备注'])
+    });
+  });
+
+  for (const section of splitPartSections) {
+    tableRows(tables, section.heading, '名称').forEach((row) => {
+      rows.push({
+        partType: section.typeValue,
+        partName: optionalText(row['名称']),
+        specAttr: optionalText(row['规格型号'] || row['规格属性']),
+        costPrice: numberValue(issues, row['成本价'], `${section.heading}.成本价`, section.heading),
+        suggestedPrice: numberValue(issues, row['建议售价'], `${section.heading}.建议售价`, section.heading),
+        suggestedStock: numberValue(issues, row['建议库存'], `${section.heading}.建议库存`, section.heading),
+        unitName: optionalText(row['单位']),
+        remark: optionalText(row['备注'])
+      });
+    });
+  }
+
+  return rows;
 }
 
 function addIssue(issues: PrecheckIssue[], issue: PrecheckIssue): void {
@@ -701,6 +943,29 @@ function collectFileReferences(
     );
   });
 
+  tableRows(tables, '图文详情卡片', '标题').forEach((row, index) => {
+    const relativePath = cleanCell(row['图片路径'] || row['文件路径']);
+    if (!relativePath) return;
+    addFileReference(
+      references,
+      packageDir,
+      '图文详情',
+      references.length + 1,
+      'graphicDetailImage',
+      '图文详情图片',
+      relativePath,
+      row['标题'],
+      firstFilled(row, ['正文', '描述']),
+      undefined,
+      undefined,
+      {
+        rowKey: `media-detail-card-${index + 1}`,
+        mediaSubtitle: row['副标题'],
+        mediaRemark: row['备注']
+      }
+    );
+  });
+
   tableRows(tables, '认证资料', '证书名称').forEach((row, index) => {
     const certRowKey = `cert-${index + 1}`;
     const filePath = cleanCell(row['文件路径']);
@@ -739,21 +1004,19 @@ function collectFileReferences(
     }
   });
 
-  tableRows(tables, '销售支持', '类型').forEach((row, index) => {
-    const relativePath = cleanCell(row['文件路径']);
+  collectSalesSupportEntries(tables).forEach((entry, index) => {
+    const relativePath = cleanCell(entry.filePath);
     if (!relativePath) return;
-    const type = cleanCell(row['类型']);
-    const usage = salesSupportFileUsageByType[type] || 'serviceSupportFile';
     addFileReference(
       references,
       packageDir,
       '销售支持',
       references.length + 1,
-      usage,
-      `${type}文件`,
+      entry.usage || 'serviceSupportFile',
+      `${String(entry.draft.title || '销售支持')}文件`,
       relativePath,
-      row['标题/问题/异议'],
-      row['文件描述'],
+      String(entry.fileTitle || entry.draft.title || ''),
+      entry.fileDescription,
       undefined,
       undefined,
       { rowKey: `sales-${index + 1}` }
@@ -819,6 +1082,48 @@ function collectFileReferences(
       );
     }
   });
+
+  let splitPartFileIndex = 0;
+  for (const section of splitPartSections) {
+    tableRows(tables, section.heading, '名称').forEach((row) => {
+      splitPartFileIndex += 1;
+      const partsRowKey = `parts-split-${splitPartFileIndex}`;
+      const imagePath = cleanCell(row['图片路径']);
+      if (imagePath) {
+        addFileReference(
+          references,
+          packageDir,
+          section.heading,
+          references.length + 1,
+          'partsImage',
+          `${section.typeLabel}图片`,
+          imagePath,
+          row['名称'],
+          row['备注'],
+          undefined,
+          undefined,
+          { rowKey: `${partsRowKey}-img`, partTypeLabel: section.typeLabel }
+        );
+      }
+      const attachmentPath = cleanCell(row['附件路径']);
+      if (attachmentPath) {
+        addFileReference(
+          references,
+          packageDir,
+          section.heading,
+          references.length + 1,
+          'partsAttachment',
+          `${section.typeLabel}附件`,
+          attachmentPath,
+          row['名称'],
+          row['备注'],
+          undefined,
+          undefined,
+          { rowKey: `${partsRowKey}-att`, partTypeLabel: section.typeLabel }
+        );
+      }
+    });
+  }
 
   tableRows(tables, '配件文件明细', '文件类型').forEach((row, index) => {
     const relativePath = cleanCell(row['文件路径']);
@@ -1015,6 +1320,7 @@ function validateCertificationTables(tables: MarkdownTable[], issues: PrecheckIs
       }
     }
   });
+
 }
 
 function validateSalesSupportTables(tables: MarkdownTable[], issues: PrecheckIssue[]): void {
@@ -1052,6 +1358,40 @@ function validateSalesSupportTables(tables: MarkdownTable[], issues: PrecheckIss
       }
     }
   });
+
+  const validateTitleContentRows = (
+    heading: string,
+    firstHeader: string,
+    titleField: string,
+    contentField: string,
+    imageField?: string
+  ) => {
+    tableRows(tables, heading, firstHeader).forEach((row, index) => {
+      const rowNumber = index + 1;
+      const title = cleanCell(row[titleField]);
+      const content = cleanCell(row[contentField]);
+      const imagePath = imageField ? cleanCell(row[imageField]) : '';
+      const hasContent = Boolean(title || content || imagePath || cleanCell(row['排序']) || cleanCell(row['备注']));
+      if (!hasContent) return;
+      if (!(title && content)) {
+        addIssue(issues, {
+          severity: 'error',
+          code: 'SALES_STRUCTURED_ROW_INCOMPLETE',
+          section: heading,
+          row: rowNumber,
+          message: `${heading}第 ${rowNumber} 行必须同时填写${titleField}和${contentField}。`
+        });
+      }
+    });
+  };
+
+  validateTitleContentRows('核心优势', '标题', '标题', '内容', '图片路径');
+  validateTitleContentRows('应用场景', '标题', '标题', '内容', '图片路径');
+  validateTitleContentRows('常见问题', '问题', '问题', '回答');
+  validateTitleContentRows('异议处理', '异议', '异议', '处理方式');
+  validateTitleContentRows('合规红线', '不可承诺事项', '不可承诺事项', '说明');
+  validateTitleContentRows('售后服务承诺', '承诺事项', '承诺事项', '说明');
+  validateTitleContentRows('质保政策', '政策标题', '政策标题', '政策内容');
 }
 
 function validateCustomerCaseTables(tables: MarkdownTable[], issues: PrecheckIssue[]): void {
@@ -1259,12 +1599,12 @@ function validateDraftAgainstCategoryConfig(
 }
 
 function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckIssue[]): Record<string, unknown> {
-  const basic = fieldMap(tables, '基础信息');
+  const basic = fieldMapAny(tables, ['基础信息', '商品身份']);
   const refs = fieldMap(tables, '分类、单位、供应商');
-  const region = fieldMap(tables, '适用区域');
-  const sales = fieldMap(tables, '销售、交付、售后');
-  const price = fieldMap(tables, '价格信息');
-  const packageInfo = fieldMap(tables, '包装与物流');
+  const region = fieldMapAny(tables, ['适用区域', '地域信息']);
+  const sales = fieldMapAny(tables, ['销售、交付、售后', '服务属性与样品设置', '交付、库存、售后']);
+  const price = fieldMapAny(tables, ['价格信息', '价格字段']);
+  const packageInfo = fieldMapAny(tables, ['包装与物流', '包装配置']);
   const related = fieldMap(tables, '关联商品');
 
   const draft: Record<string, unknown> = {
@@ -1282,7 +1622,7 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
     level: optionalText(basic['产品等级']),
     brand: optionalText(basic['品牌']),
     productModel: optionalText(basic['产品型号']),
-    hsCode: optionalText(basic['HS 编码']),
+    hsCode: optionalText(basic['建议HS编码'] || basic['HS 编码']),
     usagePurpose: optionalText(basic['产品用途']),
     relatedCommodityId: optionalText(related['关联商品ID']),
     remark: optionalText(basic['商品备注']),
@@ -1363,7 +1703,7 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
     }))
   );
   draft.regions = compactRows(
-    tableRows(tables, '适用区域', '区域名称').map((row) => ({
+    tableRowsAny(tables, ['适用区域', '地域信息'], '区域名称').map((row) => ({
       regionName: optionalText(row['区域名称']),
       regionId: optionalText(row['区域ID']),
       isAll: mappedValue(issues, row['是否全球'], yesNoMap, '适用区域.是否全球', '适用区域'),
@@ -1374,7 +1714,7 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
     }))
   );
   draft.priceTiers = compactRows(
-    tableRows(tables, '价格信息', '最小数量').map((row) => ({
+    tableRowsAny(tables, ['价格信息', '价格阶梯'], '最小数量').map((row) => ({
       minPriceQuantity: numberValue(issues, row['最小数量'], '价格阶梯.最小数量', '价格信息'),
       maxPriceQuantity: numberValue(issues, row['最大数量'], '价格阶梯.最大数量', '价格信息'),
       unitPrice: numberValue(issues, row['单价'], '价格阶梯.单价', '价格信息'),
@@ -1385,13 +1725,16 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
   );
   draft.baseConfigs = compactRows(
     tableRows(tables, '基础配置', '配置项名称').map((row) => ({
+      categoryBaseId: optionalText(row['配置项ID'] || row['ID']),
       name: optionalText(row['配置项名称']),
       configValue: optionalText(row['配置值']),
+      source: numberValue(issues, row['来源'], '基础配置.来源', '基础配置'),
       remark: optionalText(row['备注'])
     }))
   );
   draft.technicalParams = compactRows(
     tableRows(tables, '技术参数', '参数名称').map((row) => ({
+      categoryBaseId: optionalText(row['参数ID'] || row['ID']),
       name: optionalText(row['参数名称']),
       paramValue: optionalText(row['参数值']),
       remark: optionalText(row['备注'])
@@ -1399,7 +1742,9 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
   );
   draft.optionalConfigs = compactRows(
     tableRows(tables, '可选配置', '配置名称').map((row) => ({
+      categoryOptionalId: optionalText(row['配置ID'] || row['配置项ID']),
       name: optionalText(row['配置名称']),
+      categoryOptionalConfigId: optionalText(row['选项ID']),
       configValue: optionalText(row['选项值']),
       priceDiffCny: numberValue(issues, row['人民币差价'], '可选配置.人民币差价', '可选配置'),
       priceDiffUsd: numberValue(issues, row['美元差价'], '可选配置.美元差价', '可选配置'),
@@ -1407,49 +1752,15 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
       remark: optionalText(row['备注'])
     }))
   );
-  draft.partLists = compactRows(
-    tableRows(tables, '配件、备件、易损件', '类型').map((row) => ({
-      partType: mappedValue(issues, row['类型'], partTypeMap, '配件类型', '配件、备件、易损件'),
-      partName: optionalText(row['名称']),
-      specAttr: optionalText(row['规格属性']),
-      costPrice: numberValue(issues, row['成本价'], '配件成本价', '配件、备件、易损件'),
-      suggestedPrice: numberValue(issues, row['建议售价'], '配件建议售价', '配件、备件、易损件'),
-      suggestedStock: numberValue(issues, row['建议库存'], '建议库存', '配件、备件、易损件'),
-      unitName: optionalText(row['单位']),
-      remark: optionalText(row['备注'])
-    }))
-  );
-  draft.salesSupports = compactRows(
-    tableRows(tables, '销售支持', '类型').map((row) => ({
-      type: mappedValue(issues, row['类型'], salesSupportTypeMap, '销售支持类型', '销售支持'),
-      title: optionalText(row['标题/问题/异议']),
-      content: optionalText(row['内容/回答/处理方式']),
-      fileContent: optionalText(row['文件描述']),
-      remark: optionalText(row['备注'])
-    }))
-  );
-  const techSupport = fieldMap(tables, '销售支持');
-  const techSupportRow: Record<string, unknown> = {
-    type: 10,
-    title: '技术支持与联系方式',
-    techSupportContact: optionalText(techSupport['技术支持联系人']),
-    techSupportPhone: optionalText(techSupport['联系电话']),
-    techSupportEmail: optionalText(techSupport['电子邮箱']),
-    techSupportHours: optionalText(techSupport['服务时间']),
-    techSupportAlternative: optionalText(techSupport['备用联系方式'])
-  };
-  const hasTechSupportContent = ['techSupportContact', 'techSupportPhone', 'techSupportEmail', 'techSupportHours', 'techSupportAlternative'].some(
-    (field) => Boolean(techSupportRow[field])
-  );
-  if (hasTechSupportContent && Array.isArray(draft.salesSupports)) {
-    const salesSupports = draft.salesSupports as Array<Record<string, unknown>>;
-    if (!salesSupports.some((row) => row.type === 10)) salesSupports.push(techSupportRow);
-  }
+  draft.partLists = compactRows(collectPartListRows(tables, issues));
+  draft.salesSupports = compactRows(collectSalesSupportEntries(tables).map((entry) => entry.draft));
   draft.competitors = compactRows(
     tableRows(tables, '竞品对比', '对比维度').map((row) => ({
       dimensionName: optionalText(row['对比维度']),
       ourProductValue: optionalText(row['我方产品值']),
-      competitorValue: optionalText(row['竞品值']),
+      competitorValue: optionalText(
+        row['竞品名称'] && row['竞品值'] ? `${cleanCell(row['竞品名称'])}：${cleanCell(row['竞品值'])}` : row['竞品值']
+      ),
       remark: optionalText(row['备注'])
     }))
   );
@@ -1496,7 +1807,7 @@ function unresolvedReferences(draft: Record<string, unknown>) {
 }
 
 const MEDIA_SECTIONS = new Set(['商品图片', '商品视频、3D 与附件', '图文详情']);
-const PART_MEDIA_SECTIONS = new Set(['配件、备件、易损件', '配件文件明细']);
+const PART_MEDIA_SECTIONS = new Set(['配件、备件、易损件', '配件清单', '备件清单', '易损件清单', '配件文件明细']);
 const partImageCategoryMap: Record<string, number> = {
   配件: 9,
   备件: 10,
@@ -1686,6 +1997,8 @@ function attachDraftMediaAndBindings(
     if (applicationScene) entry.applicationScene = applicationScene;
     const caseHighlight = optionalText(row['案例亮点']);
     if (caseHighlight) entry.caseHighlight = caseHighlight;
+    const sortNo = numberText(row['排序']);
+    if (sortNo !== undefined) entry.sortNo = sortNo;
     const remark = optionalText(row['备注']);
     if (remark) entry.remark = remark;
 
