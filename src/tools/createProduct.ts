@@ -121,7 +121,7 @@ export const productCreateInputSchema = {
   categoryFirstId: optionalIdSchema.describe('Required first-level category id. Kept schema-optional so product_create can return a grouped MCP validation issue.'),
   categorySecondId: optionalIdSchema,
   categoryThirdId: optionalIdSchema,
-  unitId: idSchema,
+  unitId: optionalIdSchema.describe('Required unit id. If omitted, product_create can resolve it from unitName and selected category config.'),
   unitName: z.string().trim().optional(),
 
   supplierId: optionalIdSchema,
@@ -233,6 +233,7 @@ interface CategoryOptionalConfigItem {
 }
 
 interface CategoryConfigResponse {
+  unitList?: CategoryConfigItem[];
   baseList?: CategoryConfigItem[];
   fieldList?: CategoryConfigItem[];
   optionalList?: CategoryConfigItem[];
@@ -489,6 +490,13 @@ function normalizeTags(tags: ProductCreateInput['tags']): Array<{ tagName: strin
   return (tags || []).map((tag) => (typeof tag === 'string' ? { tagName: tag } : tag));
 }
 
+function normalizeUnitId(input: ProductCreateInput, categoryConfig?: CategoryConfigResponse): string | number {
+  if (isPresent(input.unitId)) return toRequiredIdValue(input.unitId, 'unitId');
+  const unit = findCategoryConfigItem(categoryConfig?.unitList, input, [], ['unitName'], 'unitId');
+  if (unit?.id !== undefined && unit.id !== null) return toRequiredIdValue(unit.id, 'unitId');
+  throw new ProductMcpError('MCP_INPUT_INVALID', 'unitId is required. Provide unitId or a unitName that exists in the selected category config.');
+}
+
 function normalizeSupplier(input: ProductCreateInput): Array<Record<string, unknown>> {
   if (input.suppliers?.length) {
     return input.suppliers.map((supplier, index) => ({
@@ -544,14 +552,49 @@ function normalizeMedias(input: ProductCreateInput): Array<Record<string, unknow
       media.mediaUrl === mainImage.mediaUrl;
     if (isDuplicateMainImage) continue;
 
+    const { id: _id, ...mediaWithoutId } = media;
     medias.push({
-      ...media,
+      ...mediaWithoutId,
       mediaName: media.mediaName || fileNameFromUrl(media.mediaUrl),
       sort: media.sort ?? medias.length + 1
     });
   }
 
   return medias;
+}
+
+function stripCreateId(row: Record<string, unknown>): Record<string, unknown> {
+  const { id: _id, ...rest } = row;
+  return rest;
+}
+
+function stripCreateIds(rows: Array<Record<string, unknown>> | undefined): Array<Record<string, unknown>> | undefined {
+  if (!rows?.length) return undefined;
+  return rows.map((row) => stripCreateId(row));
+}
+
+function normalizePartLists(input: ProductCreateInput, categoryConfig?: CategoryConfigResponse): Array<Record<string, unknown>> | undefined {
+  if (!input.partLists?.length) return undefined;
+  return input.partLists.map((row, index) => {
+    const normalized = stripCreateId(row);
+    if (!isPresent(normalized.unitId) && isPresent(normalized.unitName)) {
+      const unit = findCategoryConfigItem(categoryConfig?.unitList, normalized, [], ['unitName'], `partLists[${index}].unitId`);
+      if (unit?.id !== undefined && unit.id !== null) normalized.unitId = toStringId(unit.id);
+      if (!normalized.unitName) normalized.unitName = itemLabel(unit || {});
+    }
+    return normalized;
+  });
+}
+
+function normalizeCustomerCases(input: ProductCreateInput): Array<Record<string, unknown>> | undefined {
+  if (!input.customerCases?.length) return undefined;
+  return input.customerCases.map((row) => {
+    const normalized = stripCreateId(row);
+    if (Array.isArray(normalized.medias)) {
+      normalized.medias = (normalized.medias as Array<Record<string, unknown>>).map((media) => stripCreateId(media));
+    }
+    return normalized;
+  });
 }
 
 function addIfPresent(target: Record<string, unknown>, key: string, value: unknown): void {
@@ -725,7 +768,7 @@ function buildRequestBody(input: ProductCreateInput, categoryConfig?: CategoryCo
     productType: input.productType,
     level: input.level,
     status: input.status,
-    unitId: toRequiredIdValue(input.unitId, 'unitId'),
+    unitId: normalizeUnitId(input, categoryConfig),
     unitName: input.unitName,
     productCode: input.productCode,
     hsCode: input.hsCode,
@@ -789,12 +832,12 @@ function buildRequestBody(input: ProductCreateInput, categoryConfig?: CategoryCo
     baseConfigs: normalizeBaseConfigs(input, categoryConfig),
     technicalParams: normalizeTechnicalParams(input, categoryConfig),
     optionalConfigs: normalizeOptionalConfigs(input, categoryConfig),
-    partLists: input.partLists,
+    partLists: normalizePartLists(input, categoryConfig),
     medias: normalizeMedias(input),
-    certifications: input.certifications,
-    salesSupports: input.salesSupports,
+    certifications: stripCreateIds(input.certifications),
+    salesSupports: stripCreateIds(input.salesSupports),
     competitors: input.competitors,
-    customerCases: input.customerCases
+    customerCases: normalizeCustomerCases(input)
   };
 
   mergePackageInfo(body, input.packageInfo);
@@ -824,7 +867,11 @@ export async function productCreate(backend: BackendClient, rawInput: unknown, r
   ];
   throwValidationIssues('商品创建参数未通过前端硬拦截校验。', validationIssues);
   await validateCategorySelection(backend, input);
-  const needsCategoryConfig = Boolean(input.baseConfigs?.length || input.technicalParams?.length || input.optionalConfigs?.length);
+  const needsUnitLookup = (!isPresent(input.unitId) && isPresent(input.unitName)) ||
+    Boolean(input.partLists?.some((row) => !isPresent(row.unitId) && isPresent(row.unitName)));
+  const needsCategoryConfig = Boolean(
+    needsUnitLookup || input.baseConfigs?.length || input.technicalParams?.length || input.optionalConfigs?.length
+  );
   const categoryConfigId = input.categoryThirdId || input.categorySecondId || input.categoryFirstId;
   const categoryConfig = needsCategoryConfig && isPresent(categoryConfigId)
     ? await backend.get<CategoryConfigResponse>('/user/erp/productCategory/configList', {

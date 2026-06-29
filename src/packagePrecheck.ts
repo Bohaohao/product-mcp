@@ -21,6 +21,8 @@ export const productPrecheckPackageInputSchema = {
   includeDraft: z.boolean().default(true).describe('When true, include a draft payload skeleton parsed from 商品资料.md.'),
   categoryConfig: z
     .object({
+      units: z.array(z.record(z.string(), z.any())).optional(),
+      unitList: z.array(z.record(z.string(), z.any())).optional(),
       baseConfigs: z.array(z.record(z.string(), z.any())).optional(),
       technicalParams: z.array(z.record(z.string(), z.any())).optional(),
       optionalConfigs: z.array(z.record(z.string(), z.any())).optional()
@@ -67,6 +69,7 @@ interface FileReference {
   mediaLanguage?: string;
   mediaId?: string;
   mediaRemark?: string;
+  partTypeLabel?: string;
 }
 
 interface CheckedFileReference extends FileReference {
@@ -258,6 +261,22 @@ const salesSupportFileUsageByType: Record<string, UploadUsage> = {
   应用场景: 'scenarioImage',
   售后服务与支持: 'serviceSupportFile',
   质保政策: 'serviceSupportFile'
+};
+
+const certApplyScopeMap: Record<string, number> = {
+  整商品通用: 1,
+  整商品: 1,
+  所有单品通用: 1,
+  '整商品/所有单品通用': 1,
+  特定型号: 2,
+  特定型号单品: 2,
+  '特定型号/单品': 2
+};
+
+const certStatusMap: Record<string, number> = {
+  有效: 1,
+  无效: 2,
+  过期: 3
 };
 
 function cleanCell(value: unknown): string {
@@ -550,6 +569,7 @@ function addFileReference(
     mediaLanguage?: string;
     mediaId?: string;
     mediaRemark?: string;
+    partTypeLabel?: string;
   }
 ): void {
   references.push({
@@ -567,7 +587,8 @@ function addFileReference(
     mediaSubtitle: optionalText(extra?.mediaSubtitle),
     mediaLanguage: optionalText(extra?.mediaLanguage),
     mediaId: optionalText(extra?.mediaId),
-    mediaRemark: optionalText(extra?.mediaRemark)
+    mediaRemark: optionalText(extra?.mediaRemark),
+    partTypeLabel: optionalText(extra?.partTypeLabel)
   });
 }
 
@@ -762,6 +783,7 @@ function collectFileReferences(
 
   tableRows(tables, '配件、备件、易损件', '类型').forEach((row, index) => {
     const partsRowKey = `parts-${index + 1}`;
+    const partTypeLabel = cleanCell(row['类型']);
     const imagePath = cleanCell(row['图片路径']);
     if (imagePath) {
       addFileReference(
@@ -776,7 +798,7 @@ function collectFileReferences(
         row['备注'],
         undefined,
         undefined,
-        { rowKey: `${partsRowKey}-img` }
+        { rowKey: `${partsRowKey}-img`, partTypeLabel }
       );
     }
     const attachmentPath = cleanCell(row['附件路径']);
@@ -793,7 +815,7 @@ function collectFileReferences(
         row['备注'],
         undefined,
         undefined,
-        { rowKey: `${partsRowKey}-att` }
+        { rowKey: `${partsRowKey}-att`, partTypeLabel }
       );
     }
   });
@@ -814,7 +836,7 @@ function collectFileReferences(
       row['备注'],
       undefined,
       undefined,
-      { rowKey: `parts-file-${index + 1}` }
+      { rowKey: `parts-file-${index + 1}`, partTypeLabel: row['类型'] }
     );
   });
 
@@ -1094,6 +1116,20 @@ function configLabel(item: Record<string, unknown> | undefined): string | undefi
   return text || undefined;
 }
 
+function configId(item: Record<string, unknown> | undefined): string | undefined {
+  if (!item) return undefined;
+  const value = item.id;
+  if (value === undefined || value === null) return undefined;
+  const text = String(value).trim();
+  return text || undefined;
+}
+
+function findById(items: Array<Record<string, unknown>> | undefined, id: unknown): Record<string, unknown> | undefined {
+  const normalized = String(id ?? '').trim();
+  if (!normalized) return undefined;
+  return (items || []).find((item) => configId(item) === normalized);
+}
+
 function findByLabel(items: Array<Record<string, unknown>> | undefined, label: unknown): Record<string, unknown> | undefined {
   const normalized = normalizeLookupText(label);
   if (!normalized) return undefined;
@@ -1104,6 +1140,22 @@ function optionItems(config: Record<string, unknown> | undefined): Array<Record<
   return Array.isArray(config?.items) ? (config.items as Array<Record<string, unknown>>) : [];
 }
 
+function assignConfigReference(
+  row: Record<string, unknown>,
+  item: Record<string, unknown> | undefined,
+  idField: string,
+  nameField: string
+): void {
+  const id = configId(item);
+  if (id) row[idField] = id;
+  const label = configLabel(item);
+  if (label && !row[nameField]) row[nameField] = label;
+}
+
+function normalizedUnitList(categoryConfig: CategoryConfigForPrecheck): Array<Record<string, unknown>> | undefined {
+  return categoryConfig.units || categoryConfig.unitList;
+}
+
 function validateDraftAgainstCategoryConfig(
   draft: Record<string, unknown> | undefined,
   categoryConfig: CategoryConfigForPrecheck | undefined,
@@ -1111,65 +1163,98 @@ function validateDraftAgainstCategoryConfig(
 ): void {
   if (!draft || !categoryConfig) return;
 
+  if (!draft.unitId && draft.unitName) {
+    const unit = findByLabel(normalizedUnitList(categoryConfig), draft.unitName);
+    if (unit) {
+      draft.unitId = configId(unit);
+      draft.unitName = configLabel(unit) || draft.unitName;
+    } else {
+      addIssue(issues, {
+        severity: 'error',
+        code: 'CATEGORY_UNIT_NOT_FOUND',
+        section: '分类、单位、供应商',
+        message: `计量单位不存在或不适用于当前分类：${String(draft.unitName)}。`
+      });
+    }
+  }
+
   const baseConfigs = Array.isArray(draft.baseConfigs) ? (draft.baseConfigs as Array<Record<string, unknown>>) : [];
   baseConfigs.forEach((row, index) => {
-    const name = row.name;
-    if (!name) return;
-    if (!findByLabel(categoryConfig.baseConfigs, name)) {
+    const config = findById(categoryConfig.baseConfigs, row.categoryBaseId) || findByLabel(categoryConfig.baseConfigs, row.name);
+    if (config) {
+      assignConfigReference(row, config, 'categoryBaseId', 'name');
+      const source = config.source;
+      if (source !== undefined && source !== null && row.source === undefined) row.source = source;
+      return;
+    }
+    if (row.name || row.categoryBaseId) {
       addIssue(issues, {
         severity: 'error',
         code: 'CATEGORY_BASE_CONFIG_NOT_FOUND',
         section: '基础配置',
         row: index + 1,
-        message: `基础配置不存在或不可用：${String(name)}。`
+        message: `基础配置不存在或不可用：${String(row.name || row.categoryBaseId)}。`
       });
     }
   });
 
   const technicalParams = Array.isArray(draft.technicalParams) ? (draft.technicalParams as Array<Record<string, unknown>>) : [];
   technicalParams.forEach((row, index) => {
-    const name = row.name;
-    if (!name) return;
-    if (!findByLabel(categoryConfig.technicalParams, name)) {
+    const config = findById(categoryConfig.technicalParams, row.categoryBaseId) || findByLabel(categoryConfig.technicalParams, row.name);
+    if (config) {
+      assignConfigReference(row, config, 'categoryBaseId', 'name');
+      return;
+    }
+    if (row.name || row.categoryBaseId) {
       addIssue(issues, {
         severity: 'error',
         code: 'CATEGORY_TECHNICAL_PARAM_NOT_FOUND',
         section: '技术参数',
         row: index + 1,
-        message: `技术参数不存在或不可用：${String(name)}。`
+        message: `技术参数不存在或不可用：${String(row.name || row.categoryBaseId)}。`
       });
     }
   });
 
   const optionalConfigs = Array.isArray(draft.optionalConfigs) ? (draft.optionalConfigs as Array<Record<string, unknown>>) : [];
   optionalConfigs.forEach((row, index) => {
-    const name = row.name;
     const configValue = row.configValue;
-    if (!name) return;
-    const config = findByLabel(categoryConfig.optionalConfigs, name);
+    const config =
+      findById(categoryConfig.optionalConfigs, row.categoryOptionalId) || findByLabel(categoryConfig.optionalConfigs, row.name);
     if (!config) {
-      addIssue(issues, {
-        severity: 'error',
-        code: 'CATEGORY_OPTIONAL_CONFIG_NOT_FOUND',
-        section: '可选配置',
-        row: index + 1,
-        message: `可选配置不存在或不可用：${String(name)}。`
-      });
+      if (row.name || row.categoryOptionalId) {
+        addIssue(issues, {
+          severity: 'error',
+          code: 'CATEGORY_OPTIONAL_CONFIG_NOT_FOUND',
+          section: '可选配置',
+          row: index + 1,
+          message: `可选配置不存在或不可用：${String(row.name || row.categoryOptionalId)}。`
+        });
+      }
       return;
     }
+    assignConfigReference(row, config, 'categoryOptionalId', 'name');
 
     if (!configValue) return;
     const options = optionItems(config);
-    if (!findByLabel(options, configValue)) {
+    const option = findById(options, row.categoryOptionalConfigId) || findByLabel(options, configValue);
+    if (!option) {
       const allowed = options.map((item) => configLabel(item)).filter(Boolean).join('、');
       addIssue(issues, {
         severity: 'error',
         code: 'CATEGORY_OPTIONAL_CONFIG_VALUE_NOT_FOUND',
         section: '可选配置',
         row: index + 1,
-        message: `可选配置 ${String(name)} 不存在选项值：${String(configValue)}。可选值：${allowed || '无'}。`
+        message: `可选配置 ${String(row.name)} 不存在选项值：${String(configValue)}。可选值：${allowed || '无'}。`
       });
+      return;
     }
+    const optionId = configId(option);
+    if (optionId) row.categoryOptionalConfigId = optionId;
+    const optionLabel = configLabel(option);
+    if (optionLabel) row.configValue = optionLabel;
+    if (row.priceDiffCny === undefined && option.priceDiffCny !== undefined) row.priceDiffCny = option.priceDiffCny;
+    if (row.priceDiffUsd === undefined && option.priceDiffUsd !== undefined) row.priceDiffUsd = option.priceDiffUsd;
   });
 }
 
@@ -1281,6 +1366,7 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
     tableRows(tables, '适用区域', '区域名称').map((row) => ({
       regionName: optionalText(row['区域名称']),
       regionId: optionalText(row['区域ID']),
+      isAll: mappedValue(issues, row['是否全球'], yesNoMap, '适用区域.是否全球', '适用区域'),
       customerType: optionalText(row['客户类型']),
       originPlace: optionalText(row['产品产地']),
       sortNo: numberValue(issues, row['排序'], '适用区域.排序', '适用区域'),
@@ -1342,6 +1428,23 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
       remark: optionalText(row['备注'])
     }))
   );
+  const techSupport = fieldMap(tables, '销售支持');
+  const techSupportRow: Record<string, unknown> = {
+    type: 10,
+    title: '技术支持与联系方式',
+    techSupportContact: optionalText(techSupport['技术支持联系人']),
+    techSupportPhone: optionalText(techSupport['联系电话']),
+    techSupportEmail: optionalText(techSupport['电子邮箱']),
+    techSupportHours: optionalText(techSupport['服务时间']),
+    techSupportAlternative: optionalText(techSupport['备用联系方式'])
+  };
+  const hasTechSupportContent = ['techSupportContact', 'techSupportPhone', 'techSupportEmail', 'techSupportHours', 'techSupportAlternative'].some(
+    (field) => Boolean(techSupportRow[field])
+  );
+  if (hasTechSupportContent && Array.isArray(draft.salesSupports)) {
+    const salesSupports = draft.salesSupports as Array<Record<string, unknown>>;
+    if (!salesSupports.some((row) => row.type === 10)) salesSupports.push(techSupportRow);
+  }
   draft.competitors = compactRows(
     tableRows(tables, '竞品对比', '对比维度').map((row) => ({
       dimensionName: optionalText(row['对比维度']),
@@ -1355,17 +1458,98 @@ function parseDraft(markdown: string, tables: MarkdownTable[], issues: PrecheckI
 }
 
 function unresolvedReferences(draft: Record<string, unknown>) {
+  const categoryPath = [draft.categoryFirstName, draft.categorySecondName, draft.categoryThirdName]
+    .map((value) => String(value ?? '').trim())
+    .filter(Boolean);
   return {
     categoryFirstName: draft.categoryFirstName,
     categorySecondName: draft.categorySecondName,
     categoryThirdName: draft.categoryThirdName,
     unitName: draft.unitName,
     supplierName: draft.supplierName,
-    note: 'product_create 需要真实 categoryFirstId/categorySecondId/categoryThirdId/unitId/supplierId。下一步应通过只读 MCP 工具解析这些名称。'
+    lookupPlan: [
+      {
+        tool: 'product_list_categories',
+        match: '按用户填写的分类路径做完全匹配；如果有可用子级，继续匹配到最末级分类。',
+        categoryPath,
+        fill: ['categoryFirstId', 'categorySecondId', 'categoryThirdId']
+      },
+      {
+        tool: 'product_get_category_config',
+        when: '分类末级 ID 已解析后调用。',
+        fill: ['unitId', 'baseConfigs[].categoryBaseId', 'technicalParams[].categoryBaseId', 'optionalConfigs[].categoryOptionalId', 'optionalConfigs[].categoryOptionalConfigId']
+      },
+      {
+        tool: 'product_list_suppliers',
+        match: '供应商名称完全匹配。',
+        fill: ['suppliers[].supplierId']
+      },
+      {
+        tool: 'product_list_regions',
+        when: '适用范围为指定区域时调用。',
+        match: '区域名称完全匹配。',
+        fill: ['regions[].regionId']
+      }
+    ],
+    note: 'product_create 需要真实 categoryFirstId/categorySecondId/categoryThirdId/unitId/supplierId。用户不需要填写这些 ID；下一步应通过只读 MCP 工具解析名称并回填。'
   };
 }
 
 const MEDIA_SECTIONS = new Set(['商品图片', '商品视频、3D 与附件', '图文详情']);
+const PART_MEDIA_SECTIONS = new Set(['配件、备件、易损件', '配件文件明细']);
+const partImageCategoryMap: Record<string, number> = {
+  配件: 9,
+  备件: 10,
+  易损件: 11
+};
+const partOtherCategoryMap: Record<string, number> = {
+  配件: 3,
+  备件: 4,
+  易损件: 5
+};
+
+function partMediaCategory(file: CheckedFileReference): { imageCategory?: number; otherCategory?: number } {
+  const label = file.partTypeLabel || '配件';
+  if (file.usage === 'partsImage') {
+    return { imageCategory: partImageCategoryMap[label] || partImageCategoryMap.配件 };
+  }
+  if (file.usage === 'partsAttachment') {
+    return { otherCategory: partOtherCategoryMap[label] || partOtherCategoryMap.配件 };
+  }
+  return {};
+}
+
+function mediaEntryFromFile(file: CheckedFileReference, sort: number): Record<string, unknown> | undefined {
+  const policy = getUploadPolicy(file.usage);
+  if (policy.target !== 'medias') return undefined;
+  const entry: Record<string, unknown> = {
+    mediaType: policy.mediaType,
+    mediaUrl: bindingPlaceholder(file.rowKey || ''),
+    mediaName: path.basename(file.relativePath),
+    sort
+  };
+  if (file.usage === 'partsImage') {
+    entry.mediaType = 1;
+  }
+  if (file.usage === 'partsAttachment') {
+    entry.mediaType = 3;
+  }
+  if (!entry.mediaType) return undefined;
+  if (file.title) entry.mediaTitle = file.title;
+  if (file.mediaSubtitle) entry.mediaSubtitle = file.mediaSubtitle;
+  if (file.description) entry.mediaDesc = file.description;
+  if (file.mediaLanguage) entry.language = file.mediaLanguage;
+  if (file.languageList) entry.languageList = file.languageList;
+  if (file.mediaId) entry.mediaId = file.mediaId;
+  if (policy.imageCategory) entry.imageCategory = policy.imageCategory;
+  if (policy.videoCategory) entry.videoCategory = policy.videoCategory;
+  if (policy.otherCategory) entry.otherCategory = policy.otherCategory;
+  const partCategory = partMediaCategory(file);
+  if (partCategory.imageCategory) entry.imageCategory = partCategory.imageCategory;
+  if (partCategory.otherCategory) entry.otherCategory = partCategory.otherCategory;
+  if (file.mediaRemark) entry.remark = file.mediaRemark;
+  return entry;
+}
 
 /**
  * Populate draftCreateInput.medias / certifications / customerCases from the
@@ -1393,28 +1577,18 @@ function attachDraftMediaAndBindings(
 
   const medias: Array<Record<string, unknown>> = [];
   for (const file of checkedFiles) {
-    if (!file.ok || !file.rowKey || !MEDIA_SECTIONS.has(file.section)) continue;
-    const policy = getUploadPolicy(file.usage);
-    if (policy.target !== 'medias') continue;
-    const entry: Record<string, unknown> = {
-      mediaType: policy.mediaType,
-      mediaUrl: bindingPlaceholder(file.rowKey),
-      mediaName: path.basename(file.relativePath),
-      sort: medias.length + 1
-    };
-    if (file.title) entry.mediaTitle = file.title;
-    if (file.mediaSubtitle) entry.mediaSubtitle = file.mediaSubtitle;
-    if (file.description) entry.mediaDesc = file.description;
-    if (file.mediaLanguage) entry.language = file.mediaLanguage;
-    if (file.languageList) entry.languageList = file.languageList;
-    if (file.mediaId) entry.mediaId = file.mediaId;
-    if (policy.imageCategory) entry.imageCategory = policy.imageCategory;
-    if (policy.videoCategory) entry.videoCategory = policy.videoCategory;
-    if (policy.otherCategory) entry.otherCategory = policy.otherCategory;
-    if (file.mediaRemark) entry.remark = file.mediaRemark;
+    if (!file.ok || !file.rowKey || (!MEDIA_SECTIONS.has(file.section) && !PART_MEDIA_SECTIONS.has(file.section))) continue;
+    const entry = mediaEntryFromFile(file, medias.length + 1);
+    if (!entry) continue;
     medias.push(entry);
   }
   if (medias.length) draft.medias = medias;
+
+  const salesSupports = Array.isArray(draft.salesSupports) ? (draft.salesSupports as Array<Record<string, unknown>>) : [];
+  salesSupports.forEach((row, index) => {
+    const rowKey = `sales-${index + 1}`;
+    if (okRowKeys.has(rowKey)) row.fileUrl = bindingPlaceholder(rowKey);
+  });
 
   const certifications: Array<Record<string, unknown>> = [];
   tableRows(tables, '认证资料', '证书名称').forEach((row, index) => {
@@ -1448,6 +1622,12 @@ function attachDraftMediaAndBindings(
     if (coverRegions) entry.coverRegions = coverRegions;
     const coverRegionIds = optionalText(row['覆盖区域ID']);
     if (coverRegionIds) entry.coverRegionIds = coverRegionIds;
+    const applyScopeText = cleanCell(row['适用范围']);
+    if (applyScopeText) entry.applyScope = certApplyScopeMap[applyScopeText] ?? applyScopeText;
+    const applyModelNames = optionalText(row['适用特定型号']);
+    if (applyModelNames) entry.applyModelNames = applyModelNames;
+    const applyModelIds = optionalText(row['适用特定型号ID']);
+    if (applyModelIds) entry.applyModelIds = applyModelIds;
     const effectiveDate = optionalText(row['生效日期']);
     if (effectiveDate) entry.effectiveDate = effectiveDate;
     const expiryDate = optionalText(row['到期日期']);
@@ -1455,8 +1635,8 @@ function attachDraftMediaAndBindings(
     entry.isPermanent = cleanCell(row['是否永久有效']) === '是' ? 1 : 0;
     const fileCategory = optionalText(row['文件分类']);
     if (fileCategory) entry.fileCategory = fileCategory;
-    const status = optionalText(row['状态']);
-    if (status) entry.status = status;
+    const statusText = cleanCell(row['状态']);
+    if (statusText) entry.status = certStatusMap[statusText] ?? statusText;
     const sortValue = cleanCell(row['排序']);
     if (sortValue) {
       const parsed = Number(sortValue);

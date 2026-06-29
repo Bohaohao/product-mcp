@@ -244,6 +244,8 @@ export const UPLOAD_POLICIES: Record<ProductUploadFileInput['usage'], UploadPoli
     target: 'salesSupports.fileUrl'
   },
   partsImage: imagePolicy('partsImage', '配件/备件/易损件图片', 5, 'medias', {
+    mediaType: 1,
+    imageCategory: 9,
     aspectRatio: 1,
     aspectRatioText: '1:1'
   }),
@@ -253,6 +255,8 @@ export const UPLOAD_POLICIES: Record<ProductUploadFileInput['usage'], UploadPoli
     allowedExtensions: ['pdf'],
     maxSizeMb: 50,
     maxCount: 5,
+    mediaType: 3,
+    otherCategory: 3,
     target: 'medias'
   },
   richTextImage: imagePolicy('richTextImage', '富文本图片', 0, 'richTextHtml'),

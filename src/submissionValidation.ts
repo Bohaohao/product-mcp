@@ -88,6 +88,11 @@ function validateReferences(input: UnknownRecord, issues: SubmissionValidationIs
     addIssue(issues, 'CATEGORY_FIRST_REQUIRED', '一级分类必填。', '分类、单位、供应商', undefined, 'categoryFirstId');
   }
 
+  const hasUnit = hasValue(input.unitId) || hasValue(input.unitName);
+  if (!hasUnit) {
+    addIssue(issues, 'UNIT_REQUIRED', '计量单位必填。', '分类、单位、供应商', undefined, 'unitId');
+  }
+
   const suppliers = Array.isArray(input.suppliers) ? (input.suppliers as UnknownRecord[]) : [];
   const hasSupplier =
     suppliers.some((supplier) => hasValue(supplier.supplierId) || (options.allowReferenceNames && hasValue(supplier.supplierName))) ||
@@ -256,9 +261,12 @@ function validatePartLists(input: UnknownRecord, issues: SubmissionValidationIss
   const rows = Array.isArray(input.partLists) ? (input.partLists as UnknownRecord[]) : [];
   rows.forEach((row, index) => {
     const rowNumber = index + 1;
-    const hasContent = rowHasAnyValue(row, ['partName', 'specAttr', 'costPrice', 'suggestedPrice', 'suggestedStock', 'unitName']);
+    const hasContent = rowHasAnyValue(row, ['partType', 'partName', 'specAttr', 'costPrice', 'suggestedPrice', 'suggestedStock', 'unitId', 'unitName']);
     if (!hasContent) return;
 
+    if (!hasValue(row.partType)) {
+      addIssue(issues, 'PART_TYPE_REQUIRED', `配件第 ${rowNumber} 行必须填写类型。`, '配件、备件、易损件', rowNumber, 'partLists');
+    }
     if (!hasValue(row.partName)) {
       addIssue(issues, 'PART_NAME_REQUIRED', `配件第 ${rowNumber} 行必须填写名称。`, '配件、备件、易损件', rowNumber, 'partLists');
     }
@@ -293,8 +301,49 @@ function validatePartLists(input: UnknownRecord, issues: SubmissionValidationIss
       );
     }
 
-    if (!hasValue(row.unitName)) {
+    if (!hasValue(row.unitId) && !hasValue(row.unitName)) {
       addIssue(issues, 'PART_UNIT_REQUIRED', `配件第 ${rowNumber} 行必须填写单位。`, '配件、备件、易损件', rowNumber, 'partLists');
+    }
+  });
+}
+
+function validatePriceTiers(input: UnknownRecord, issues: SubmissionValidationIssue[]): void {
+  const rows = Array.isArray(input.priceTiers) ? (input.priceTiers as UnknownRecord[]) : [];
+  rows.forEach((row, index) => {
+    const rowNumber = index + 1;
+    const fields = ['minPriceQuantity', 'maxPriceQuantity', 'unitPrice', 'profitRate', 'minDeliveryDays', 'maxDeliveryDays'];
+    if (!rowHasAnyValue(row, fields)) return;
+
+    const minPriceQuantity = numberValue(row.minPriceQuantity);
+    const maxPriceQuantity = numberValue(row.maxPriceQuantity);
+    const unitPrice = numberValue(row.unitPrice);
+    const profitRate = numberValue(row.profitRate);
+    const minDeliveryDays = numberValue(row.minDeliveryDays);
+    const maxDeliveryDays = numberValue(row.maxDeliveryDays);
+
+    if (minPriceQuantity === undefined || minPriceQuantity <= 0) {
+      addIssue(issues, 'PRICE_TIER_MIN_QUANTITY_INVALID', `价格阶梯第 ${rowNumber} 行最小数量必须为正数。`, '价格信息', rowNumber, 'priceTiers');
+    }
+    if (maxPriceQuantity === undefined || maxPriceQuantity <= 0) {
+      addIssue(issues, 'PRICE_TIER_MAX_QUANTITY_INVALID', `价格阶梯第 ${rowNumber} 行最大数量必须为正数。`, '价格信息', rowNumber, 'priceTiers');
+    }
+    if (minPriceQuantity !== undefined && maxPriceQuantity !== undefined && maxPriceQuantity < minPriceQuantity) {
+      addIssue(issues, 'PRICE_TIER_QUANTITY_RANGE_INVALID', `价格阶梯第 ${rowNumber} 行最大数量不能小于最小数量。`, '价格信息', rowNumber, 'priceTiers');
+    }
+    if (unitPrice === undefined || unitPrice <= 0) {
+      addIssue(issues, 'PRICE_TIER_UNIT_PRICE_INVALID', `价格阶梯第 ${rowNumber} 行单价必须为正数。`, '价格信息', rowNumber, 'priceTiers');
+    }
+    if (profitRate === undefined || profitRate < 0) {
+      addIssue(issues, 'PRICE_TIER_PROFIT_RATE_INVALID', `价格阶梯第 ${rowNumber} 行利润率必须为不小于 0 的数字。`, '价格信息', rowNumber, 'priceTiers');
+    }
+    if (minDeliveryDays === undefined || minDeliveryDays < 0 || !Number.isInteger(minDeliveryDays)) {
+      addIssue(issues, 'PRICE_TIER_MIN_DELIVERY_INVALID', `价格阶梯第 ${rowNumber} 行最短交货天数必须为不小于 0 的整数。`, '价格信息', rowNumber, 'priceTiers');
+    }
+    if (maxDeliveryDays === undefined || maxDeliveryDays < 0 || !Number.isInteger(maxDeliveryDays)) {
+      addIssue(issues, 'PRICE_TIER_MAX_DELIVERY_INVALID', `价格阶梯第 ${rowNumber} 行最长交货天数必须为不小于 0 的整数。`, '价格信息', rowNumber, 'priceTiers');
+    }
+    if (minDeliveryDays !== undefined && maxDeliveryDays !== undefined && maxDeliveryDays < minDeliveryDays) {
+      addIssue(issues, 'PRICE_TIER_DELIVERY_RANGE_INVALID', `价格阶梯第 ${rowNumber} 行最长交货天数不能小于最短交货天数。`, '价格信息', rowNumber, 'priceTiers');
     }
   });
 }
@@ -427,14 +476,23 @@ function validateSalesSupports(input: UnknownRecord, issues: SubmissionValidatio
   rows.forEach((row, index) => {
     const rowNumber = index + 1;
     const type = numberValue(row.type);
+    if (type === 1) {
+      const hasContent = rowHasAnyValue(row, ['title', 'content']);
+      if (!hasContent) return;
+      if (!hasValue(row.content)) {
+        addIssue(issues, 'SALES_ONE_LINE_CONTENT_REQUIRED', `销售支持第 ${rowNumber} 行（一句话卖点）必须填写内容。`, '销售支持', rowNumber, 'salesSupports');
+      }
+      return;
+    }
+
     if (type === 2 || type === 3) {
       const hasContent = rowHasAnyValue(row, ['title', 'content', 'fileUrl']);
       if (!hasContent) return;
-      if (!hasValue(row.title) || !hasValue(row.content) || !hasValue(row.fileUrl)) {
+      if (!hasValue(row.title) || !hasValue(row.content)) {
         addIssue(
           issues,
           'SALES_IMAGE_TEXT_ROW_INCOMPLETE',
-          `销售支持第 ${rowNumber} 行（图文类）必须同时填写标题、内容、文件。`,
+          `销售支持第 ${rowNumber} 行（图文类）必须同时填写标题和内容；文件可选，填写后必须上传成功。`,
           '销售支持',
           rowNumber,
           'salesSupports'
@@ -443,7 +501,7 @@ function validateSalesSupports(input: UnknownRecord, issues: SubmissionValidatio
       return;
     }
 
-    if (type === 4 || type === 5) {
+    if ([4, 5, 6, 7, 8, 9].includes(type || 0)) {
       const hasContent = rowHasAnyValue(row, ['title', 'content']);
       if (!hasContent) return;
       if (!hasValue(row.title) || !hasValue(row.content)) {
@@ -451,6 +509,38 @@ function validateSalesSupports(input: UnknownRecord, issues: SubmissionValidatio
           issues,
           'SALES_QA_ROW_INCOMPLETE',
           `销售支持第 ${rowNumber} 行必须同时填写标题和内容。`,
+          '销售支持',
+          rowNumber,
+          'salesSupports'
+        );
+      }
+      return;
+    }
+
+    if (type === 10) {
+      const hasContent = rowHasAnyValue(row, [
+        'title',
+        'techSupportContact',
+        'techSupportPhone',
+        'techSupportEmail',
+        'techSupportHours',
+        'techSupportAlternative'
+      ]);
+      if (!hasContent) return;
+      if (!hasValue(row.title)) {
+        addIssue(issues, 'SALES_TECH_SUPPORT_TITLE_REQUIRED', `销售支持第 ${rowNumber} 行必须填写技术支持标题。`, '销售支持', rowNumber, 'salesSupports');
+      }
+      if (!hasValue(row.techSupportContact)) {
+        addIssue(issues, 'SALES_TECH_SUPPORT_CONTACT_REQUIRED', `销售支持第 ${rowNumber} 行必须填写技术支持联系人。`, '销售支持', rowNumber, 'salesSupports');
+      }
+      if (!hasValue(row.techSupportHours)) {
+        addIssue(issues, 'SALES_TECH_SUPPORT_HOURS_REQUIRED', `销售支持第 ${rowNumber} 行必须填写服务时间。`, '销售支持', rowNumber, 'salesSupports');
+      }
+      if (!hasValue(row.techSupportPhone) && !hasValue(row.techSupportEmail) && !hasValue(row.techSupportAlternative)) {
+        addIssue(
+          issues,
+          'SALES_TECH_SUPPORT_CHANNEL_REQUIRED',
+          `销售支持第 ${rowNumber} 行必须至少填写联系电话、电子邮箱或备用联系方式之一。`,
           '销售支持',
           rowNumber,
           'salesSupports'
@@ -533,6 +623,7 @@ export function validateFrontendAlignedSubmission(
   validateRegions(input, issues, options);
   validateSamplePrice(input, issues);
   validateTags(input, issues);
+  validatePriceTiers(input, issues);
   validateWholeMachineConfig(input, issues);
   validateUnifiedPackage(input, issues);
   validatePartLists(input, issues);
