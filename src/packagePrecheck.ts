@@ -1,4 +1,4 @@
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, readdir, stat } from 'node:fs/promises';
 import path from 'node:path';
 import * as z from 'zod/v4';
 import {
@@ -11,8 +11,9 @@ import {
 } from './upload/policies.js';
 import { prepareImageForUpload } from './upload/imagePreparer.js';
 import { buildFieldCoverage, buildProtocolTrace, buildSubmissionPreview, toActionableIssues } from './protocol.js';
-import { validateFrontendAlignedSubmission, type SubmissionValidationIssue } from './submissionValidation.js';
+import { validateCreateReadiness, type SubmissionValidationIssue } from './submissionValidation.js';
 import { validateMediaClassificationRow, type MediaClassificationKind } from './workflows/classificationBoundary.js';
+import { productOcrCertifications, productOcrOptionsSchema } from './ocr/certificationOcr.js';
 
 export const productPrecheckPackageInputSchema = {
   packagePath: z
@@ -25,6 +26,8 @@ export const productPrecheckPackageInputSchema = {
     .enum(['standard', 'summary', 'debug'])
     .default('standard')
     .describe('standard keeps the existing full response, summary returns only business summaries/coverage/issues, debug keeps all diagnostics.'),
+  ocrMode: z.enum(['off', 'suggest']).default('suggest').describe('When suggest, run local certification OCR suggestions without modifying 商品资料.md.'),
+  ocrOptions: productOcrOptionsSchema,
   categoryConfig: z
     .object({
       units: z.array(z.record(z.string(), z.any())).optional(),
@@ -42,6 +45,7 @@ export type ProductPrecheckPackageInput = z.infer<typeof productPrecheckPackageO
 
 type UploadUsage = ProductUploadFileInput['usage'];
 type Severity = 'error' | 'warning' | 'info';
+type FileReferenceKind = 'explicitRequired' | 'explicitAttachment' | 'extraDiscovered';
 
 interface PrecheckIssue {
   severity: Severity;
@@ -71,6 +75,10 @@ interface FileReference {
   description?: string;
   languageList?: Array<'zh' | 'en'>;
   required?: boolean;
+  referenceKind?: FileReferenceKind;
+  field?: string;
+  fieldPath?: string;
+  productNameCn?: string;
   rowKey?: string;
   mediaSubtitle?: string;
   mediaLanguage?: string;
@@ -665,6 +673,15 @@ function collectPartListRows(tables: MarkdownTable[], issues: PrecheckIssue[]): 
 }
 
 function addIssue(issues: PrecheckIssue[], issue: PrecheckIssue): void {
+  const duplicate = issues.some(
+    (existing) =>
+      existing.severity === issue.severity &&
+      existing.code === issue.code &&
+      existing.section === issue.section &&
+      existing.row === issue.row &&
+      existing.path === issue.path
+  );
+  if (duplicate) return;
   issues.push(issue);
 }
 
@@ -856,6 +873,10 @@ function addFileReference(
     mediaId?: string;
     mediaRemark?: string;
     partTypeLabel?: string;
+    referenceKind?: FileReferenceKind;
+    field?: string;
+    fieldPath?: string;
+    productNameCn?: string;
   }
 ): void {
   references.push({
@@ -869,6 +890,10 @@ function addFileReference(
     description: optionalText(description),
     languageList: languageList(languages),
     required,
+    referenceKind: extra?.referenceKind,
+    field: optionalText(extra?.field),
+    fieldPath: optionalText(extra?.fieldPath),
+    productNameCn: optionalText(extra?.productNameCn),
     rowKey: extra?.rowKey,
     mediaSubtitle: optionalText(extra?.mediaSubtitle),
     mediaLanguage: optionalText(extra?.mediaLanguage),
@@ -1025,8 +1050,13 @@ function collectFileReferences(
         row['证书名称'],
         row['备注'],
         undefined,
-        undefined,
-        { rowKey: `${certRowKey}-fileUrl` }
+        true,
+        {
+          rowKey: `${certRowKey}-fileUrl`,
+          referenceKind: 'explicitRequired',
+          field: '文件路径',
+          fieldPath: `认证资料第 ${index + 1} 行 / 文件路径`
+        }
       );
     }
     const mainImagePath = cleanCell(row['主图路径']);
@@ -1042,8 +1072,13 @@ function collectFileReferences(
         row['证书名称'],
         row['备注'],
         undefined,
-        undefined,
-        { rowKey: `${certRowKey}-mainImageUrl` }
+        true,
+        {
+          rowKey: `${certRowKey}-mainImageUrl`,
+          referenceKind: 'explicitRequired',
+          field: '主图路径',
+          fieldPath: `认证资料第 ${index + 1} 行 / 主图路径`
+        }
       );
     }
   });
@@ -1192,7 +1227,102 @@ function collectFileReferences(
   return references;
 }
 
-async function checkFiles(references: FileReference[], issues: PrecheckIssue[]): Promise<CheckedFileReference[]> {
+function extraPathSuggestsCertification(relativePath: string): boolean {
+  const text = relativePath.toLowerCase();
+  return ['认证', '证书', '检测', '报告', 'certificate', 'certification', 'cert', 'ce', 'fcc', 'iso', 'rohs'].some((part) =>
+    text.includes(part)
+  );
+}
+
+async function collectExtraDiscoveredCertificationImages(
+  packageDir: string,
+  references: FileReference[]
+): Promise<FileReference[]> {
+  const referencedPaths = new Set(references.map((reference) => normalizeRelativePathForDedupe(reference.relativePath)));
+  const extras: FileReference[] = [];
+  const ignoredDirs = new Set(['.git', '.generated', 'node_modules']);
+  const imageExts = new Set(['jpg', 'jpeg', 'png']);
+
+  async function walk(currentDir: string): Promise<void> {
+    const entries = await readdir(currentDir, { withFileTypes: true });
+    for (const entry of entries) {
+      const absolutePath = path.join(currentDir, entry.name);
+      if (entry.isDirectory()) {
+        if (ignoredDirs.has(entry.name)) continue;
+        await walk(absolutePath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const ext = path.extname(entry.name).replace(/^\./, '').toLowerCase();
+      if (!imageExts.has(ext)) continue;
+
+      const relative = path.relative(packageDir, absolutePath).replace(/\\/g, '/');
+      const relativePath = relative.startsWith('.') ? relative : `./${relative}`;
+      if (referencedPaths.has(normalizeRelativePathForDedupe(relativePath))) continue;
+      if (!extraPathSuggestsCertification(relativePath)) continue;
+
+      const row = extras.length + 1;
+      extras.push({
+        section: '认证资料额外文件',
+        row,
+        usage: 'certificateMainImage',
+        usageLabel: '额外认证图片',
+        relativePath,
+        absolutePath,
+        title: path.basename(entry.name, path.extname(entry.name)),
+        description: '未在商品资料.md 中引用，仅作为可忽略额外文件校验。',
+        required: false,
+        referenceKind: 'extraDiscovered',
+        field: '未引用额外文件',
+        fieldPath: `认证资料额外文件第 ${row} 项`
+      });
+    }
+  }
+
+  await walk(packageDir);
+  return extras;
+}
+
+function isBlockingFileReference(reference: Pick<FileReference, 'required' | 'referenceKind'>): boolean {
+  return Boolean(reference.required || reference.referenceKind === 'explicitRequired' || reference.referenceKind === 'explicitAttachment');
+}
+
+function fileReferenceIssueMessage(reference: FileReference, message: string, productNameCn?: string): string {
+  const parts: string[] = [];
+  const productName = reference.productNameCn || productNameCn;
+  if (productName) parts.push(`商品 ${productName}`);
+  if (reference.fieldPath) {
+    parts.push(reference.fieldPath);
+  } else {
+    parts.push(`${reference.section}第 ${reference.row} 行`);
+    if (reference.field || reference.usageLabel) parts.push(reference.field || reference.usageLabel);
+  }
+  parts.push(path.basename(reference.relativePath));
+  return `${parts.join(' / ')}：${message}`;
+}
+
+function invalidFileSummary(file: CheckedFileReference, productNameCn?: string) {
+  return {
+    productNameCn: file.productNameCn || productNameCn,
+    section: file.section,
+    row: file.row,
+    field: file.field,
+    fieldPath: file.fieldPath,
+    usage: file.usage,
+    usageLabel: file.usageLabel,
+    referenceKind: file.referenceKind,
+    required: isBlockingFileReference(file),
+    relativePath: file.relativePath,
+    absolutePath: file.absolutePath,
+    errors: file.errors
+  };
+}
+
+async function checkFiles(
+  references: FileReference[],
+  issues: PrecheckIssue[],
+  productNameCn?: string
+): Promise<CheckedFileReference[]> {
   const checked: CheckedFileReference[] = [];
   const usageCounts = new Map<UploadUsage, number>();
 
@@ -1264,14 +1394,16 @@ async function checkFiles(references: FileReference[], issues: PrecheckIssue[]):
     }
 
     if (errors.length) {
+      const blocking = isBlockingFileReference(reference);
       for (const message of errors) {
         addIssue(issues, {
-          severity: reference.required ? 'error' : 'warning',
-          code: reference.required ? 'REQUIRED_FILE_INVALID' : 'OPTIONAL_FILE_INVALID',
+          severity: blocking ? 'error' : 'warning',
+          code: blocking ? 'REQUIRED_FILE_INVALID' : 'OPTIONAL_FILE_INVALID',
           section: reference.section,
           row: reference.row,
+          field: reference.field,
           path: reference.relativePath,
-          message
+          message: fileReferenceIssueMessage(reference, message, productNameCn)
         });
       }
     }
@@ -1327,10 +1459,10 @@ function validateCertificationTables(tables: MarkdownTable[], issues: PrecheckIs
       addIssue(issues, { severity: 'error', code: 'CERT_FILE_CATEGORY_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写文件分类。` });
     }
     if (!cleanCell(row['文件路径'])) {
-      addIssue(issues, { severity: 'error', code: 'CERT_FILE_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写文件路径。` });
+      addIssue(issues, { severity: 'error', code: 'CERT_FILE_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行缺少证书文件，请填写文件路径并确保文件可上传。` });
     }
     if (!cleanCell(row['主图路径'])) {
-      addIssue(issues, { severity: 'error', code: 'CERT_MAIN_IMAGE_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写主图路径。` });
+      addIssue(issues, { severity: 'error', code: 'CERT_MAIN_IMAGE_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行缺少主图，请填写主图路径并确保文件可上传。` });
     }
     if (!cleanCell(row['证书名称'])) {
       addIssue(issues, { severity: 'error', code: 'CERT_NAME_REQUIRED', section: '认证资料', row: rowNumber, message: `认证资料第 ${rowNumber} 行必须填写证书名称。` });
@@ -1977,6 +2109,8 @@ function attachDraftMediaAndBindings(
     if (coverRegions) entry.coverRegions = coverRegions;
     const coverRegionIds = optionalText(row['覆盖区域ID']);
     if (coverRegionIds) entry.coverRegionIds = coverRegionIds;
+    const issuingAuthority = optionalText(row['发证机构']);
+    if (issuingAuthority) entry.issuingAuthority = issuingAuthority;
     const applyScopeText = cleanCell(row['适用范围']);
     if (applyScopeText) entry.applyScope = certApplyScopeMap[applyScopeText] ?? applyScopeText;
     const applyModelNames = optionalText(row['适用特定型号']);
@@ -2079,24 +2213,24 @@ export async function precheckProductPackage(rawInput: unknown) {
   const tables = parseMarkdownTables(markdown);
   issues.push(...mediaClassificationPrecheckIssues(tables));
   const draft = input.includeDraft ? parseDraft(markdown, tables, issues) : undefined;
-  if (draft) {
-    appendFrontendValidationIssues(
-      issues,
-      validateFrontendAlignedSubmission(draft, {
-        allowReferenceNames: true,
-        skipCertificationValidation: true,
-        skipMediaValidation: true,
-        skipSalesValidation: true
-      })
-    );
-  }
+  const draftProductNameCn = typeof draft?.productNameCn === 'string' ? draft.productNameCn : undefined;
   validateDraftAgainstCategoryConfig(draft, input.categoryConfig, issues);
   validateCertificationTables(tables, issues);
   validateSalesSupportTables(tables, issues);
   validateCustomerCaseTables(tables, issues);
-  const fileReferences = collectFileReferences(tables, packageDir, issues);
-  const checkedFiles = await checkFiles(fileReferences, issues);
+  const explicitFileReferences = collectFileReferences(tables, packageDir, issues);
+  const extraDiscoveredFiles = await collectExtraDiscoveredCertificationImages(packageDir, explicitFileReferences);
+  const fileReferences = [...explicitFileReferences, ...extraDiscoveredFiles];
+  const checkedFiles = await checkFiles(fileReferences, issues, draftProductNameCn);
   attachDraftMediaAndBindings(draft, tables, checkedFiles);
+  if (draft) {
+    appendFrontendValidationIssues(
+      issues,
+      validateCreateReadiness(draft, {
+        allowReferenceNames: true
+      })
+    );
+  }
   const requiredFileOk = checkedFiles.some((file) => file.usage === 'productMainImage' && file.ok);
   if (!requiredFileOk) {
     addIssue(issues, {
@@ -2117,11 +2251,27 @@ export async function precheckProductPackage(rawInput: unknown) {
     });
   }
 
+  const certificationOcr =
+    input.ocrMode === 'suggest'
+      ? await productOcrCertifications({
+          packagePath: markdownPath,
+          markdownFileName: input.markdownFileName,
+          mode: 'suggest',
+          ocrOptions: input.ocrOptions
+        })
+      : undefined;
+
   const errorCount = issues.filter((issue) => issue.severity === 'error').length;
   const warningCount = issues.filter((issue) => issue.severity === 'warning').length;
-  const invalidOptionalFileCount = checkedFiles.filter((file) => !file.ok && !file.required).length;
+  const blockingInvalidFiles = checkedFiles
+    .filter((file) => !file.ok && isBlockingFileReference(file))
+    .map((file) => invalidFileSummary(file, draftProductNameCn));
+  const ignoredInvalidExtraFiles = checkedFiles
+    .filter((file) => !file.ok && !isBlockingFileReference(file))
+    .map((file) => invalidFileSummary(file, draftProductNameCn));
+  const referencedCheckedFiles = checkedFiles.filter((file) => file.referenceKind !== 'extraDiscovered');
   const uploadQueue = checkedFiles
-    .filter((file) => file.ok)
+    .filter((file) => file.ok && file.referenceKind !== 'extraDiscovered')
     .map((file) => {
       const policy = getUploadPolicy(file.usage);
       return {
@@ -2137,6 +2287,9 @@ export async function precheckProductPackage(rawInput: unknown) {
         source: {
           section: file.section,
           row: file.row,
+          field: file.field,
+          fieldPath: file.fieldPath,
+          referenceKind: file.referenceKind,
           relativePath: file.relativePath,
           usageLabel: file.usageLabel
         },
@@ -2158,13 +2311,15 @@ export async function precheckProductPackage(rawInput: unknown) {
     useAllRegions: draft?.useAllRegions
   };
   const readiness = {
-    canUploadAllReferencedFiles: checkedFiles.every((file) => file.ok),
+    canUploadAllReferencedFiles: referencedCheckedFiles.every((file) => file.ok),
     canCreateAfterSkippingInvalidOptionalFiles: errorCount === 0,
-    requiresUserDecision: invalidOptionalFileCount > 0,
+    requiresUserDecision: ignoredInvalidExtraFiles.length > 0,
     errorCount,
     warningCount,
     validUploadCount: uploadQueue.length,
-    invalidFileCount: checkedFiles.filter((file) => !file.ok).length
+    invalidFileCount: checkedFiles.filter((file) => !file.ok).length,
+    blockingInvalidFileCount: blockingInvalidFiles.length,
+    ignoredInvalidExtraFileCount: ignoredInvalidExtraFiles.length
   };
   const fieldCoverage = draft ? buildFieldCoverage(draft) : undefined;
   const submissionPreview = draft ? buildSubmissionPreview(draft) : undefined;
@@ -2187,17 +2342,33 @@ export async function precheckProductPackage(rawInput: unknown) {
     },
     {
       name: 'validate_files',
-      ok: checkedFiles.every((file) => file.ok),
+      ok: referencedCheckedFiles.every((file) => file.ok),
       counts: {
-        referencedFiles: checkedFiles.length,
+        referencedFiles: referencedCheckedFiles.length,
+        extraDiscoveredFiles: extraDiscoveredFiles.length,
         validUploadCount: uploadQueue.length,
-        invalidFileCount: checkedFiles.filter((file) => !file.ok).length
+        invalidFileCount: checkedFiles.filter((file) => !file.ok).length,
+        blockingInvalidFileCount: blockingInvalidFiles.length,
+        ignoredInvalidExtraFileCount: ignoredInvalidExtraFiles.length
       }
     },
     {
       name: 'build_draft',
       ok: Boolean(draft),
       counts: submissionPreview?.counts
+    },
+    {
+      name: 'ocr_certifications',
+      ok: certificationOcr ? certificationOcr.ok === true : true,
+      counts: certificationOcr
+        ? {
+            scannedFileCount: certificationOcr.ocrSummary?.scannedFileCount,
+            autoFilledCount: certificationOcr.ocrSummary?.autoFilledCount,
+            suggestedCount: certificationOcr.ocrSummary?.suggestedCount,
+            needsManualCount: certificationOcr.ocrSummary?.needsManualCount,
+            conflictCount: certificationOcr.ocrSummary?.conflictCount
+          }
+        : undefined
     }
   ]);
 
@@ -2215,10 +2386,13 @@ export async function precheckProductPackage(rawInput: unknown) {
     readiness,
     fieldCoverage,
     submissionPreview,
+    certificationOcr,
     actionableIssues,
     unresolvedReferences: draft ? unresolvedReferences(draft) : undefined,
     uploadQueue,
     files: checkedFiles,
+    blockingInvalidFiles,
+    ignoredInvalidExtraFiles,
     draftCreateInput: draft,
     issues
   };
@@ -2234,7 +2408,10 @@ export async function precheckProductPackage(rawInput: unknown) {
       readiness,
       fieldCoverage,
       submissionPreview,
+      certificationOcr,
       actionableIssues,
+      blockingInvalidFiles,
+      ignoredInvalidExtraFiles,
       issues
     };
   }

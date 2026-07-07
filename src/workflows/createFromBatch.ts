@@ -5,6 +5,7 @@ import path from 'node:path';
 import * as z from 'zod/v4';
 import type { BackendClient } from '../backendClient.js';
 import { buildProtocolTrace, type ProtocolStage } from '../protocol.js';
+import { productOcrOptionsSchema } from '../ocr/certificationOcr.js';
 import { productCreateFromPackage, type UploadLocalFile } from './createFromPackage.js';
 import { batchWorkbookHash, loadBatchWorkbook, type BatchProductRow, type BatchRowIssue, type BatchRowSelection } from './batchWorkbook.js';
 import { prepareBatchMaterialPackage } from './batchMaterialPackage.js';
@@ -17,6 +18,8 @@ export const productCreateFromBatchInputSchema = {
   runMode: z.enum(['prepare', 'preview', 'create']).default('preview'),
   confirm: z.boolean().optional().describe('Required true when runMode=create. One confirmation covers the full selected batch.'),
   clientRequestId: z.string().trim().min(1).optional().describe('Optional workflow idempotency key. Reuse the same value from preview to create.'),
+  ocrMode: z.enum(['off', 'suggest', 'apply']).default('apply').describe('Per-row certification OCR assistance before each package precheck.'),
+  ocrOptions: productOcrOptionsSchema,
   sheetName: z.string().trim().optional(),
   rowSelection: z
     .union([
@@ -129,20 +132,85 @@ function summarizeIssues(issues: BatchRowIssue[] | undefined): string {
   return rows.map((issue) => issue.message).join('；').slice(0, 900);
 }
 
+function humanText(value: unknown): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (typeof value === 'string') {
+    const text = value.trim();
+    return text && text !== '[object Object]' ? text : undefined;
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return undefined;
+}
+
+function issueSeverity(value: unknown): BatchRowIssue['severity'] {
+  return value === 'warning' || value === 'info' ? value : 'error';
+}
+
+function normalizePackageIssue(value: unknown): BatchRowIssue | undefined {
+  if (!isRecord(value)) return undefined;
+  const message = humanText(value.message) || humanText(value.summary) || humanText(value.error);
+  if (!message) return undefined;
+  const details: Record<string, unknown> = {};
+  for (const key of ['section', 'row', 'field', 'path', 'location', 'impact', 'suggestion', 'candidates']) {
+    if (value[key] !== undefined) details[key] = value[key];
+  }
+  return {
+    code: humanText(value.code) || 'ROW_WORKFLOW_ISSUE',
+    severity: issueSeverity(value.severity),
+    message,
+    blocking: value.blocking === undefined ? issueSeverity(value.severity) === 'error' : value.blocking !== false,
+    scope: 'row',
+    field: humanText(value.field),
+    details: Object.keys(details).length ? details : undefined
+  };
+}
+
+function collectIssueCandidates(value: unknown, output: unknown[], seen = new Set<unknown>()): void {
+  if (!value || typeof value !== 'object' || seen.has(value)) return;
+  seen.add(value);
+  const record = value as UnknownRecord;
+  for (const key of ['precheckIssues', 'actionableIssues', 'issues']) {
+    const items = record[key];
+    if (Array.isArray(items)) output.push(...items);
+  }
+  for (const key of ['referenceResolution', 'details', 'error']) {
+    if (record[key]) collectIssueCandidates(record[key], output, seen);
+  }
+}
+
+function extractPackageIssues(value: unknown): BatchRowIssue[] {
+  const candidates: unknown[] = [];
+  collectIssueCandidates(value, candidates);
+  const normalized = candidates.map(normalizePackageIssue).filter((issue): issue is BatchRowIssue => Boolean(issue));
+  const seen = new Set<string>();
+  return normalized.filter((issue) => {
+    const key = `${issue.code}\u0000${issue.message}\u0000${issue.field || ''}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function firstErrorCode(issues: BatchRowIssue[]): string | undefined {
+  return issues.find((issue) => issue.severity === 'error')?.code || issues[0]?.code;
+}
+
 function rowResultFromPackageResult(row: BatchProductRow, result: UnknownRecord, fallbackStatus: string): BatchRowResult {
   const ok = result.ok === true;
   const createResult = isRecord(result.createResult) ? result.createResult : undefined;
   const productId = stringValue(result.productId) || stringValue(result.id) || stringValue(createResult?.productId) || stringValue(createResult?.id);
+  const issues = extractPackageIssues(result);
   return {
     rowNumber: row.rowNumber,
     productNameCn: row.productNameCn,
     ok,
     status: ok ? fallbackStatus : fallbackStatus.replace('成功', '失败'),
-    code: stringValue(result.code),
-    message: stringValue(result.summary) || stringValue(result.message),
+    code: firstErrorCode(issues) || stringValue(result.code),
+    message: summarizeIssues(issues) || humanText(result.summary) || humanText(result.message),
     productId,
     workflowId: stringValue(result.workflowId),
-    clientRequestId: stringValue(result.clientRequestId)
+    clientRequestId: stringValue(result.clientRequestId),
+    issues: issues.length ? issues : undefined
   };
 }
 
@@ -173,7 +241,8 @@ function packageResult(result: UnknownRecord, responseMode: ProductCreateFromBat
     packagePath: row.packagePath,
     markdownPath: row.markdownPath,
     workflowId: row.workflowId,
-    clientRequestId: row.clientRequestId
+    clientRequestId: row.clientRequestId,
+    issues: row.issues?.slice(0, 10)
   }));
   if (responseMode === 'summary') {
     return {
@@ -374,7 +443,9 @@ export async function productCreateFromBatch(
         packagePath: prepared.packageDir,
         runMode: 'preview',
         responseMode: input.responseMode === 'debug' ? 'debug' : 'summary',
-        clientRequestId
+        clientRequestId,
+        ocrMode: input.ocrMode,
+        ocrOptions: input.ocrOptions
       },
       requestId,
       runtime
@@ -424,7 +495,9 @@ export async function productCreateFromBatch(
         runMode: 'create',
         confirm: true,
         responseMode: input.responseMode === 'debug' ? 'debug' : 'summary',
-        clientRequestId
+        clientRequestId,
+        ocrMode: input.ocrMode,
+        ocrOptions: input.ocrOptions
       },
       requestId,
       runtime
@@ -442,15 +515,17 @@ export async function productCreateFromBatch(
     });
     results.set(row.rowNumber, result);
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const issues = extractPackageIssues(error);
+      const message = summarizeIssues(issues) || (error instanceof Error ? error.message : humanText(error)) || 'Row workflow failed.';
       const result: BatchRowResult = {
         rowNumber: row.rowNumber,
         productNameCn: row.productNameCn,
         status: failureStatus,
         ok: false,
-        code: 'ROW_WORKFLOW_FAILED',
+        code: firstErrorCode(issues) || 'ROW_WORKFLOW_FAILED',
         message,
-        clientRequestId
+        clientRequestId,
+        issues: issues.length ? issues : undefined
       };
       await loaded.session
         .writeRowProgress(row.rowNumber, {

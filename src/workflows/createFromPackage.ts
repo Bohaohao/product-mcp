@@ -5,6 +5,7 @@ import path from 'node:path';
 import * as z from 'zod/v4';
 import type { BackendClient } from '../backendClient.js';
 import { precheckProductPackage } from '../packagePrecheck.js';
+import { productOcrCertifications, productOcrOptionsSchema } from '../ocr/certificationOcr.js';
 import { buildFieldCoverage, buildProtocolTrace, buildSubmissionPreview, toActionableIssues, type ProtocolStage } from '../protocol.js';
 import { productCheckNameDuplicate } from '../tools/productSearch.js';
 import { productCreate } from '../tools/createProduct.js';
@@ -21,6 +22,8 @@ export const productCreateFromPackageInputSchema = {
   runMode: z.enum(['preview', 'create']).default('preview').describe('preview does not upload or create; create requires confirm=true.'),
   confirm: z.boolean().optional().describe('Required true when runMode=create.'),
   clientRequestId: z.string().trim().max(100).optional(),
+  ocrMode: z.enum(['off', 'suggest', 'apply']).default('apply').describe('Certification OCR assistance before precheck. apply fills blank fields only.'),
+  ocrOptions: productOcrOptionsSchema,
   responseMode: z.enum(['summary', 'standard', 'debug']).default('summary'),
   includeDetailSections: z
     .array(z.enum(['base', 'medias', 'sales', 'parts', 'certifications']))
@@ -725,11 +728,44 @@ export async function productCreateFromPackage(
     );
   }
 
+  const certificationOcr =
+    input.ocrMode === 'off'
+      ? undefined
+      : await productOcrCertifications({
+          packagePath: input.packagePath,
+          markdownFileName: input.markdownFileName,
+          mode: input.ocrMode === 'apply' ? 'apply' : 'suggest',
+          ocrOptions: input.ocrOptions
+        });
+  if (certificationOcr) {
+    journal.snapshots = { ...(journal.snapshots || {}), certificationOcr };
+    addStage(journal, {
+      name: 'ocr_certifications',
+      ok: certificationOcr.ok === true,
+      summary: certificationOcr.ocrSummary?.wrote ? 'OCR filled blank certification fields.' : 'OCR returned certification suggestions.',
+      counts: certificationOcr.ocrSummary
+        ? {
+            scannedFileCount: certificationOcr.ocrSummary.scannedFileCount,
+            ocrSuccessCount: certificationOcr.ocrSummary.ocrSuccessCount,
+            ocrFailureCount: certificationOcr.ocrSummary.ocrFailureCount,
+            autoFilledCount: certificationOcr.ocrSummary.autoFilledCount,
+            suggestedCount: certificationOcr.ocrSummary.suggestedCount,
+            needsManualCount: certificationOcr.ocrSummary.needsManualCount,
+            conflictCount: certificationOcr.ocrSummary.conflictCount,
+            skippedByDatePolicyCount: certificationOcr.ocrSummary.skippedByDatePolicyCount
+          }
+        : undefined
+    });
+    await writeJournal(journal);
+  }
+
   const precheck = (await precheckProductPackage({
     packagePath: input.packagePath,
     markdownFileName: input.markdownFileName,
     includeDraft: true,
-    responseMode: 'standard'
+    responseMode: 'standard',
+    ocrMode: input.ocrMode === 'off' ? 'off' : 'suggest',
+    ocrOptions: input.ocrOptions
   })) as UnknownRecord;
   journal.snapshots = {
     ...(journal.snapshots || {}),
@@ -738,6 +774,7 @@ export async function productCreateFromPackage(
     precheckIssues: precheck.issues,
     precheckFieldCoverage: precheck.fieldCoverage,
     precheckSubmissionPreview: precheck.submissionPreview,
+    certificationOcr,
     draftCreateInput: precheck.draftCreateInput,
     uploadQueue: precheck.uploadQueue
   };
@@ -760,6 +797,7 @@ export async function productCreateFromPackage(
         precheck,
         ...precheckContext(precheck),
         readiness: precheck.readiness,
+        certificationOcr,
         fieldCoverage: precheck.fieldCoverage,
         submissionPreview: precheck.submissionPreview,
         actionableIssues: precheck.actionableIssues || toActionableIssues(Array.isArray(precheck.issues) ? precheck.issues : [])
@@ -830,6 +868,7 @@ export async function productCreateFromPackage(
         readiness: precheck.readiness,
         duplicateCheck,
         referenceResolution,
+        certificationOcr,
         ...precheckContext(precheck),
         fieldCoverage: buildFieldCoverage(previewDraft),
         submissionPreview: preview,
@@ -869,6 +908,7 @@ export async function productCreateFromPackage(
       {
         duplicateCheck,
         referenceResolution,
+        certificationOcr,
         ...precheckContext(precheck),
         uploadSummary: uploadResult.uploadSummary,
         uploadErrors: uploadResult.failures,
@@ -950,6 +990,7 @@ export async function productCreateFromPackage(
       },
       duplicateCheck,
       referenceResolution,
+      certificationOcr,
       ...precheckContext(precheck),
       uploadSummary: uploadResult.uploadSummary,
       createResult,

@@ -18,6 +18,8 @@ interface FrontendValidationOptions {
   skipSalesValidation?: boolean;
 }
 
+export interface CreateReadinessValidationOptions extends FrontendValidationOptions {}
+
 function hasValue(value: unknown): boolean {
   if (value === undefined || value === null) return false;
   if (typeof value === 'string') return value.trim() !== '';
@@ -665,6 +667,20 @@ export function validateFrontendAlignedSubmission(
     validateSalesSupports(input, issues);
   }
   return issues;
+}
+
+/**
+ * Shared business-readiness gate for preview/precheck/create.
+ *
+ * This intentionally validates frontend-aligned required business fields only.
+ * Upload URL resolution is enforced separately by validateResolvedUploads after
+ * Product MCP has replaced local-file binding placeholders with OSS URLs.
+ */
+export function validateCreateReadiness(
+  input: UnknownRecord,
+  options: CreateReadinessValidationOptions = {}
+): SubmissionValidationIssue[] {
+  return validateFrontendAlignedSubmission(input, options);
 }
 
 const URL_PLACEHOLDER_PATTERNS = [

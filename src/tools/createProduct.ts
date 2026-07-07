@@ -2,7 +2,7 @@ import * as z from 'zod/v4';
 import type { BackendClient } from '../backendClient.js';
 import { ProductMcpError } from '../errors.js';
 import { buildFieldCoverage, buildProtocolTrace, buildSubmissionPreview, toActionableIssues } from '../protocol.js';
-import { throwValidationIssues, validateFrontendAlignedSubmission, validateResolvedUploads } from '../submissionValidation.js';
+import { throwValidationIssues, validateCreateReadiness, validateResolvedUploads } from '../submissionValidation.js';
 
 const idSchema = z.union([z.string().trim().min(1), z.number()]);
 const optionalIdSchema = idSchema.optional();
@@ -871,7 +871,7 @@ export async function productCreate(backend: BackendClient, rawInput: unknown, r
             field: 'confirm'
           }
         ]),
-    ...validateFrontendAlignedSubmission(input as unknown as Record<string, unknown>),
+    ...validateCreateReadiness(input as unknown as Record<string, unknown>),
     ...validateResolvedUploads(input as unknown as Record<string, unknown>)
   ];
   throwValidationIssues('商品创建参数未通过前端硬拦截校验。', validationIssues);

@@ -302,6 +302,30 @@ function toMarkdownRelativePath(packageDir: string, absolutePath: string): strin
   return relative.startsWith('.') ? relative : `./${relative}`;
 }
 
+function normalizeMaterialRelativePath(value: string): string {
+  return value.trim().replace(/\\/g, '/').replace(/^\.\//, '').toLowerCase();
+}
+
+function extractReferencedMaterialPaths(markdown: string | undefined): Set<string> {
+  const paths = new Set<string>();
+  if (!markdown) return paths;
+
+  const pathHeaders = new Set(['文件路径', '主图路径', '图片路径', '附件路径', '文件路径或内容']);
+  for (const table of parseMarkdownTables(markdown)) {
+    for (const row of table.rows) {
+      for (const header of table.headers) {
+        if (!pathHeaders.has(header)) continue;
+        const value = stringifyCell(row[header]);
+        if (!value || /^https?:\/\//i.test(value) || value.startsWith('{{')) continue;
+        if (!/[\\/]/.test(value) && !/\.[a-z0-9]{2,5}$/i.test(value)) continue;
+        paths.add(normalizeMaterialRelativePath(value));
+      }
+    }
+  }
+
+  return paths;
+}
+
 async function collectMaterialFiles(packageDir: string, markdownFileName: string): Promise<FileInventoryItem[]> {
   const files: FileInventoryItem[] = [];
   const ignoredDirs = new Set(['.git', '.generated', 'node_modules']);
@@ -369,6 +393,39 @@ function pathSuggestsCertification(file: FileInventoryItem): boolean {
   return includesAny(file.lowerSearchText, ['认证', '证书', '检测', '报告', 'certificate', 'certification', 'ce', 'fcc', 'iso', 'rohs']);
 }
 
+function certificationKey(file: FileInventoryItem): string {
+  const withoutCertificateWords = file.baseName.replace(
+    /(证书|认证|检测报告|检测|报告|certificate|certification|cert|report)/gi,
+    ' '
+  );
+  const withoutAuxiliarySuffix = withoutCertificateWords.replace(
+    /(?:[-_\s]*(?:main|cover|front|preview|thumb|thumbnail|page[-_\s]*\d+|p\d+|render(?:ed)?|screenshot|scan|主图|封面图?|首页|第一页|渲染图|截图))+$/gi,
+    ''
+  );
+  const normalized = withoutAuxiliarySuffix
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_\-./()（）]+/g, '');
+  return normalized || file.baseName.trim().toLowerCase().replace(/[\s_\-./()（）]+/g, '');
+}
+
+function certificationDisplayName(file: FileInventoryItem): string {
+  const cleaned = file.baseName
+    .replace(/(证书|认证|检测报告|检测|报告|certificate|certification|cert|report)/gi, '')
+    .replace(/(?:[-_\s]*(?:main|cover|front|preview|thumb|thumbnail|page[-_\s]*\d+|p\d+|render(?:ed)?|screenshot|scan|主图|封面图?|首页|第一页|渲染图|截图))+$/gi, '')
+    .trim();
+  return cleaned || file.baseName;
+}
+
+function isCertificateAuxiliaryImage(file: FileInventoryItem): boolean {
+  if (!isImage(file)) return false;
+  const base = file.baseName.toLowerCase();
+  return (
+    /(^|[-_\s])(main|cover|front|preview|thumb|thumbnail|page[-_\s]*\d+|p\d+|render(?:ed)?|screenshot|scan)([-_\s]|$)/i.test(base) ||
+    /(主图|封面图?|首页|第一页|渲染图|截图)/.test(file.baseName)
+  );
+}
+
 function pathSuggestsCase(file: FileInventoryItem): boolean {
   return includesAny(file.lowerSearchText, ['案例', '客户', 'case', 'customer']);
 }
@@ -422,7 +479,12 @@ function increment(counts: Record<string, number>, key: string): void {
   counts[key] = (counts[key] || 0) + 1;
 }
 
-function classifyMaterialFiles(files: FileInventoryItem[], productNameCn: string, sourceClassification = ''): ClassifiedMaterialRows {
+function classifyMaterialFiles(
+  files: FileInventoryItem[],
+  productNameCn: string,
+  sourceClassification = '',
+  boundRelativePaths: Set<string> = new Set()
+): ClassifiedMaterialRows {
   const classified: ClassifiedMaterialRows = {
     productImages: [],
     productMedia: [],
@@ -441,6 +503,7 @@ function classifyMaterialFiles(files: FileInventoryItem[], productNameCn: string
   const singletonImageLabels = new Set(['商品主图', 'Banner 图']);
   const usedSingletonImageLabels = new Set<string>();
   const certRowsByName = new Map<string, Record<string, string>>();
+  const certImageCandidatesByName = new Map<string, FileInventoryItem[]>();
   const caseRowsByCustomer = new Map<string, Record<string, string>>();
   const partRowsByKindAndName = new Map<string, Record<string, string>>();
 
@@ -480,14 +543,43 @@ function classifyMaterialFiles(files: FileInventoryItem[], productNameCn: string
     increment(classified.counts, 'productImages');
   };
 
+  const attachCertificationMainImage = (key: string, row: Record<string, string>) => {
+    if (row['主图路径']) return;
+    const candidates = certImageCandidatesByName.get(key);
+    if (!candidates?.length) return;
+    const preferred = candidates.sort((a, b) => Number(!isCertificateAuxiliaryImage(a)) - Number(!isCertificateAuxiliaryImage(b)))[0];
+    row['主图路径'] = preferred.relativePath;
+    increment(classified.counts, 'certificationImagesBound');
+  };
+
+  const rememberCertificationImage = (file: FileInventoryItem) => {
+    const key = certificationKey(file);
+    const existingRow = certRowsByName.get(key);
+    if (existingRow?.['文件路径'] && !existingRow['主图路径']) {
+      existingRow['主图路径'] = file.relativePath;
+      increment(classified.counts, 'certificationImagesBound');
+      return;
+    }
+    const candidates = certImageCandidatesByName.get(key) || [];
+    candidates.push(file);
+    certImageCandidatesByName.set(key, candidates);
+    increment(classified.counts, 'certificationImageCandidates');
+  };
+
   const pushCertification = (file: FileInventoryItem) => {
-    const certName = file.baseName.replace(/(证书|认证|检测报告|检测|报告)/g, '').trim() || file.baseName;
-    const row = certRowsByName.get(certName) || { 证书名称: certName, 文件分类: '认证资料' };
-    if (isPdf(file)) row['文件路径'] = file.relativePath;
-    else if (isImage(file)) row['主图路径'] = file.relativePath;
-    else return;
-    certRowsByName.set(certName, row);
-    increment(classified.counts, 'certifications');
+    if (isImage(file)) {
+      rememberCertificationImage(file);
+      return;
+    }
+    if (!isPdf(file)) return;
+
+    const key = certificationKey(file);
+    const created = !certRowsByName.has(key);
+    const row = certRowsByName.get(key) || { 证书名称: certificationDisplayName(file), 文件分类: '认证资料' };
+    row['文件路径'] = file.relativePath;
+    certRowsByName.set(key, row);
+    attachCertificationMainImage(key, row);
+    if (created) increment(classified.counts, 'certifications');
   };
 
   const pushCase = (file: FileInventoryItem) => {
@@ -520,6 +612,11 @@ function classifyMaterialFiles(files: FileInventoryItem[], productNameCn: string
   };
 
   for (const file of files) {
+    if (boundRelativePaths.has(normalizeMaterialRelativePath(file.relativePath))) {
+      increment(classified.counts, 'alreadyBoundFilesSkipped');
+      continue;
+    }
+
     if (pathSuggestsCertification(file)) {
       pushCertification(file);
       continue;
@@ -820,7 +917,8 @@ export async function prepareBatchMaterialPackages(rawInput: unknown): Promise<B
       const regionRows = regionRowsFromRow(row);
       const sourceClassification = sourceClassificationFromRecord(row);
       const inventory = await collectMaterialFiles(packageDir, input.markdownFileName);
-      const classified = classifyMaterialFiles(inventory, productNameCn, sourceClassification);
+      const boundRelativePaths = extractReferencedMaterialPaths(existingMarkdown);
+      const classified = classifyMaterialFiles(inventory, productNameCn, sourceClassification, boundRelativePaths);
       issues.push(...classified.issues.map((issue) => ({ ...issue, rowIndex, packageDir })));
 
       const hasGrossWeight = findCell(row, ['包装重量 kg', '包装重量', '毛重', '毛重 kg', 'grossWeight', 'grossWeightKg', 'packWeight', 'packageWeight']).found;

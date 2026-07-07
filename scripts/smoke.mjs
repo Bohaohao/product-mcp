@@ -9,6 +9,8 @@ import { parsePages } from '../dist/chromePages.js';
 import { ProductMcpError } from '../dist/errors.js';
 import { createProductMcpExpressApp } from '../dist/server.js';
 import { ProductTokenDaemonClient } from '../dist/tokenDaemonClient.js';
+import { precheckProductPackage } from '../dist/packagePrecheck.js';
+import { productOcrCertifications } from '../dist/ocr/certificationOcr.js';
 import { productCreate } from '../dist/tools/createProduct.js';
 import { productCreateFromPackage } from '../dist/workflows/createFromPackage.js';
 
@@ -702,6 +704,141 @@ async function createWorkflowPackage() {
   return dir;
 }
 
+async function createCertificationOcrPackage(options = {}) {
+  const dir = await createWorkflowPackage();
+  await mkdir(path.join(dir, '认证'), { recursive: true });
+  const pdfName = options.pdfName || 'Excavator CE.pdf';
+  await writeFile(path.join(dir, '认证', pdfName), Buffer.from('%PDF-1.4\n% smoke OCR certificate\n'));
+  const markdownPath = path.join(dir, '商品资料.md');
+  const markdown = await readFile(markdownPath, 'utf8');
+  await writeFile(
+    markdownPath,
+    `${markdown}
+
+## 7. 认证资料
+
+| 证书名称 | 证书类型 | 证书编号 | 覆盖区域 | 覆盖区域ID | 适用范围 | 适用特定型号 | 适用特定型号ID | 生效日期 | 到期日期 | 是否永久有效 | 文件路径 | 主图路径 | 文件分类 | 状态 | 排序 | 备注 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| CE 认证 |  |  |  |  | 全部型号 |  |  |  |  |  | ./认证/${pdfName} |  | 认证资料 | 有效 | 1 | smoke OCR |
+`,
+    'utf8'
+  );
+  return { dir, markdownPath, pdfName };
+}
+
+async function createFakeOcrCommands(root) {
+  const renderPath = path.join(root, 'fake-render.mjs');
+  const ocrPath = path.join(root, 'fake-ocr.mjs');
+  await writeFile(
+    renderPath,
+    `import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+const input = JSON.parse(readFileSync(0, 'utf8'));
+mkdirSync(input.outputPath.replace(/[\\\\/][^\\\\/]+$/, ''), { recursive: true });
+writeFileSync(input.outputPath, 'rendered page ' + input.page);
+`,
+    'utf8'
+  );
+  await writeFile(
+    ocrPath,
+    `import { readFileSync } from 'node:fs';
+const input = JSON.parse(readFileSync(0, 'utf8'));
+const source = String(input.sourcePath || input.filePath || '');
+const page = Number(input.page || 1);
+let text = '';
+let confidence = 0.96;
+if (source.includes('LOW.pdf')) {
+  text = 'Certificate No: LOW-12345 CE';
+  confidence = 0.55;
+} else if (page === 1) {
+  text = 'CE Certificate Certificate No: CE-2026-001 Region: European Union';
+} else if (page === 2) {
+  text = 'Issued by: SGS Date of Issue: 2026-01-02 Expiry Date: 2028-01-02';
+} else {
+  text = '';
+  confidence = 0.4;
+}
+process.stdout.write(JSON.stringify({ text, confidence }));
+`,
+    'utf8'
+  );
+  return {
+    ocrCommand: `"${process.execPath}" "${ocrPath}"`,
+    renderCommand: `"${process.execPath}" "${renderPath}"`
+  };
+}
+
+async function withFakeOcr(root, run) {
+  const oldOcr = process.env.PRODUCT_OCR_COMMAND;
+  const oldRender = process.env.PRODUCT_PDF_RENDER_COMMAND;
+  const commands = await createFakeOcrCommands(root);
+  process.env.PRODUCT_OCR_COMMAND = commands.ocrCommand;
+  process.env.PRODUCT_PDF_RENDER_COMMAND = commands.renderCommand;
+  try {
+    return await run();
+  } finally {
+    if (oldOcr === undefined) delete process.env.PRODUCT_OCR_COMMAND;
+    else process.env.PRODUCT_OCR_COMMAND = oldOcr;
+    if (oldRender === undefined) delete process.env.PRODUCT_PDF_RENDER_COMMAND;
+    else process.env.PRODUCT_PDF_RENDER_COMMAND = oldRender;
+  }
+}
+
+async function assertCertificationOcrSmoke() {
+  const root = await mkdtemp(path.join(tmpdir(), 'product-mcp-ocr-'));
+  try {
+    await withFakeOcr(root, async () => {
+      const fixture = await createCertificationOcrPackage();
+      const suggest = await productOcrCertifications({
+        packagePath: fixture.dir,
+        mode: 'suggest',
+        ocrOptions: { maxPdfPages: 3 }
+      });
+      const suggestText = stringifyResult(suggest);
+      assert(suggest.ok === true, 'certification OCR suggest should return ok');
+      assert(suggestText.includes('CE-2026-001'), 'certification OCR should extract visible certificate number');
+      assert(suggestText.includes('CE'), 'certification OCR should extract visible certificate type');
+      assert(/Excavator CE\.pdf.*第 1 页|第 1 页.*Excavator CE\.pdf/.test(suggestText), 'OCR suggestions should include page 1 source reference');
+      assert(/Expiry Date|到期日期|2028-01-02/.test(suggestText), 'OCR should inspect later PDF pages when useful');
+
+      const applied = await productOcrCertifications({
+        packagePath: fixture.dir,
+        mode: 'apply',
+        ocrOptions: { maxPdfPages: 3 }
+      });
+      assert(applied.ocrSummary.autoFilledCount >= 5, 'OCR apply should fill blank high-confidence certification fields');
+      const markdown = await readFile(fixture.markdownPath, 'utf8');
+      assert(markdown.includes('CE-2026-001'), 'OCR apply did not write certificate number');
+      assert(markdown.includes('SGS'), 'OCR apply did not write issuing authority');
+      assert(markdown.includes('2026-01-02'), 'OCR apply did not write effective date');
+      assert(markdown.includes('2028-01-02'), 'OCR apply did not write expiry date');
+      assert(markdown.includes('.generated/ocr/certifications/Excavator CE-page-1.png'), 'OCR apply did not write generated PDF main image path');
+
+      const keepBlankFixture = await createCertificationOcrPackage();
+      const keepBlank = await productOcrCertifications({
+        packagePath: keepBlankFixture.dir,
+        mode: 'apply',
+        ocrOptions: { maxPdfPages: 3, datePolicy: 'keepBlank' }
+      });
+      const keepBlankMarkdown = await readFile(keepBlankFixture.markdownPath, 'utf8');
+      assert(!keepBlankMarkdown.includes('2026-01-02'), 'datePolicy=keepBlank should not write effective date');
+      assert(!keepBlankMarkdown.includes('2028-01-02'), 'datePolicy=keepBlank should not write expiry date');
+      assert(stringifyResult(keepBlank).includes('skippedByDatePolicy'), 'date keep-blank policy should be traceable in OCR diff');
+
+      const lowFixture = await createCertificationOcrPackage({ pdfName: 'LOW.pdf' });
+      const low = await productOcrCertifications({
+        packagePath: lowFixture.dir,
+        mode: 'apply',
+        ocrOptions: { maxPdfPages: 1 }
+      });
+      const lowMarkdown = await readFile(lowFixture.markdownPath, 'utf8');
+      assert(!lowMarkdown.includes('LOW-12345'), 'low-confidence OCR should not be auto-written');
+      assert(stringifyResult(low).includes('suggested'), 'low-confidence OCR should remain a suggestion');
+    });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
 async function assertCreateFromPackageWorkflow() {
   const packageDir = await createWorkflowPackage();
   const tracePaths = [];
@@ -1009,6 +1146,11 @@ async function createBatchSmokeFixtures() {
   const validProductName = 'Workflow Unique Product';
   const missingProductName = 'Missing Package Product';
   const preparedProductName = 'Prepared Batch Product';
+  const certMissingProductName = 'Cert Missing Main Image Product';
+  const certInvalidImageProductName = 'Cert Invalid Main Image Product';
+  const certAutoPairProductName = 'Cert Auto Pair Product';
+  const certAuxOnlyProductName = 'Cert Auxiliary Images Only Product';
+  const certExtraInvalidProductName = 'Cert Extra Invalid Image Product';
   const sourcePackageDir = await createWorkflowPackage();
   const validPackageDir = path.join(materialsRoot, validProductName);
   await cp(sourcePackageDir, validPackageDir, { recursive: true });
@@ -1022,6 +1164,60 @@ async function createBatchSmokeFixtures() {
   await mkdir(path.join(preparedPackageDir, '实测视频'), { recursive: true });
   await writeFile(path.join(preparedPackageDir, '商品主图', 'main.png'), onePixelPng);
   await writeFile(path.join(preparedPackageDir, '实测视频', 'actual.mp4'), Buffer.from('not-a-real-video'));
+
+  const certMissingPackageDir = path.join(materialsRoot, certMissingProductName);
+  await cp(sourcePackageDir, certMissingPackageDir, { recursive: true });
+  await mkdir(path.join(certMissingPackageDir, '认证'), { recursive: true });
+  await writeFile(path.join(certMissingPackageDir, '认证', 'CE.pdf'), Buffer.from('%PDF-1.4\n% smoke certificate\n'));
+  const certMarkdownPath = path.join(certMissingPackageDir, '商品资料.md');
+  const certMarkdown = await readFile(certMarkdownPath, 'utf8');
+  await writeFile(
+    certMarkdownPath,
+    `${certMarkdown}
+
+## 7. 认证资料
+
+| 证书名称 | 证书类型 | 证书编号 | 覆盖区域 | 覆盖区域ID | 适用范围 | 适用特定型号 | 适用特定型号ID | 生效日期 | 到期日期 | 是否永久有效 | 文件路径 | 主图路径 | 文件分类 | 状态 | 排序 | 备注 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| CE 认证 | CE | CE-001 | 全球 |  | 全部型号 |  |  |  |  | 是 | ./认证/CE.pdf |  | 认证资料 | 有效 | 1 | smoke 缺主图 |
+`,
+    'utf8'
+  );
+
+  const certInvalidImagePackageDir = path.join(materialsRoot, certInvalidImageProductName);
+  await cp(sourcePackageDir, certInvalidImagePackageDir, { recursive: true });
+  await mkdir(path.join(certInvalidImagePackageDir, '认证'), { recursive: true });
+  await writeFile(path.join(certInvalidImagePackageDir, '认证', 'CE.pdf'), Buffer.from('%PDF-1.4\n% smoke certificate\n'));
+  await writeFile(path.join(certInvalidImagePackageDir, '认证', 'CE-main.jpg'), Buffer.from('not-a-valid-image'));
+  const certInvalidMarkdownPath = path.join(certInvalidImagePackageDir, '商品资料.md');
+  const certInvalidMarkdown = await readFile(certInvalidMarkdownPath, 'utf8');
+  await writeFile(
+    certInvalidMarkdownPath,
+    `${certInvalidMarkdown}
+
+## 7. 认证资料
+
+| 证书名称 | 证书类型 | 证书编号 | 覆盖区域 | 覆盖区域ID | 适用范围 | 适用特定型号 | 适用特定型号ID | 生效日期 | 到期日期 | 是否永久有效 | 文件路径 | 主图路径 | 文件分类 | 状态 | 排序 | 备注 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| CE 认证 | CE | CE-002 | 全球 |  | 全部型号 |  |  |  |  | 是 | ./认证/CE.pdf | ./认证/CE-main.jpg | 认证资料 | 有效 | 1 | smoke 坏主图 |
+`,
+    'utf8'
+  );
+
+  const certAutoPairPackageDir = path.join(materialsRoot, certAutoPairProductName);
+  await mkdir(path.join(certAutoPairPackageDir, '认证'), { recursive: true });
+  await writeFile(path.join(certAutoPairPackageDir, '认证', 'CE.pdf'), Buffer.from('%PDF-1.4\n% smoke certificate\n'));
+  await writeFile(path.join(certAutoPairPackageDir, '认证', 'CE-main.jpg'), onePixelPng);
+
+  const certAuxOnlyPackageDir = path.join(materialsRoot, certAuxOnlyProductName);
+  await mkdir(path.join(certAuxOnlyPackageDir, '认证'), { recursive: true });
+  await writeFile(path.join(certAuxOnlyPackageDir, '认证', 'main.jpg'), onePixelPng);
+  await writeFile(path.join(certAuxOnlyPackageDir, '认证', 'cover.jpg'), onePixelPng);
+
+  const certExtraInvalidPackageDir = path.join(materialsRoot, certExtraInvalidProductName);
+  await cp(sourcePackageDir, certExtraInvalidPackageDir, { recursive: true });
+  await mkdir(path.join(certExtraInvalidPackageDir, '认证'), { recursive: true });
+  await writeFile(path.join(certExtraInvalidPackageDir, '认证', 'unused-main.jpg'), Buffer.from('not-a-valid-image'));
 
   const createExcelPath = path.join(root, 'batch-create.xlsx');
   await writeBatchWorkbook(createExcelPath, [
@@ -1039,6 +1235,18 @@ async function createBatchSmokeFixtures() {
   const prepareExcelPath = path.join(root, 'batch-prepare.xlsx');
   await writeBatchWorkbook(prepareExcelPath, [createBatchWorkbookRow(preparedProductName)]);
 
+  const certMissingExcelPath = path.join(root, 'batch-cert-missing-main-image.xlsx');
+  await writeBatchWorkbook(certMissingExcelPath, [createBatchWorkbookRow(certMissingProductName)]);
+
+  const certInvalidImageExcelPath = path.join(root, 'batch-cert-invalid-main-image.xlsx');
+  await writeBatchWorkbook(certInvalidImageExcelPath, [createBatchWorkbookRow(certInvalidImageProductName)]);
+
+  const certAutoPairExcelPath = path.join(root, 'batch-cert-auto-pair.xlsx');
+  await writeBatchWorkbook(certAutoPairExcelPath, [createBatchWorkbookRow(certAutoPairProductName)]);
+
+  const certAuxOnlyExcelPath = path.join(root, 'batch-cert-aux-only.xlsx');
+  await writeBatchWorkbook(certAuxOnlyExcelPath, [createBatchWorkbookRow(certAuxOnlyProductName)]);
+
   return {
     root,
     packageDirs: [sourcePackageDir],
@@ -1046,9 +1254,20 @@ async function createBatchSmokeFixtures() {
     validProductName,
     missingProductName,
     preparedProductName,
+    certMissingProductName,
+    certInvalidImageProductName,
+    certAutoPairProductName,
+    certAuxOnlyProductName,
+    certExtraInvalidProductName,
     createExcelPath,
     formulaExcelPath,
-    prepareExcelPath
+    prepareExcelPath,
+    certMissingExcelPath,
+    certInvalidImageExcelPath,
+    certAutoPairExcelPath,
+    certAuxOnlyExcelPath,
+    certInvalidImagePackageDir,
+    certExtraInvalidPackageDir
   };
 }
 
@@ -1246,6 +1465,125 @@ async function assertBatchModeSmoke() {
     assert(!markdown.includes('| 作业视频 | ./实测视频/actual.mp4 |'), 'batch prepare must not subjectively rewrite 实测视频 to 作业视频');
     assert(markdown.includes('目标模板无同名分类，保留原始分类'), 'batch prepare should trace preserved nonstandard media categories');
 
+    const certAutoPairResult = await api.prepareProductBatchMarkdown({
+      excelPath: fixtures.certAutoPairExcelPath,
+      materialsRoot: fixtures.materialsRoot,
+      responseMode: 'debug'
+    });
+    const certAutoPairMarkdownPath = await existingPathFromResult(
+      certAutoPairResult,
+      fixtures.materialsRoot,
+      (value) => /\.md$/i.test(value) || value.endsWith('\u5546\u54c1\u8d44\u6599.md')
+    );
+    assert(certAutoPairMarkdownPath, 'batch prepare did not return certification auto-pair Markdown path');
+    const certAutoPairMarkdown = await readFile(certAutoPairMarkdownPath, 'utf8');
+    const certAutoPairRows = certAutoPairMarkdown
+      .split(/\r?\n/)
+      .filter((line) => line.includes('./认证/'));
+    assert(
+      certAutoPairRows.some((line) => line.includes('./认证/CE.pdf') && line.includes('./认证/CE-main.jpg')),
+      'CE-main.jpg should be bound to the CE.pdf certification row'
+    );
+    assert(
+      certAutoPairRows.filter((line) => line.includes('./认证/CE-main.jpg')).length === 1,
+      'CE-main.jpg must not be generated as an extra certification row'
+    );
+
+    const certAuxOnlyResult = await api.prepareProductBatchMarkdown({
+      excelPath: fixtures.certAuxOnlyExcelPath,
+      materialsRoot: fixtures.materialsRoot,
+      responseMode: 'debug'
+    });
+    const certAuxOnlyMarkdownPath = await existingPathFromResult(
+      certAuxOnlyResult,
+      fixtures.materialsRoot,
+      (value) => /\.md$/i.test(value) || value.endsWith('\u5546\u54c1\u8d44\u6599.md')
+    );
+    assert(certAuxOnlyMarkdownPath, 'batch prepare did not return auxiliary-only certification Markdown path');
+    const certAuxOnlyMarkdown = await readFile(certAuxOnlyMarkdownPath, 'utf8');
+    assert(!certAuxOnlyMarkdown.includes('./认证/main.jpg'), 'main.jpg without a certificate anchor must not create a certification row');
+    assert(!certAuxOnlyMarkdown.includes('./认证/cover.jpg'), 'cover.jpg without a certificate anchor must not create a certification row');
+
+    const certInvalidPrecheck = await precheckProductPackage({
+      packagePath: fixtures.certInvalidImagePackageDir,
+      responseMode: 'debug'
+    });
+    const certInvalidPrecheckText = stringifyResult(certInvalidPrecheck);
+    assert(certInvalidPrecheck.ok === false, 'precheck should fail when certification main image is invalid');
+    assert(certInvalidPrecheckText.includes('REQUIRED_FILE_INVALID'), 'invalid certification main image should be a blocking file error');
+    assert(
+      /认证资料第\s+\d+\s+行\s*\/\s*主图路径.*CE-main\.jpg/.test(certInvalidPrecheckText),
+      'invalid certification main image should locate row, field and file name'
+    );
+    assert(
+      certInvalidPrecheckText.includes('blockingInvalidFiles') && !certInvalidPrecheckText.includes('"ignoredInvalidExtraFiles":[{"'),
+      'invalid explicit certification main image should be grouped as blocking, not ignored extra'
+    );
+
+    const certExtraInvalidPrecheck = await precheckProductPackage({
+      packagePath: fixtures.certExtraInvalidPackageDir,
+      responseMode: 'debug'
+    });
+    const certExtraInvalidText = stringifyResult(certExtraInvalidPrecheck);
+    assert(certExtraInvalidPrecheck.ok === true, 'unreferenced invalid certification image should not block precheck');
+    assert(certExtraInvalidText.includes('OPTIONAL_FILE_INVALID'), 'unreferenced invalid certification image should be reported as optional invalid file');
+    assert(certExtraInvalidText.includes('ignoredInvalidExtraFiles'), 'unreferenced invalid certification image should be grouped as ignored extra');
+    assert(!stringifyResult(certExtraInvalidPrecheck.uploadQueue || []).includes('unused-main.jpg'), 'unreferenced invalid certification image must not enter uploadQueue');
+
+    const certMissingPreviewBackend = createWorkflowBackendStub({ allowCreate: true });
+    let certMissingUploadCalled = false;
+    const certMissingPreview = await api.runProductBatchFromExcel(
+      certMissingPreviewBackend,
+      {
+        excelPath: fixtures.certMissingExcelPath,
+        materialsRoot: fixtures.materialsRoot,
+        runMode: 'preview',
+        responseMode: 'debug'
+      },
+      'smoke-batch-cert-missing-main-image-preview',
+      {
+        async uploadLocalFile() {
+          certMissingUploadCalled = true;
+          throw new Error('batch preview with missing certification main image must not upload');
+        }
+      }
+    );
+    const certMissingText = stringifyResult(certMissingPreview);
+    assert(certMissingPreview.ok === false, 'batch preview should fail when certification main image is missing');
+    assert(certMissingText.includes('CERT_MAIN_IMAGE_REQUIRED'), 'batch preview should expose CERT_MAIN_IMAGE_REQUIRED');
+    assert(/认证资料第\s+\d+\s+行.*(缺少主图|必须上传主图|主图路径)/.test(certMissingText), 'batch preview should locate the missing certification main image row');
+    assert(!certMissingText.includes('[object Object]'), 'batch preview row error should not contain [object Object]');
+    assert(!certMissingText.includes('ROW_WORKFLOW_FAILED'), 'batch preview validation error should not collapse to ROW_WORKFLOW_FAILED');
+    assert(certMissingUploadCalled === false, 'batch preview with missing certification main image called upload');
+    assert(certMissingPreviewBackend.createPostCount === 0, 'batch preview with missing certification main image called create');
+
+    const certInvalidPreviewBackend = createWorkflowBackendStub({ allowCreate: true });
+    let certInvalidUploadCalled = false;
+    const certInvalidPreview = await api.runProductBatchFromExcel(
+      certInvalidPreviewBackend,
+      {
+        excelPath: fixtures.certInvalidImageExcelPath,
+        materialsRoot: fixtures.materialsRoot,
+        runMode: 'preview',
+        responseMode: 'debug'
+      },
+      'smoke-batch-cert-invalid-main-image-preview',
+      {
+        async uploadLocalFile() {
+          certInvalidUploadCalled = true;
+          throw new Error('batch preview with invalid certification main image must not upload');
+        }
+      }
+    );
+    const certInvalidText = stringifyResult(certInvalidPreview);
+    assert(certInvalidPreview.ok === false, 'batch preview should fail when certification main image file is invalid');
+    assert(certInvalidText.includes('REQUIRED_FILE_INVALID'), 'batch preview should expose invalid explicit certification image as blocking');
+    assert(/认证资料第\s+\d+\s+行\s*\/\s*主图路径.*CE-main\.jpg/.test(certInvalidText), 'batch preview should locate invalid certification main image row and file');
+    assert(!certInvalidText.includes('[object Object]'), 'batch preview invalid file error should not contain [object Object]');
+    assert(!certInvalidText.includes('ROW_WORKFLOW_FAILED'), 'batch preview invalid file error should not collapse to ROW_WORKFLOW_FAILED');
+    assert(certInvalidUploadCalled === false, 'batch preview with invalid certification main image called upload');
+    assert(certInvalidPreviewBackend.createPostCount === 0, 'batch preview with invalid certification main image called create');
+
     const previewBackend = createWorkflowBackendStub({ allowCreate: true });
     let previewUploadCalled = false;
     const previewResult = await api.runProductBatchFromExcel(
@@ -1390,6 +1728,7 @@ async function main() {
   await assertPartListUnitStaysString();
   await assertPreviewOnlySkipsCreate();
   await assertCreateFromPackageWorkflow();
+  await assertCertificationOcrSmoke();
   await assertBatchModeSmoke();
   await assertTokenDaemonClientAndBridge();
 

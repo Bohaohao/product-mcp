@@ -39,6 +39,7 @@ import {
 } from './upload/policies.js';
 import { defaultUploadBackendConfig, getOssStsToken, uploadLocalFileToOss } from './upload/ossUploader.js';
 import { precheckProductPackage, productPrecheckPackageInputSchema } from './packagePrecheck.js';
+import { productOcrCertifications, productOcrCertificationsInputSchema } from './ocr/certificationOcr.js';
 import { productCreateFromPackage, productCreateFromPackageInputSchema } from './workflows/createFromPackage.js';
 import { productCreateFromBatch, productCreateFromBatchInputSchema } from './workflows/createFromBatch.js';
 import { prepareImageForUpload } from './upload/imagePreparer.js';
@@ -1301,6 +1302,10 @@ export class ProductTokenBridge {
     return await precheckProductPackage(input);
   }
 
+  async ocrCertifications(input: unknown) {
+    return await productOcrCertifications(input);
+  }
+
   private async getOssStsTokenWithCache(backendConfig: ReturnType<typeof defaultUploadBackendConfig>) {
     try {
       const browserToken = await this.getBrowserToken();
@@ -1438,6 +1443,27 @@ async function main(): Promise<void> {
         return textResult({
           ok: false,
           code: 'PRODUCT_PRECHECK_PACKAGE_FAILED',
+          message: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+  );
+
+  server.registerTool(
+    'product_ocr_certifications',
+    {
+      title: 'OCR product certification materials',
+      description:
+        'Run local OCR on certification PDFs/images in a 商品资料.md package. suggest mode returns traceable candidates only; apply mode fills blank certification fields with high-confidence local OCR results and never overwrites user-provided values.',
+      inputSchema: productOcrCertificationsInputSchema
+    },
+    async (input) => {
+      try {
+        return textResult(await bridge.ocrCertifications(input));
+      } catch (error) {
+        return textResult({
+          ok: false,
+          code: 'PRODUCT_OCR_CERTIFICATIONS_FAILED',
           message: error instanceof Error ? error.message : String(error)
         });
       }
