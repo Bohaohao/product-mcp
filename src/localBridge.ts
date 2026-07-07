@@ -40,6 +40,7 @@ import {
 import { defaultUploadBackendConfig, getOssStsToken, uploadLocalFileToOss } from './upload/ossUploader.js';
 import { precheckProductPackage, productPrecheckPackageInputSchema } from './packagePrecheck.js';
 import { productCreateFromPackage, productCreateFromPackageInputSchema } from './workflows/createFromPackage.js';
+import { productCreateFromBatch, productCreateFromBatchInputSchema } from './workflows/createFromBatch.js';
 import { prepareImageForUpload } from './upload/imagePreparer.js';
 import {
   ProductTokenDaemonClient,
@@ -1172,6 +1173,18 @@ export class ProductTokenBridge {
     );
   }
 
+  async createProductFromBatch(input: unknown, requestId: string): Promise<CallToolResult> {
+    return this.callBackendTool(
+      'product_create_from_batch',
+      requestId,
+      (backend) =>
+        productCreateFromBatch(backend, input, requestId, {
+          uploadLocalFile: (uploadInput) => this.uploadLocalFile(uploadInput)
+        }),
+      'product_create_from_batch runs the local Excel batch workflow inside Product MCP: row material preparation, per-row package workflow preview/create, progress write-back, and batch trace reporting.'
+    );
+  }
+
   private localBackendConfig(): ProductMcpConfig {
     return {
       port: 0,
@@ -1504,6 +1517,31 @@ async function main(): Promise<void> {
           isChromeRemoteDebuggingNotAllowedError(error)
         ) {
           return textResult(bridgeErrorPayload(error, config, 'PRODUCT_CREATE_FROM_PACKAGE_FAILED'));
+        }
+
+        return textResult(toErrorPayload(error, requestId));
+      }
+    }
+  );
+
+  server.registerTool(
+    'product_create_from_batch',
+    {
+      title: 'Create products from batch workbook',
+      description:
+        'High-level local workflow for Excel-driven batch product creation. It reads a standard import workbook, matches each row to a same-name material package folder, generates/updates 商品资料.md, writes row progress back to the workbook, and in create mode runs the full per-package workflow for each selected product. Create mode requires confirm=true.',
+      inputSchema: productCreateFromBatchInputSchema
+    },
+    async (input) => {
+      const requestId = createBridgeRequestId('product_create_from_batch');
+      try {
+        return await bridge.createProductFromBatch(input, requestId);
+      } catch (error) {
+        if (
+          isChromeDevtoolsMcpPreflightError(error) ||
+          isChromeRemoteDebuggingNotAllowedError(error)
+        ) {
+          return textResult(bridgeErrorPayload(error, config, 'PRODUCT_CREATE_FROM_BATCH_FAILED'));
         }
 
         return textResult(toErrorPayload(error, requestId));

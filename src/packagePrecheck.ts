@@ -12,6 +12,7 @@ import {
 import { prepareImageForUpload } from './upload/imagePreparer.js';
 import { buildFieldCoverage, buildProtocolTrace, buildSubmissionPreview, toActionableIssues } from './protocol.js';
 import { validateFrontendAlignedSubmission, type SubmissionValidationIssue } from './submissionValidation.js';
+import { validateMediaClassificationRow, type MediaClassificationKind } from './workflows/classificationBoundary.js';
 
 export const productPrecheckPackageInputSchema = {
   packagePath: z
@@ -380,6 +381,42 @@ function tableRows(tables: MarkdownTable[], headingIncludes: string, requiredHea
 
 function tableRowsAny(tables: MarkdownTable[], headingIncludesList: string[], requiredHeader: string): Array<Record<string, string>> {
   return headingIncludesList.flatMap((heading) => tableRows(tables, heading, requiredHeader));
+}
+
+function mediaClassificationPrecheckIssues(tables: MarkdownTable[]): PrecheckIssue[] {
+  const checks: Array<{
+    headingIncludes: string;
+    labelHeader: string;
+    pathHeader: string;
+    kind: MediaClassificationKind;
+  }> = [
+    { headingIncludes: '商品图片', labelHeader: '图片用途', pathHeader: '文件路径', kind: 'image' },
+    { headingIncludes: '商品视频、3D 与附件', labelHeader: '资料用途', pathHeader: '文件路径', kind: 'media' },
+    { headingIncludes: '图文详情', labelHeader: '资料用途', pathHeader: '文件路径或内容', kind: 'richText' }
+  ];
+
+  const issues: PrecheckIssue[] = [];
+  for (const check of checks) {
+    tableRows(tables, check.headingIncludes, check.labelHeader).forEach((row, index) => {
+      const issue = validateMediaClassificationRow({
+        kind: check.kind,
+        label: row[check.labelHeader],
+        pathValue: row[check.pathHeader],
+        remark: row['备注'],
+        fieldPath: `${check.headingIncludes}[${index + 1}].${check.labelHeader}`
+      });
+      if (!issue) return;
+      issues.push({
+        severity: 'error',
+        code: issue.code,
+        message: issue.message,
+        section: check.headingIncludes,
+        row: index + 1,
+        field: check.labelHeader
+      });
+    });
+  }
+  return issues;
 }
 
 /**
@@ -2040,6 +2077,7 @@ export async function precheckProductPackage(rawInput: unknown) {
   const { packageDir, markdownPath } = await resolveMarkdownPath(input);
   const markdown = await readFile(markdownPath, 'utf8');
   const tables = parseMarkdownTables(markdown);
+  issues.push(...mediaClassificationPrecheckIssues(tables));
   const draft = input.includeDraft ? parseDraft(markdown, tables, issues) : undefined;
   if (draft) {
     appendFrontendValidationIssues(

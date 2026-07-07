@@ -1,12 +1,11 @@
 import { createServer } from 'node:http';
 import { once } from 'node:events';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { parsePages } from '../dist/chromePages.js';
-import { ProductTokenBridge } from '../dist/localBridge.js';
 import { ProductMcpError } from '../dist/errors.js';
 import { createProductMcpExpressApp } from '../dist/server.js';
 import { ProductTokenDaemonClient } from '../dist/tokenDaemonClient.js';
@@ -629,13 +628,14 @@ function createWorkflowBackendStub(options = {}) {
 
 async function createWorkflowPackage() {
   const dir = await mkdtemp(path.join(tmpdir(), 'product-mcp-workflow-'));
-  await mkdir(path.join(dir, 'images'), { recursive: true });
+  await mkdir(path.join(dir, '商品主图'), { recursive: true });
+  await mkdir(path.join(dir, '细节图'), { recursive: true });
   const onePixelPng = Buffer.from(
     'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
     'base64'
   );
-  await writeFile(path.join(dir, 'images', 'main.png'), onePixelPng);
-  await writeFile(path.join(dir, 'images', 'detail.png'), onePixelPng);
+  await writeFile(path.join(dir, '商品主图', 'main.png'), onePixelPng);
+  await writeFile(path.join(dir, '细节图', 'detail.png'), onePixelPng);
   await writeFile(
     path.join(dir, '商品资料.md'),
     `# 商品资料
@@ -694,8 +694,8 @@ async function createWorkflowPackage() {
 
 | 图片用途 | 文件路径 | 数量/比例说明 | 标题 | 副标题 | 描述 | 语言 | 语言代码 | 原图文ID | 备注 |
 |---|---|---|---|---|---|---|---|---|---|
-| 商品主图 | ./images/main.png | 1:1 | 主图 |  |  |  |  |  |  |
-| 细节图 | ./images/detail.png | 1:1 | 细节 |  |  |  |  |  |  |
+| 商品主图 | ./商品主图/main.png | 1:1 | 主图 |  |  |  |  |  |  |
+| 细节图 | ./细节图/detail.png | 1:1 | 细节 |  |  |  |  |  |  |
 `,
     'utf8'
   );
@@ -826,6 +826,491 @@ async function assertCreateFromPackageWorkflow() {
   }
 }
 
+const BATCH_HEADER = Object.freeze({
+  productType: '\u4ea7\u54c1\u7c7b\u578b',
+  categoryFirstName: '\u6240\u5c5e\u4e00\u7ea7\u5206\u7c7b',
+  categorySecondName: '\u6240\u5c5e\u4e8c\u7ea7\u5206\u7c7b',
+  categoryThirdName: '\u6240\u5c5e\u4e09\u7ea7\u5206\u7c7b',
+  productNameCn: '\u4ea7\u54c1\u4e2d\u6587\u540d\u79f0',
+  productModel: '\u4ea7\u54c1\u578b\u53f7',
+  unitName: '\u5355\u4f4d',
+  status: '\u72b6\u6001',
+  supplierName: '\u6240\u5c5e\u4f9b\u5e94\u5546',
+  supplierCode: '\u4f9b\u8d27\u5546\u4ee3\u7801',
+  regionName: '\u9002\u7528\u533a\u57df\uff08\u4e0b\u62c9\u9009\u62e9\uff09',
+  level: '\u4ea7\u54c1\u7b49\u7ea7\uff08\u4e0b\u62c9\u9009\u62e9\uff09',
+  referenceCostCny: '\u53c2\u8003\u6210\u672c\u4ef7\u542b\u7a0e\uff08\uffe5\uff09',
+  referenceCostUsd: '\u53c2\u8003\u6210\u672c\u4ef7\uff08\uff04\uff09',
+  profitMargin: '\u5229\u6da6\u7387\uff08%\uff09',
+  packLength: '\u5305\u88c5\u5c3a\u5bf8-\u957f\uff08\u6beb\u7c73\uff09',
+  packWidth: '\u5305\u88c5\u5c3a\u5bf8-\u5bbd\uff08\u6beb\u7c73\uff09',
+  packHeight: '\u5305\u88c5\u5c3a\u5bf8-\u9ad8\uff08\u6beb\u7c73\uff09',
+  packWeight: '\u91cd\u91cf-\u6bdb\u91cd\uff08\u5343\u514b\uff09',
+  packingFee: '\u5305\u88c5\u8d39\uff08\u5143\uff09',
+  progress: '\u521b\u5efa\u8fdb\u5ea6',
+  resultMessage: '\u521b\u5efa\u7ed3\u679c\u8bf4\u660e',
+  productId: '\u5546\u54c1ID',
+  packagePath: '\u8d44\u6599\u5305\u8def\u5f84',
+  markdownPath: '\u5546\u54c1\u8d44\u6599\u8def\u5f84',
+  updatedAt: '\u6700\u540e\u66f4\u65b0\u65f6\u95f4',
+  workflowId: 'workflowId'
+});
+
+const BATCH_STANDARD_HEADERS = Object.freeze([
+  BATCH_HEADER.productType,
+  BATCH_HEADER.categoryFirstName,
+  BATCH_HEADER.categorySecondName,
+  BATCH_HEADER.categoryThirdName,
+  BATCH_HEADER.productNameCn,
+  BATCH_HEADER.productModel,
+  BATCH_HEADER.unitName,
+  BATCH_HEADER.status,
+  BATCH_HEADER.supplierName,
+  BATCH_HEADER.supplierCode,
+  BATCH_HEADER.regionName,
+  BATCH_HEADER.level,
+  BATCH_HEADER.referenceCostCny,
+  BATCH_HEADER.referenceCostUsd,
+  BATCH_HEADER.profitMargin,
+  BATCH_HEADER.packLength,
+  BATCH_HEADER.packWidth,
+  BATCH_HEADER.packHeight,
+  BATCH_HEADER.packWeight,
+  BATCH_HEADER.packingFee
+]);
+
+const BATCH_PROGRESS_HEADERS = Object.freeze([
+  BATCH_HEADER.progress,
+  BATCH_HEADER.resultMessage,
+  BATCH_HEADER.productId,
+  BATCH_HEADER.packagePath,
+  BATCH_HEADER.markdownPath,
+  BATCH_HEADER.updatedAt,
+  BATCH_HEADER.workflowId
+]);
+
+const BATCH_WORKBOOK_HEADERS = Object.freeze([...BATCH_STANDARD_HEADERS, ...BATCH_PROGRESS_HEADERS]);
+
+const BATCH_REQUIRED_EXPORTS = Object.freeze([
+  'productCreateFromBatch',
+  'readBatchWorkbookRows',
+  'prepareBatchMaterialPackage'
+]);
+
+const BATCH_MODULE_PATHS = Object.freeze({
+  workflow: '../dist/workflows/createFromBatch.js',
+  workbook: '../dist/workflows/batchWorkbook.js',
+  materialPackage: '../dist/workflows/batchMaterialPackage.js'
+});
+
+async function loadExcelJs() {
+  let excelModule;
+  try {
+    excelModule = await import('exceljs');
+  } catch (error) {
+    if (error?.code !== 'MODULE_NOT_FOUND') throw error;
+    excelModule = await import('exceljs/dist/exceljs.js');
+  }
+  return excelModule.default || excelModule;
+}
+
+async function writeBatchWorkbook(excelPath, rows) {
+  const ExcelJS = await loadExcelJs();
+  const workbook = new ExcelJS.Workbook();
+  const worksheet = workbook.addWorksheet('Batch');
+  worksheet.addRow(BATCH_WORKBOOK_HEADERS);
+  for (const row of rows) {
+    const excelRow = worksheet.addRow([]);
+    BATCH_WORKBOOK_HEADERS.forEach((header, index) => {
+      excelRow.getCell(index + 1).value = row[header] ?? '';
+    });
+  }
+  BATCH_WORKBOOK_HEADERS.forEach((header, index) => {
+    worksheet.getColumn(index + 1).width = Math.max(14, header.length + 4);
+  });
+  await writeFile(excelPath, Buffer.from(await workbook.xlsx.writeBuffer()));
+}
+
+async function openBatchWorkbook(excelPath) {
+  const ExcelJS = await loadExcelJs();
+  const workbook = new ExcelJS.Workbook();
+  await workbook.xlsx.load(await readFile(excelPath));
+  return workbook;
+}
+
+function excelValueToText(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value === 'object') {
+    if (Array.isArray(value.richText)) return value.richText.map((item) => item.text || '').join('');
+    if (value.text !== undefined) return String(value.text);
+    if (value.result !== undefined) return excelValueToText(value.result);
+    if (value.error !== undefined) return String(value.error);
+    if (value.formula !== undefined) return String(value.formula);
+  }
+  return String(value);
+}
+
+function cellText(cell) {
+  return excelValueToText(cell.value).trim();
+}
+
+function worksheetHeaderMap(worksheet) {
+  const headers = new Map();
+  const headerRow = worksheet.getRow(1);
+  for (let index = 1; index <= headerRow.cellCount; index += 1) {
+    const text = cellText(headerRow.getCell(index));
+    if (text) headers.set(text, index);
+  }
+  return headers;
+}
+
+function isFormulaErrorValue(value) {
+  return (
+    Boolean(value) &&
+    typeof value === 'object' &&
+    value.formula !== undefined &&
+    Boolean(value.result) &&
+    typeof value.result === 'object' &&
+    typeof value.result.error === 'string'
+  );
+}
+
+function createBatchWorkbookRow(productNameCn, overrides = {}) {
+  return {
+    [BATCH_HEADER.productType]: '\u670d\u52a1',
+    [BATCH_HEADER.categoryFirstName]: 'Construction Machinery',
+    [BATCH_HEADER.categorySecondName]: 'Excavator Parts',
+    [BATCH_HEADER.categoryThirdName]: '',
+    [BATCH_HEADER.productNameCn]: productNameCn,
+    [BATCH_HEADER.productModel]: '',
+    [BATCH_HEADER.unitName]: 'piece',
+    [BATCH_HEADER.status]: '\u4e0a\u67b6',
+    [BATCH_HEADER.supplierName]: 'Smoke Supplier',
+    [BATCH_HEADER.supplierCode]: '',
+    [BATCH_HEADER.regionName]: '\u5168\u7403',
+    [BATCH_HEADER.level]: '',
+    [BATCH_HEADER.referenceCostCny]: '',
+    [BATCH_HEADER.referenceCostUsd]: '',
+    [BATCH_HEADER.profitMargin]: '',
+    [BATCH_HEADER.packLength]: '',
+    [BATCH_HEADER.packWidth]: '',
+    [BATCH_HEADER.packHeight]: '',
+    [BATCH_HEADER.packWeight]: '',
+    [BATCH_HEADER.packingFee]: '',
+    ...overrides
+  };
+}
+
+async function createBatchSmokeFixtures() {
+  const root = await mkdtemp(path.join(tmpdir(), 'product-mcp-batch-'));
+  const materialsRoot = path.join(root, 'materials');
+  await mkdir(materialsRoot, { recursive: true });
+
+  const validProductName = 'Workflow Unique Product';
+  const missingProductName = 'Missing Package Product';
+  const preparedProductName = 'Prepared Batch Product';
+  const sourcePackageDir = await createWorkflowPackage();
+  const validPackageDir = path.join(materialsRoot, validProductName);
+  await cp(sourcePackageDir, validPackageDir, { recursive: true });
+
+  const onePixelPng = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
+    'base64'
+  );
+  const preparedPackageDir = path.join(materialsRoot, preparedProductName);
+  await mkdir(path.join(preparedPackageDir, '商品主图'), { recursive: true });
+  await mkdir(path.join(preparedPackageDir, '实测视频'), { recursive: true });
+  await writeFile(path.join(preparedPackageDir, '商品主图', 'main.png'), onePixelPng);
+  await writeFile(path.join(preparedPackageDir, '实测视频', 'actual.mp4'), Buffer.from('not-a-real-video'));
+
+  const createExcelPath = path.join(root, 'batch-create.xlsx');
+  await writeBatchWorkbook(createExcelPath, [
+    createBatchWorkbookRow(validProductName),
+    createBatchWorkbookRow(missingProductName)
+  ]);
+
+  const formulaExcelPath = path.join(root, 'batch-formula-error.xlsx');
+  await writeBatchWorkbook(formulaExcelPath, [
+    createBatchWorkbookRow('Formula Error Product', {
+      [BATCH_HEADER.productNameCn]: { formula: '1/0', result: { error: '#DIV/0!' } }
+    })
+  ]);
+
+  const prepareExcelPath = path.join(root, 'batch-prepare.xlsx');
+  await writeBatchWorkbook(prepareExcelPath, [createBatchWorkbookRow(preparedProductName)]);
+
+  return {
+    root,
+    packageDirs: [sourcePackageDir],
+    materialsRoot,
+    validProductName,
+    missingProductName,
+    preparedProductName,
+    createExcelPath,
+    formulaExcelPath,
+    prepareExcelPath
+  };
+}
+
+async function assertBatchDraftFixtureCoverage(fixtures) {
+  const workbook = await openBatchWorkbook(fixtures.createExcelPath);
+  const worksheet = workbook.getWorksheet('Batch') || workbook.worksheets[0];
+  const headers = worksheetHeaderMap(worksheet);
+  for (const header of BATCH_WORKBOOK_HEADERS) {
+    assert(headers.has(header), `batch fixture missing standard Excel header: ${header}`);
+  }
+  assert(
+    cellText(worksheet.getRow(2).getCell(headers.get(BATCH_HEADER.productNameCn))) === fixtures.validProductName,
+    'batch fixture valid product row was not written'
+  );
+  assert(
+    cellText(worksheet.getRow(3).getCell(headers.get(BATCH_HEADER.productNameCn))) === fixtures.missingProductName,
+    'batch fixture missing-package product row was not written'
+  );
+
+  const formulaWorkbook = await openBatchWorkbook(fixtures.formulaExcelPath);
+  const formulaSheet = formulaWorkbook.getWorksheet('Batch') || formulaWorkbook.worksheets[0];
+  const formulaHeaders = worksheetHeaderMap(formulaSheet);
+  const formulaValue = formulaSheet.getRow(2).getCell(formulaHeaders.get(BATCH_HEADER.productNameCn)).value;
+  assert(isFormulaErrorValue(formulaValue), 'batch formula-error fixture did not preserve an Excel formula error cell');
+
+  const prepareWorkbook = await openBatchWorkbook(fixtures.prepareExcelPath);
+  const prepareSheet = prepareWorkbook.getWorksheet('Batch') || prepareWorkbook.worksheets[0];
+  const prepareHeaders = worksheetHeaderMap(prepareSheet);
+  assert(
+    cellText(prepareSheet.getRow(2).getCell(prepareHeaders.get(BATCH_HEADER.productNameCn))) === fixtures.preparedProductName,
+    'batch prepare fixture did not include a product row for Markdown generation'
+  );
+}
+
+async function loadBatchSmokeApi() {
+  const missingModules = [];
+  const imported = {};
+  for (const [key, modulePath] of Object.entries(BATCH_MODULE_PATHS)) {
+    const moduleUrl = new URL(modulePath, import.meta.url);
+    try {
+      await stat(moduleUrl);
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        missingModules.push(modulePath);
+        continue;
+      }
+      throw error;
+    }
+    imported[key] = await import(moduleUrl.href);
+  }
+
+  if (missingModules.length) return { pending: true, missingModules };
+
+  const missingExports = [
+    ['workflow', 'productCreateFromBatch'],
+    ['workbook', 'readBatchWorkbookRows'],
+    ['materialPackage', 'prepareBatchMaterialPackage']
+  ].filter(([moduleKey, exportName]) => typeof imported[moduleKey]?.[exportName] !== 'function');
+
+  if (missingExports.length) {
+    throw new Error(
+      `Batch smoke modules are missing required exports: ${missingExports
+        .map(([moduleKey, exportName]) => `${BATCH_MODULE_PATHS[moduleKey]}.${exportName}`)
+        .join(', ')}`
+    );
+  }
+
+  return {
+    pending: false,
+    api: {
+      async parseProductBatchWorkbook(input) {
+        return imported.workbook.readBatchWorkbookRows({
+          workbookPath: input.workbookPath || input.excelPath,
+          sheetName: input.sheetName,
+          rowSelection: input.rowSelection
+        });
+      },
+      async prepareProductBatchMarkdown(input) {
+        const parsed = await imported.workbook.readBatchWorkbookRows({
+          workbookPath: input.workbookPath || input.excelPath,
+          sheetName: input.sheetName,
+          rowSelection: input.rowSelection
+        });
+        const results = [];
+        for (const row of parsed.rows) {
+          results.push(
+            await imported.materialPackage.prepareBatchMaterialPackage(row, input.materialsRoot, {
+              markdownFileName: input.markdownFileName,
+              dryRun: input.dryRun
+            })
+          );
+        }
+        return {
+          ok: results.every((result) => result.ok),
+          workbook: parsed,
+          results
+        };
+      },
+      async runProductBatchFromExcel(backend, input, requestId, runtime) {
+        return imported.workflow.productCreateFromBatch(
+          backend,
+          {
+            workbookPath: input.workbookPath || input.excelPath,
+            materialsRoot: input.materialsRoot,
+            runMode: input.runMode,
+            confirm: input.confirm,
+            sheetName: input.sheetName,
+            rowSelection: input.rowSelection,
+            concurrency: input.concurrency,
+            responseMode: input.responseMode
+          },
+          requestId,
+          runtime
+        );
+      }
+    }
+  };
+}
+
+function stringifyResult(value) {
+  return JSON.stringify(value, (_key, item) => (typeof item === 'bigint' ? String(item) : item));
+}
+
+function collectStrings(value, predicate, output = []) {
+  if (typeof value === 'string') {
+    if (predicate(value)) output.push(value);
+  } else if (Array.isArray(value)) {
+    value.forEach((item) => collectStrings(item, predicate, output));
+  } else if (value && typeof value === 'object') {
+    Object.values(value).forEach((item) => collectStrings(item, predicate, output));
+  }
+  return output;
+}
+
+async function existingPathFromResult(result, fallbackDir, predicate) {
+  for (const candidate of collectStrings(result, predicate)) {
+    const resolved = path.isAbsolute(candidate) ? candidate : path.resolve(fallbackDir, candidate);
+    try {
+      await stat(resolved);
+      return resolved;
+    } catch {
+      // Keep scanning result paths; the final assertion will report the missing artifact.
+    }
+  }
+  return undefined;
+}
+
+async function workbookPathAfterBatchRun(result, fallbackExcelPath) {
+  return (
+    (await existingPathFromResult(result, path.dirname(fallbackExcelPath), (value) => /\.xlsx$/i.test(value))) ||
+    fallbackExcelPath
+  );
+}
+
+async function assertBatchModeSmoke() {
+  const fixtures = await createBatchSmokeFixtures();
+  try {
+    await assertBatchDraftFixtureCoverage(fixtures);
+    const loaded = await loadBatchSmokeApi();
+    if (loaded.pending) {
+      console.warn(
+        `[smoke:batch] pending integration; missing batch module(s): ${loaded.missingModules.join(
+          ', '
+        )}. Expected exports: ${BATCH_REQUIRED_EXPORTS.join(', ')}. Draft xlsx fixtures were generated and validated.`
+      );
+      return;
+    }
+
+    const { api } = loaded;
+    const parsed = await api.parseProductBatchWorkbook({ excelPath: fixtures.createExcelPath, responseMode: 'debug' });
+    const parsedText = stringifyResult(parsed);
+    assert(parsedText.includes(fixtures.validProductName), 'batch parser did not recognize the valid standard-header row');
+    assert(parsedText.includes(fixtures.missingProductName), 'batch parser did not keep missing-package row for row-level failure');
+
+    const formulaResult = await api.parseProductBatchWorkbook({ excelPath: fixtures.formulaExcelPath, responseMode: 'debug' });
+    assert(
+      /FORMULA|formula|\u516c\u5f0f|#DIV\/0!/.test(stringifyResult(formulaResult)),
+      'batch parser did not report formula-error cells'
+    );
+
+    const prepareResult = await api.prepareProductBatchMarkdown({
+      excelPath: fixtures.prepareExcelPath,
+      materialsRoot: fixtures.materialsRoot,
+      responseMode: 'debug'
+    });
+    const markdownPath = await existingPathFromResult(
+      prepareResult,
+      fixtures.materialsRoot,
+      (value) => /\.md$/i.test(value) || value.endsWith('\u5546\u54c1\u8d44\u6599.md')
+    );
+    assert(markdownPath, 'batch prepare did not return a generated Markdown path');
+    const markdown = await readFile(markdownPath, 'utf8');
+    assert(markdown.includes(fixtures.preparedProductName), 'batch prepare Markdown did not include source product data');
+    assert(markdown.includes('| 实测视频 | ./实测视频/actual.mp4 |'), 'batch prepare should preserve direct-parent media category');
+    assert(!markdown.includes('| 作业视频 | ./实测视频/actual.mp4 |'), 'batch prepare must not subjectively rewrite 实测视频 to 作业视频');
+    assert(markdown.includes('目标模板无同名分类，保留原始分类'), 'batch prepare should trace preserved nonstandard media categories');
+
+    const previewBackend = createWorkflowBackendStub({ allowCreate: true });
+    let previewUploadCalled = false;
+    const previewResult = await api.runProductBatchFromExcel(
+      previewBackend,
+      {
+        excelPath: fixtures.createExcelPath,
+        materialsRoot: fixtures.materialsRoot,
+        runMode: 'preview',
+        responseMode: 'debug'
+      },
+      'smoke-batch-preview',
+      {
+        async uploadLocalFile() {
+          previewUploadCalled = true;
+          throw new Error('batch preview must not upload');
+        }
+      }
+    );
+    assert(/preview/i.test(stringifyResult(previewResult)), 'batch preview did not return preview metadata');
+    assert(previewUploadCalled === false, 'batch preview mode called upload');
+    assert(previewBackend.createPostCount === 0, 'batch preview mode called create');
+
+    const createBackend = createWorkflowBackendStub({ allowCreate: true });
+    const createResult = await api.runProductBatchFromExcel(
+      createBackend,
+      {
+        excelPath: fixtures.createExcelPath,
+        materialsRoot: fixtures.materialsRoot,
+        runMode: 'create',
+        confirm: true,
+        responseMode: 'debug'
+      },
+      'smoke-batch-create',
+      {
+        async uploadLocalFile(input) {
+          return {
+            ok: true,
+            url: `https://oss.example.test/${path.basename(input.localPath)}`,
+            objectKey: `smoke/${path.basename(input.localPath)}`
+          };
+        }
+      }
+    );
+    assert(createBackend.createPostCount === 1, 'batch create should create the valid row once');
+
+    const writebackPath = await workbookPathAfterBatchRun(createResult, fixtures.createExcelPath);
+    const workbook = await openBatchWorkbook(writebackPath);
+    const worksheet = workbook.getWorksheet('Batch') || workbook.worksheets[0];
+    const headers = worksheetHeaderMap(worksheet);
+    const productIdText = cellText(worksheet.getRow(2).getCell(headers.get(BATCH_HEADER.productId)));
+    const successProgressText = cellText(worksheet.getRow(2).getCell(headers.get(BATCH_HEADER.progress)));
+    const successMessageText = cellText(worksheet.getRow(2).getCell(headers.get(BATCH_HEADER.resultMessage)));
+    const failedProgressText = cellText(worksheet.getRow(3).getCell(headers.get(BATCH_HEADER.progress)));
+    const failedMessageText = cellText(worksheet.getRow(3).getCell(headers.get(BATCH_HEADER.resultMessage)));
+
+    assert(productIdText.includes('workflow-product-1'), 'batch create did not write 商品ID back to the workbook');
+    assert(successProgressText || successMessageText, 'batch create did not write progress/message for the success row');
+    assert(failedProgressText || failedMessageText, 'batch create did not write progress/message for the failed row');
+    assert(/fail|error|missing|\u5931\u8d25|\u7f3a/i.test(`${failedProgressText} ${failedMessageText}`), 'batch create did not record the missing-package row failure');
+  } finally {
+    await rm(fixtures.root, { recursive: true, force: true });
+    await Promise.all(fixtures.packageDirs.map((dir) => rm(dir, { recursive: true, force: true })));
+  }
+}
+
 async function assertTokenDaemonClientAndBridge() {
   const secret = 'smoke-secret';
   const { server, stats } = createFakeTokenDaemon(secret);
@@ -854,6 +1339,7 @@ async function assertTokenDaemonClientAndBridge() {
 
     process.env.PRODUCT_TOKEN_DAEMON_URL = url;
     process.env.PRODUCT_TOKEN_DAEMON_SECRET = secret;
+    const { ProductTokenBridge } = await import('../dist/localBridge.js');
     const bridge = new ProductTokenBridge({
       projectUrl: 'https://test.eysscm.com/erp/commodity/commodity',
       matchUrlPrefixes: ['https://test.eysscm.com/erp/commodity'],
@@ -900,11 +1386,12 @@ function assertChromePageParsing() {
 
 async function main() {
   assertChromePageParsing();
-  await assertTokenDaemonClientAndBridge();
   await assertCreateSucceedsWithoutEnglishName();
   await assertPartListUnitStaysString();
   await assertPreviewOnlySkipsCreate();
   await assertCreateFromPackageWorkflow();
+  await assertBatchModeSmoke();
+  await assertTokenDaemonClientAndBridge();
 
   const modelAliasResult = await productCreate(
     createSuccessBackendStub((body) => {
