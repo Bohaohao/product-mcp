@@ -11,6 +11,9 @@ import {
   validateMediaClassificationRow,
   type MediaClassificationKind
 } from './classificationBoundary.js';
+import { buildSourceCoverageAudit } from './sourceCoverageAudit.js';
+import { collectSourceInventory, sourceInventorySummary } from './sourceInventory.js';
+import { mapSourcesToStructuredRows } from './sourceTargetMapper.js';
 
 type UnknownRow = Record<string, unknown>;
 type IssueSeverity = 'error' | 'warning' | 'info';
@@ -47,6 +50,8 @@ export interface BatchMaterialRowResult {
   templateMode?: 'created' | 'updated' | 'rebuilt';
   fieldCount: number;
   classifiedCounts?: Record<string, number>;
+  sourceInventorySummary?: ReturnType<typeof sourceInventorySummary>;
+  sourceCoverageSummary?: ReturnType<typeof buildSourceCoverageAudit>['summary'];
   issues: BatchMaterialIssue[];
 }
 
@@ -89,6 +94,11 @@ interface ClassifiedMaterialRows {
   productMedia: Array<Record<string, string>>;
   detailCards: Array<Record<string, string>>;
   richTextMaterials: Array<Record<string, string>>;
+  advantageRows: Array<Record<string, string>>;
+  scenarioRows: Array<Record<string, string>>;
+  faqRows: Array<Record<string, string>>;
+  afterSalesRows: Array<Record<string, string>>;
+  warrantyRows: Array<Record<string, string>>;
   certifications: Array<Record<string, string>>;
   caseRows: Array<Record<string, string>>;
   caseMediaRows: Array<Record<string, string>>;
@@ -490,6 +500,11 @@ function classifyMaterialFiles(
     productMedia: [],
     detailCards: [],
     richTextMaterials: [],
+    advantageRows: [],
+    scenarioRows: [],
+    faqRows: [],
+    afterSalesRows: [],
+    warrantyRows: [],
     certifications: [],
     caseRows: [],
     caseMediaRows: [],
@@ -732,6 +747,37 @@ function buildTableMerges(classified: ClassifiedMaterialRows, regionRows: Array<
       labelHeader: '资料用途'
     },
     {
+      headingIncludes: '核心优势',
+      requiredHeaders: ['标题', '内容'],
+      rows: classified.advantageRows,
+      pathHeaders: ['图片路径'],
+      uniqueHeaders: ['标题']
+    },
+    {
+      headingIncludes: '应用场景',
+      requiredHeaders: ['标题', '内容'],
+      rows: classified.scenarioRows,
+      pathHeaders: ['图片路径'],
+      uniqueHeaders: ['标题']
+    },
+    {
+      headingIncludes: '常见问题',
+      requiredHeaders: ['问题', '回答'],
+      rows: classified.faqRows,
+      uniqueHeaders: ['问题']
+    },
+    {
+      headingIncludes: '售后服务承诺',
+      requiredHeaders: ['承诺事项', '说明'],
+      rows: classified.afterSalesRows,
+      uniqueHeaders: ['承诺事项']
+    },
+    {
+      requiredHeaders: ['政策标题', '政策内容'],
+      rows: classified.warrantyRows,
+      uniqueHeaders: ['政策标题']
+    },
+    {
       headingIncludes: '认证资料',
       requiredHeaders: ['证书名称', '文件路径', '主图路径'],
       rows: classified.certifications,
@@ -917,8 +963,18 @@ export async function prepareBatchMaterialPackages(rawInput: unknown): Promise<B
       const regionRows = regionRowsFromRow(row);
       const sourceClassification = sourceClassificationFromRecord(row);
       const inventory = await collectMaterialFiles(packageDir, input.markdownFileName);
+      const sourceInventory = await collectSourceInventory(packageDir, { markdownFileName: input.markdownFileName });
       const boundRelativePaths = extractReferencedMaterialPaths(existingMarkdown);
       const classified = classifyMaterialFiles(inventory, productNameCn, sourceClassification, boundRelativePaths);
+      const structuredRows = await mapSourcesToStructuredRows(sourceInventory, productNameCn);
+      classified.advantageRows.push(...structuredRows.advantageRows);
+      classified.scenarioRows.push(...structuredRows.scenarioRows);
+      classified.faqRows.push(...structuredRows.faqRows);
+      classified.afterSalesRows.push(...structuredRows.afterSalesRows);
+      classified.warrantyRows.push(...structuredRows.warrantyRows);
+      classified.caseRows.push(...structuredRows.caseRows);
+      classified.caseMediaRows.push(...structuredRows.caseMediaRows);
+      Object.assign(classified.counts, Object.fromEntries(Object.entries(structuredRows.counts).map(([key, value]) => [key, (classified.counts[key] || 0) + value])));
       issues.push(...classified.issues.map((issue) => ({ ...issue, rowIndex, packageDir })));
 
       const hasGrossWeight = findCell(row, ['包装重量 kg', '包装重量', '毛重', '毛重 kg', 'grossWeight', 'grossWeightKg', 'packWeight', 'packageWeight']).found;
@@ -943,6 +999,21 @@ export async function prepareBatchMaterialPackages(rawInput: unknown): Promise<B
       });
       issues.push(...templateIssuesToBatchIssues(applied.issues, rowIndex, productNameCn, packageDir));
       issues.push(...mediaClassificationIssues(applied.markdown, rowIndex, productNameCn, packageDir));
+      const sourceCoverage = buildSourceCoverageAudit({
+        sources: sourceInventory,
+        markdown: applied.markdown
+      });
+      issues.push(
+        ...sourceCoverage.issues.map((issue) => ({
+          severity: issue.severity,
+          code: issue.code,
+          message: issue.message,
+          rowIndex,
+          productNameCn,
+          packageDir,
+          field: issue.field
+        }))
+      );
 
       if (!input.dryRun) await writeFile(markdownPath, applied.markdown, 'utf8');
 
@@ -957,6 +1028,8 @@ export async function prepareBatchMaterialPackages(rawInput: unknown): Promise<B
         templateMode: applied.mode,
         fieldCount: Object.keys(fieldUpdates).length,
         classifiedCounts: classified.counts,
+        sourceInventorySummary: sourceInventorySummary(sourceInventory),
+        sourceCoverageSummary: sourceCoverage.summary,
         issues
       });
     } catch (error) {

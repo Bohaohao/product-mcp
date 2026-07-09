@@ -56,6 +56,8 @@ interface BatchRowResult {
   markdownPath?: string;
   workflowId?: string;
   clientRequestId?: string;
+  sourceMappingSummary?: unknown;
+  sourceCoverageReport?: unknown;
   issues?: BatchRowIssue[];
 }
 
@@ -210,6 +212,8 @@ function rowResultFromPackageResult(row: BatchProductRow, result: UnknownRecord,
     productId,
     workflowId: stringValue(result.workflowId),
     clientRequestId: stringValue(result.clientRequestId),
+    sourceMappingSummary: result.sourceMappingSummary,
+    sourceCoverageReport: result.sourceCoverageReport,
     issues: issues.length ? issues : undefined
   };
 }
@@ -242,6 +246,8 @@ function packageResult(result: UnknownRecord, responseMode: ProductCreateFromBat
     markdownPath: row.markdownPath,
     workflowId: row.workflowId,
     clientRequestId: row.clientRequestId,
+    sourceMappingSummary: row.sourceMappingSummary,
+    sourceCoverageReport: row.sourceCoverageReport,
     issues: row.issues?.slice(0, 10)
   }));
   if (responseMode === 'summary') {

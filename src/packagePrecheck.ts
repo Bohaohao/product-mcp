@@ -14,6 +14,8 @@ import { buildFieldCoverage, buildProtocolTrace, buildSubmissionPreview, toActio
 import { validateCreateReadiness, type SubmissionValidationIssue } from './submissionValidation.js';
 import { validateMediaClassificationRow, type MediaClassificationKind } from './workflows/classificationBoundary.js';
 import { productOcrCertifications, productOcrOptionsSchema } from './ocr/certificationOcr.js';
+import { buildSourceCoverageAudit } from './workflows/sourceCoverageAudit.js';
+import { collectSourceInventory, sourceInventorySummary } from './workflows/sourceInventory.js';
 
 export const productPrecheckPackageInputSchema = {
   packagePath: z
@@ -602,7 +604,7 @@ function collectSalesSupportEntries(tables: MarkdownTable[]): SalesSupportEntry[
     });
   }
 
-  tableRows(tables, '质保政策', '政策标题').forEach((row) => {
+  rowsByHeader(tables, '政策标题').forEach((row) => {
     addSalesEntry(entries, {
       draft: {
         type: 9,
@@ -1567,7 +1569,22 @@ function validateSalesSupportTables(tables: MarkdownTable[], issues: PrecheckIss
   validateTitleContentRows('异议处理', '异议', '异议', '处理方式');
   validateTitleContentRows('合规红线', '不可承诺事项', '不可承诺事项', '说明');
   validateTitleContentRows('售后服务承诺', '承诺事项', '承诺事项', '说明');
-  validateTitleContentRows('质保政策', '政策标题', '政策标题', '政策内容');
+  rowsByHeader(tables, '政策标题').forEach((row, index) => {
+    const rowNumber = index + 1;
+    const title = cleanCell(row['政策标题']);
+    const content = cleanCell(row['政策内容']);
+    const hasContent = Boolean(title || content || cleanCell(row['排序']) || cleanCell(row['备注']));
+    if (!hasContent) return;
+    if (!(title && content)) {
+      addIssue(issues, {
+        severity: 'error',
+        code: 'SALES_STRUCTURED_ROW_INCOMPLETE',
+        section: '质保政策',
+        row: rowNumber,
+        message: `质保政策第 ${rowNumber} 行必须同时填写政策标题和政策内容。`
+      });
+    }
+  });
 }
 
 function validateCustomerCaseTables(tables: MarkdownTable[], issues: PrecheckIssue[]): void {
@@ -2261,8 +2278,6 @@ export async function precheckProductPackage(rawInput: unknown) {
         })
       : undefined;
 
-  const errorCount = issues.filter((issue) => issue.severity === 'error').length;
-  const warningCount = issues.filter((issue) => issue.severity === 'warning').length;
   const blockingInvalidFiles = checkedFiles
     .filter((file) => !file.ok && isBlockingFileReference(file))
     .map((file) => invalidFileSummary(file, draftProductNameCn));
@@ -2297,6 +2312,24 @@ export async function precheckProductPackage(rawInput: unknown) {
         draftBinding: file.rowKey ? buildDraftBinding(policy.target, file.rowKey) : undefined
       };
     });
+  const sourceInventory = await collectSourceInventory(packageDir, { markdownFileName: input.markdownFileName });
+  const sourceCoverage = buildSourceCoverageAudit({
+    sources: sourceInventory,
+    markdown,
+    uploadQueue
+  });
+  issues.push(
+    ...sourceCoverage.issues.map((issue) => ({
+      severity: issue.severity,
+      code: issue.code,
+      section: issue.section,
+      field: issue.field,
+      path: issue.sourcePath,
+      message: issue.message
+    }))
+  );
+  const errorCount = issues.filter((issue) => issue.severity === 'error').length;
+  const warningCount = issues.filter((issue) => issue.severity === 'warning').length;
 
   const summary = {
     productNameCn: draft?.productNameCn,
@@ -2319,7 +2352,9 @@ export async function precheckProductPackage(rawInput: unknown) {
     validUploadCount: uploadQueue.length,
     invalidFileCount: checkedFiles.filter((file) => !file.ok).length,
     blockingInvalidFileCount: blockingInvalidFiles.length,
-    ignoredInvalidExtraFileCount: ignoredInvalidExtraFiles.length
+    ignoredInvalidExtraFileCount: ignoredInvalidExtraFiles.length,
+    sourceCoverageBlockedCount: sourceCoverage.summary.blockedCount,
+    sourceCoverageAmbiguousCount: sourceCoverage.summary.ambiguousCount
   };
   const fieldCoverage = draft ? buildFieldCoverage(draft) : undefined;
   const submissionPreview = draft ? buildSubmissionPreview(draft) : undefined;
@@ -2358,6 +2393,11 @@ export async function precheckProductPackage(rawInput: unknown) {
       counts: submissionPreview?.counts
     },
     {
+      name: 'source_coverage_audit',
+      ok: sourceCoverage.ok,
+      counts: sourceCoverage.summary
+    },
+    {
       name: 'ocr_certifications',
       ok: certificationOcr ? certificationOcr.ok === true : true,
       counts: certificationOcr
@@ -2386,6 +2426,14 @@ export async function precheckProductPackage(rawInput: unknown) {
     readiness,
     fieldCoverage,
     submissionPreview,
+    sourceInventorySummary: sourceInventorySummary(sourceInventory),
+    sourceMappingSummary: {
+      mappedCount: sourceCoverage.summary.mappedCount,
+      ignoredCount: sourceCoverage.summary.ignoredCount,
+      ambiguousCount: sourceCoverage.summary.ambiguousCount,
+      blockedCount: sourceCoverage.summary.blockedCount
+    },
+    sourceCoverageReport: input.responseMode === 'summary' ? sourceCoverage.report.slice(0, 100) : sourceCoverage.report,
     certificationOcr,
     actionableIssues,
     unresolvedReferences: draft ? unresolvedReferences(draft) : undefined,
@@ -2408,6 +2456,9 @@ export async function precheckProductPackage(rawInput: unknown) {
       readiness,
       fieldCoverage,
       submissionPreview,
+      sourceInventorySummary: result.sourceInventorySummary,
+      sourceMappingSummary: result.sourceMappingSummary,
+      sourceCoverageReport: result.sourceCoverageReport,
       certificationOcr,
       actionableIssues,
       blockingInvalidFiles,

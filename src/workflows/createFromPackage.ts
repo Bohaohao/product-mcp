@@ -578,7 +578,10 @@ function uploadQueueSummary(uploadQueue: unknown): UnknownRecord {
 function precheckContext(precheck: UnknownRecord): UnknownRecord {
   return {
     precheckIssues: precheck.issues,
-    uploadQueueSummary: uploadQueueSummary(precheck.uploadQueue)
+    uploadQueueSummary: uploadQueueSummary(precheck.uploadQueue),
+    sourceInventorySummary: precheck.sourceInventorySummary,
+    sourceMappingSummary: precheck.sourceMappingSummary,
+    sourceCoverageReport: precheck.sourceCoverageReport
   };
 }
 
@@ -648,6 +651,9 @@ function packageResult(result: UnknownRecord, responseMode: ProductCreateFromPac
     readiness: result.readiness,
     fieldCoverage: result.fieldCoverage,
     submissionPreview: result.submissionPreview,
+    sourceInventorySummary: result.sourceInventorySummary,
+    sourceMappingSummary: result.sourceMappingSummary,
+    sourceCoverageReport: result.sourceCoverageReport,
     duplicateCheck: result.duplicateCheck,
     referenceResolution: result.referenceResolution,
     uploadSummary: result.uploadSummary,
@@ -774,6 +780,9 @@ export async function productCreateFromPackage(
     precheckIssues: precheck.issues,
     precheckFieldCoverage: precheck.fieldCoverage,
     precheckSubmissionPreview: precheck.submissionPreview,
+    sourceInventorySummary: precheck.sourceInventorySummary,
+    sourceMappingSummary: precheck.sourceMappingSummary,
+    sourceCoverageReport: precheck.sourceCoverageReport,
     certificationOcr,
     draftCreateInput: precheck.draftCreateInput,
     uploadQueue: precheck.uploadQueue

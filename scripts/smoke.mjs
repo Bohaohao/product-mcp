@@ -1151,6 +1151,8 @@ async function createBatchSmokeFixtures() {
   const certAutoPairProductName = 'Cert Auto Pair Product';
   const certAuxOnlyProductName = 'Cert Auxiliary Images Only Product';
   const certExtraInvalidProductName = 'Cert Extra Invalid Image Product';
+  const sourceMappingProductName = 'Source Mapping Product';
+  const sourceCoverageGapProductName = 'Source Coverage Gap Product';
   const sourcePackageDir = await createWorkflowPackage();
   const validPackageDir = path.join(materialsRoot, validProductName);
   await cp(sourcePackageDir, validPackageDir, { recursive: true });
@@ -1164,6 +1166,36 @@ async function createBatchSmokeFixtures() {
   await mkdir(path.join(preparedPackageDir, '实测视频'), { recursive: true });
   await writeFile(path.join(preparedPackageDir, '商品主图', 'main.png'), onePixelPng);
   await writeFile(path.join(preparedPackageDir, '实测视频', 'actual.mp4'), Buffer.from('not-a-real-video'));
+
+  const sourceMappingPackageDir = path.join(materialsRoot, sourceMappingProductName);
+  await mkdir(path.join(sourceMappingPackageDir, '商品主图'), { recursive: true });
+  await mkdir(path.join(sourceMappingPackageDir, '应用场景'), { recursive: true });
+  await mkdir(path.join(sourceMappingPackageDir, '核心优势'), { recursive: true });
+  await mkdir(path.join(sourceMappingPackageDir, 'FAQ'), { recursive: true });
+  await mkdir(path.join(sourceMappingPackageDir, '客户案例', '客户A'), { recursive: true });
+  await mkdir(path.join(sourceMappingPackageDir, '认证'), { recursive: true });
+  await mkdir(path.join(sourceMappingPackageDir, '配件'), { recursive: true });
+  await mkdir(path.join(sourceMappingPackageDir, '售后'), { recursive: true });
+  await mkdir(path.join(sourceMappingPackageDir, '质保'), { recursive: true });
+  await writeFile(path.join(sourceMappingPackageDir, '商品主图', 'main.png'), onePixelPng);
+  await writeFile(path.join(sourceMappingPackageDir, '应用场景', '文案.txt'), '道路开挖施工：适用于道路开挖、管沟铺设与路基修整\n建筑工地施工：适用于建筑工地土方转运与基础施工\n');
+  await writeFile(path.join(sourceMappingPackageDir, '应用场景', '道路工程.jpg'), onePixelPng);
+  await writeFile(path.join(sourceMappingPackageDir, '应用场景', '建筑工地.jpg'), onePixelPng);
+  await writeFile(path.join(sourceMappingPackageDir, '核心优势', '文案.txt'), '高效节能：动力响应快，综合油耗低\n维护便捷：常用维护点集中，保养效率高\n');
+  await writeFile(path.join(sourceMappingPackageDir, '核心优势', '高效节能.jpg'), onePixelPng);
+  await writeFile(path.join(sourceMappingPackageDir, 'FAQ', 'faq.txt'), 'Q：是否适合狭窄工况？\nA：适合园林、市政和小型道路施工。\n');
+  await writeFile(path.join(sourceMappingPackageDir, '客户案例', '客户A', '文案.txt'), '道路养护项目：客户用于城区道路养护，设备通过性好，转场灵活。\n');
+  await writeFile(path.join(sourceMappingPackageDir, '客户案例', '客户A', '现场.jpg'), onePixelPng);
+  await writeFile(path.join(sourceMappingPackageDir, '认证', 'CE.pdf'), Buffer.from('%PDF-1.4\n% smoke certificate\n'));
+  await writeFile(path.join(sourceMappingPackageDir, '认证', 'CE-main.jpg'), onePixelPng);
+  await writeFile(path.join(sourceMappingPackageDir, '配件', '铲斗.jpg'), onePixelPng);
+  await writeFile(path.join(sourceMappingPackageDir, '售后', '文案.txt'), '快速响应：收到售后请求后 24 小时内响应。\n');
+  await writeFile(path.join(sourceMappingPackageDir, '质保', '文案.txt'), '整机质保：核心部件提供 12 个月质保。\n');
+
+  const sourceCoverageGapPackageDir = path.join(materialsRoot, sourceCoverageGapProductName);
+  await cp(sourcePackageDir, sourceCoverageGapPackageDir, { recursive: true });
+  await mkdir(path.join(sourceCoverageGapPackageDir, '应用场景'), { recursive: true });
+  await writeFile(path.join(sourceCoverageGapPackageDir, '应用场景', '道路工程.jpg'), onePixelPng);
 
   const certMissingPackageDir = path.join(materialsRoot, certMissingProductName);
   await cp(sourcePackageDir, certMissingPackageDir, { recursive: true });
@@ -1235,6 +1267,9 @@ async function createBatchSmokeFixtures() {
   const prepareExcelPath = path.join(root, 'batch-prepare.xlsx');
   await writeBatchWorkbook(prepareExcelPath, [createBatchWorkbookRow(preparedProductName)]);
 
+  const sourceMappingExcelPath = path.join(root, 'batch-source-mapping.xlsx');
+  await writeBatchWorkbook(sourceMappingExcelPath, [createBatchWorkbookRow(sourceMappingProductName)]);
+
   const certMissingExcelPath = path.join(root, 'batch-cert-missing-main-image.xlsx');
   await writeBatchWorkbook(certMissingExcelPath, [createBatchWorkbookRow(certMissingProductName)]);
 
@@ -1259,15 +1294,19 @@ async function createBatchSmokeFixtures() {
     certAutoPairProductName,
     certAuxOnlyProductName,
     certExtraInvalidProductName,
+    sourceMappingProductName,
+    sourceCoverageGapProductName,
     createExcelPath,
     formulaExcelPath,
     prepareExcelPath,
+    sourceMappingExcelPath,
     certMissingExcelPath,
     certInvalidImageExcelPath,
     certAutoPairExcelPath,
     certAuxOnlyExcelPath,
     certInvalidImagePackageDir,
-    certExtraInvalidPackageDir
+    certExtraInvalidPackageDir,
+    sourceCoverageGapPackageDir
   };
 }
 
@@ -1464,6 +1503,52 @@ async function assertBatchModeSmoke() {
     assert(markdown.includes('| 实测视频 | ./实测视频/actual.mp4 |'), 'batch prepare should preserve direct-parent media category');
     assert(!markdown.includes('| 作业视频 | ./实测视频/actual.mp4 |'), 'batch prepare must not subjectively rewrite 实测视频 to 作业视频');
     assert(markdown.includes('目标模板无同名分类，保留原始分类'), 'batch prepare should trace preserved nonstandard media categories');
+
+    const sourceMappingResult = await api.prepareProductBatchMarkdown({
+      excelPath: fixtures.sourceMappingExcelPath,
+      materialsRoot: fixtures.materialsRoot,
+      responseMode: 'debug'
+    });
+    const sourceMappingMarkdownPath = await existingPathFromResult(
+      sourceMappingResult,
+      fixtures.materialsRoot,
+      (value) => /\.md$/i.test(value) || value.endsWith('\u5546\u54c1\u8d44\u6599.md')
+    );
+    assert(sourceMappingMarkdownPath, 'source mapping prepare did not return a generated Markdown path');
+    const sourceMappingMarkdown = await readFile(sourceMappingMarkdownPath, 'utf8');
+    assert(sourceMappingMarkdown.includes('道路开挖施工'), '应用场景文案 was not mapped into 8.3 应用场景');
+    assert(sourceMappingMarkdown.includes('./应用场景/道路工程.jpg'), '应用场景 image was not referenced by structured scenario row');
+    assert(sourceMappingMarkdown.includes('| 场景图 | ./应用场景/道路工程.jpg |'), '应用场景 image should still be kept as 商品图片/场景图');
+    assert(sourceMappingMarkdown.includes('高效节能'), '核心优势文案 was not mapped into 8.2 核心优势');
+    assert(sourceMappingMarkdown.includes('是否适合狭窄工况'), 'FAQ 文案 was not mapped into 8.4 常见问题');
+    assert(sourceMappingMarkdown.includes('客户A'), '客户案例文案 did not generate 8.8 客户案例');
+    assert(sourceMappingMarkdown.includes('./客户案例/客户A/现场.jpg'), '客户案例图片 did not generate 客户案例媒体');
+    assert(sourceMappingMarkdown.includes('./认证/CE.pdf'), '认证 PDF did not generate 7 认证资料行');
+    assert(sourceMappingMarkdown.includes('./配件/铲斗.jpg'), '配件图片 did not generate 5 配件清单');
+    assert(sourceMappingMarkdown.includes('快速响应'), '售后文案 was not mapped into 8.10 售后服务承诺');
+    assert(sourceMappingMarkdown.includes('整机质保'), '质保文案 was not mapped into 8.11 质保政策');
+
+    const sourceMappingPrecheck = await precheckProductPackage({
+      packagePath: sourceMappingMarkdownPath,
+      responseMode: 'debug',
+      ocrMode: 'off'
+    });
+    const sourceMappingPrecheckText = stringifyResult(sourceMappingPrecheck);
+    assert(sourceMappingPrecheckText.includes('sourceCoverageReport'), 'precheck should return sourceCoverageReport');
+    assert(!sourceMappingPrecheckText.includes('MEDIA_ONLY_MAPPING_SUSPECT'), 'structured source mapping should not be media-only suspect');
+
+    const sourceCoverageGapPrecheck = await precheckProductPackage({
+      packagePath: fixtures.sourceCoverageGapPackageDir,
+      responseMode: 'debug',
+      ocrMode: 'off'
+    });
+    const sourceCoverageGapText = stringifyResult(sourceCoverageGapPrecheck);
+    assert(sourceCoverageGapPrecheck.ok === false, 'precheck should fail when business source exists but target section is empty');
+    assert(
+      /SOURCE_NOT_MAPPED|MEDIA_ONLY_MAPPING_SUSPECT|SECTION_MATERIAL_NOT_FILLED|SOURCE_COVERAGE_AUDIT_FAILED/.test(sourceCoverageGapText),
+      'source coverage audit should expose a concrete mapping error code'
+    );
+    assert(sourceCoverageGapText.includes('应用场景/道路工程.jpg'), 'source coverage audit should locate the unmapped scenario image');
 
     const certAutoPairResult = await api.prepareProductBatchMarkdown({
       excelPath: fixtures.certAutoPairExcelPath,
