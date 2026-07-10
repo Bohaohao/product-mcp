@@ -613,7 +613,7 @@ function createWorkflowBackendStub(options = {}) {
     },
     async post(requestPath, body) {
       if (requestPath === '/user/erp/commodity/list') {
-        assert(body.keyword === 'WorkflowUniqueProduct', 'workflow duplicate keyword was not normalized');
+        assert(body.keyword === (options.expectedDuplicateKeyword || 'WorkflowUniqueProduct'), 'workflow duplicate keyword was not normalized');
         return { rows: [], total: 0 };
       }
       if (requestPath === '/user/erp/commodity') {
@@ -726,6 +726,31 @@ async function createCertificationOcrPackage(options = {}) {
   return { dir, markdownPath, pdfName };
 }
 
+async function createCertificationVisionFallbackPackage() {
+  const dir = await createWorkflowPackage();
+  await mkdir(path.join(dir, '认证'), { recursive: true });
+  const onePixelPng = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
+    'base64'
+  );
+  await writeFile(path.join(dir, '认证', 'CE.jpg'), onePixelPng);
+  const markdownPath = path.join(dir, '商品资料.md');
+  const markdown = await readFile(markdownPath, 'utf8');
+  await writeFile(
+    markdownPath,
+    `${markdown}
+
+## 7. 认证资料
+
+| 证书名称 | 证书类型 | 证书编号 | 覆盖区域 | 覆盖区域ID | 适用范围 | 适用特定型号 | 适用特定型号ID | 生效日期 | 到期日期 | 是否永久有效 | 文件路径 | 主图路径 | 文件分类 | 状态 | 排序 | 备注 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| CE 认证 |  |  |  |  | 全部型号 |  |  |  |  |  | ./认证/CE.jpg |  | 认证资料 | 有效 | 1 | smoke vision fallback |
+`,
+    'utf8'
+  );
+  return { dir, markdownPath };
+}
+
 async function createFakeOcrCommands(root) {
   const renderPath = path.join(root, 'fake-render.mjs');
   const ocrPath = path.join(root, 'fake-ocr.mjs');
@@ -783,6 +808,29 @@ async function withFakeOcr(root, run) {
   }
 }
 
+async function withNoLocalOcr(root, run) {
+  const oldOcr = process.env.PRODUCT_OCR_COMMAND;
+  const oldRender = process.env.PRODUCT_PDF_RENDER_COMMAND;
+  const oldPath = process.env.PATH;
+  const oldPathCap = process.env.Path;
+  delete process.env.PRODUCT_OCR_COMMAND;
+  delete process.env.PRODUCT_PDF_RENDER_COMMAND;
+  process.env.PATH = root;
+  process.env.Path = root;
+  try {
+    return await run();
+  } finally {
+    if (oldOcr === undefined) delete process.env.PRODUCT_OCR_COMMAND;
+    else process.env.PRODUCT_OCR_COMMAND = oldOcr;
+    if (oldRender === undefined) delete process.env.PRODUCT_PDF_RENDER_COMMAND;
+    else process.env.PRODUCT_PDF_RENDER_COMMAND = oldRender;
+    if (oldPath === undefined) delete process.env.PATH;
+    else process.env.PATH = oldPath;
+    if (oldPathCap === undefined) delete process.env.Path;
+    else process.env.Path = oldPathCap;
+  }
+}
+
 async function assertCertificationOcrSmoke() {
   const root = await mkdtemp(path.join(tmpdir(), 'product-mcp-ocr-'));
   try {
@@ -834,6 +882,63 @@ async function assertCertificationOcrSmoke() {
       assert(!lowMarkdown.includes('LOW-12345'), 'low-confidence OCR should not be auto-written');
       assert(stringifyResult(low).includes('suggested'), 'low-confidence OCR should remain a suggestion');
     });
+
+    await withNoLocalOcr(root, async () => {
+      const fallbackFixture = await createCertificationVisionFallbackPackage();
+      const fallback = await productOcrCertifications({
+        packagePath: fallbackFixture.dir,
+        mode: 'suggest'
+      });
+      assert(fallback.ok === false, 'OCR provider unavailable should return partial ok=false');
+      assert(fallback.blocking === false, 'OCR provider unavailable must not be a direct business blocker');
+      assert(fallback.code === 'OCR_PROVIDER_UNAVAILABLE', 'OCR provider unavailable code should be structured');
+      assert(fallback.fallbackRequired === true, 'OCR provider unavailable should request Codex vision fallback');
+      assert(fallback.fallbackType === 'codex_native_vision', 'OCR fallback type should target Codex native vision');
+      assert(fallback.visionExtractionRequest?.files?.some((file) => file.relativePath === './认证/CE.jpg'), 'vision fallback request should list the certification image');
+      assert(stringifyResult(fallback.visionExtractionRequest).includes('certificateNo'), 'vision fallback request should include the expected field schema');
+
+      const applied = await productOcrCertifications({
+        packagePath: fallbackFixture.dir,
+        mode: 'apply',
+        visionExtractionResults: [
+          {
+            sourcePath: './认证/CE.jpg',
+            fields: {
+              certificateType: { value: 'CE', confidence: 0.96, sourcePath: './认证/CE.jpg' },
+              certificateNo: { value: 'CE-VISION-001', confidence: 0.96, sourcePath: './认证/CE.jpg' },
+              coverRegions: { value: '欧盟', confidence: 0.9, sourcePath: './认证/CE.jpg' },
+              issuingAuthority: { value: 'Vision Lab', confidence: 0.86, sourcePath: './认证/CE.jpg' },
+              effectiveDate: { value: '2026-02-03', confidence: 0.9, sourcePath: './认证/CE.jpg' },
+              expiryDate: { value: '2028-02-03', confidence: 0.9, sourcePath: './认证/CE.jpg' },
+              mainImagePath: { value: './认证/CE.jpg', confidence: 0.95, sourcePath: './认证/CE.jpg' }
+            }
+          }
+        ]
+      });
+      assert(applied.fallbackRequired !== true, 'vision extraction results should satisfy fallback when all fields are filled');
+      const appliedMarkdown = await readFile(fallbackFixture.markdownPath, 'utf8');
+      assert(appliedMarkdown.includes('CE-VISION-001'), 'vision extraction result did not fill certificate number');
+      assert(appliedMarkdown.includes('Codex native vision fallback after OCR unavailable'), 'vision fallback audit remark was not written');
+
+      const keepBlankFixture = await createCertificationVisionFallbackPackage();
+      await productOcrCertifications({
+        packagePath: keepBlankFixture.dir,
+        mode: 'apply',
+        ocrOptions: { datePolicy: 'keepBlank' },
+        visionExtractionResults: [
+          {
+            sourcePath: './认证/CE.jpg',
+            fields: {
+              effectiveDate: { value: '2026-02-03', confidence: 0.96, sourcePath: './认证/CE.jpg' },
+              expiryDate: { value: '2028-02-03', confidence: 0.96, sourcePath: './认证/CE.jpg' }
+            }
+          }
+        ]
+      });
+      const keepBlankVisionMarkdown = await readFile(keepBlankFixture.markdownPath, 'utf8');
+      assert(!keepBlankVisionMarkdown.includes('2026-02-03'), 'datePolicy=keepBlank should also apply to Codex vision effective date');
+      assert(!keepBlankVisionMarkdown.includes('2028-02-03'), 'datePolicy=keepBlank should also apply to Codex vision expiry date');
+    });
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -843,6 +948,78 @@ async function assertCreateFromPackageWorkflow() {
   const packageDir = await createWorkflowPackage();
   const tracePaths = [];
   try {
+    const fallbackRoot = await mkdtemp(path.join(tmpdir(), 'product-mcp-no-ocr-'));
+    const fallbackPackage = await createCertificationVisionFallbackPackage();
+    try {
+      await withNoLocalOcr(fallbackRoot, async () => {
+        const autoFallback = await productCreateFromPackage(
+          createWorkflowBackendStub(),
+          {
+            packagePath: fallbackPackage.dir,
+            runMode: 'preview',
+            clientRequestId: `smoke-ocr-auto-${Date.now()}`,
+            responseMode: 'summary',
+            ocrMode: 'auto'
+          },
+          'smoke-create-from-package-ocr-auto',
+          {
+            async uploadLocalFile() {
+              throw new Error('OCR fallback preview must not upload');
+            }
+          }
+        );
+        assert(autoFallback.ok === false, 'auto OCR fallback package should still fail missing certification fields during precheck');
+        assert(autoFallback.ocrFallback?.code === 'OCR_PROVIDER_UNAVAILABLE', 'auto OCR fallback should expose provider unavailable status');
+        assert(autoFallback.visionExtractionRequest?.files?.some((file) => file.relativePath === './认证/CE.jpg'), 'auto OCR fallback should expose a Codex vision request');
+        if (autoFallback.tracePath) tracePaths.push(autoFallback.tracePath);
+
+        const strictFallback = await productCreateFromPackage(
+          createWorkflowBackendStub(),
+          {
+            packagePath: fallbackPackage.dir,
+            runMode: 'preview',
+            clientRequestId: `smoke-ocr-strict-${Date.now()}`,
+            responseMode: 'summary',
+            ocrMode: 'strict'
+          },
+          'smoke-create-from-package-ocr-strict',
+          {
+            async uploadLocalFile() {
+              throw new Error('strict OCR failure must not upload');
+            }
+          }
+        );
+        assert(strictFallback.ok === false, 'strict OCR fallback should block');
+        assert(strictFallback.code === 'OCR_PROVIDER_UNAVAILABLE', 'strict OCR fallback should return OCR_PROVIDER_UNAVAILABLE');
+        assert(strictFallback.visionExtractionRequest?.files?.length > 0, 'strict OCR fallback should still expose the vision request');
+        if (strictFallback.tracePath) tracePaths.push(strictFallback.tracePath);
+
+        const offFallback = await productCreateFromPackage(
+          createWorkflowBackendStub(),
+          {
+            packagePath: fallbackPackage.dir,
+            runMode: 'preview',
+            clientRequestId: `smoke-ocr-off-${Date.now()}`,
+            responseMode: 'summary',
+            ocrMode: 'off'
+          },
+          'smoke-create-from-package-ocr-off',
+          {
+            async uploadLocalFile() {
+              throw new Error('OCR off preview must not upload');
+            }
+          }
+        );
+        assert(offFallback.ok === false, 'ocrMode=off package should still fail field-level certification validation');
+        assert(!offFallback.ocrFallback, 'ocrMode=off must not expose OCR fallback');
+        assert(!offFallback.visionExtractionRequest, 'ocrMode=off must not expose a vision request');
+        if (offFallback.tracePath) tracePaths.push(offFallback.tracePath);
+      });
+    } finally {
+      await rm(fallbackPackage.dir, { recursive: true, force: true });
+      await rm(fallbackRoot, { recursive: true, force: true });
+    }
+
     const previewBackend = createWorkflowBackendStub();
     let previewUploadCalled = false;
     const previewResult = await productCreateFromPackage(
@@ -1153,6 +1330,8 @@ async function createBatchSmokeFixtures() {
   const certExtraInvalidProductName = 'Cert Extra Invalid Image Product';
   const sourceMappingProductName = 'Source Mapping Product';
   const sourceCoverageGapProductName = 'Source Coverage Gap Product';
+  const testingVideoProductName = 'Testing Video Metadata Product';
+  const testingVideoInvalidProductName = 'Testing Video Invalid Metadata Product';
   const sourcePackageDir = await createWorkflowPackage();
   const validPackageDir = path.join(materialsRoot, validProductName);
   await cp(sourcePackageDir, validPackageDir, { recursive: true });
@@ -1196,6 +1375,39 @@ async function createBatchSmokeFixtures() {
   await cp(sourcePackageDir, sourceCoverageGapPackageDir, { recursive: true });
   await mkdir(path.join(sourceCoverageGapPackageDir, '应用场景'), { recursive: true });
   await writeFile(path.join(sourceCoverageGapPackageDir, '应用场景', '道路工程.jpg'), onePixelPng);
+
+  const testingVideoPackageDir = path.join(materialsRoot, testingVideoProductName);
+  await cp(sourcePackageDir, testingVideoPackageDir, { recursive: true });
+  await mkdir(path.join(testingVideoPackageDir, '视频', '链界实测视频'), { recursive: true });
+  await mkdir(path.join(testingVideoPackageDir, '视频', '三方实测视频'), { recursive: true });
+  await writeFile(path.join(testingVideoPackageDir, '视频', '链界实测视频', '动态特写.mp4'), Buffer.from('smoke exact video'));
+  await writeFile(
+    path.join(testingVideoPackageDir, '视频', '链界实测视频', '动态特写.txt'),
+    '视频标题：动态特写完整标题\n视频描述：动态特写完整描述\n',
+    'utf8'
+  );
+  await writeFile(path.join(testingVideoPackageDir, '视频', '链界实测视频', '履带_converted.mp4'), Buffer.from('smoke converted video'));
+  const utf16Sidecar = Buffer.concat([
+    Buffer.from([0xff, 0xfe]),
+    Buffer.from('视频标题：履带行走测试\r\n视频描述：履带通过性与稳定性测试。\r\n', 'utf16le')
+  ]);
+  await writeFile(path.join(testingVideoPackageDir, '视频', '链界实测视频', '履带.txt'), utf16Sidecar);
+  await writeFile(path.join(testingVideoPackageDir, '视频', '链界实测视频', '无文案.mp4'), Buffer.from('smoke missing sidecar video'));
+  await writeFile(path.join(testingVideoPackageDir, '视频', '三方实测视频', '第三方测评.mp4'), Buffer.from('smoke third-party video'));
+  await writeFile(
+    path.join(testingVideoPackageDir, '视频', '三方实测视频', '第三方测评.txt'),
+    '视频标题: 第三方独立测评\n视频描述: 第三方机构完成的整机工况测评。\n',
+    'utf8'
+  );
+
+  const testingVideoInvalidPackageDir = path.join(materialsRoot, testingVideoInvalidProductName);
+  await cp(sourcePackageDir, testingVideoInvalidPackageDir, { recursive: true });
+  await mkdir(path.join(testingVideoInvalidPackageDir, '视频', '链界实测视频'), { recursive: true });
+  await writeFile(path.join(testingVideoInvalidPackageDir, '视频', '链界实测视频', '字段不全.mp4'), Buffer.from('smoke incomplete metadata'));
+  await writeFile(path.join(testingVideoInvalidPackageDir, '视频', '链界实测视频', '字段不全.txt'), '视频标题：只有标题\n', 'utf8');
+  await writeFile(path.join(testingVideoInvalidPackageDir, '视频', '链界实测视频', '无法解码.mp4'), Buffer.from('smoke unreadable metadata'));
+  await writeFile(path.join(testingVideoInvalidPackageDir, '视频', '链界实测视频', '无法解码.txt'), Buffer.from([0xff, 0xff, 0x00, 0xff]));
+  await writeFile(path.join(testingVideoInvalidPackageDir, '视频', '链界实测视频', '孤立文案.txt'), '视频标题：孤立\n视频描述：没有对应视频。\n', 'utf8');
 
   const certMissingPackageDir = path.join(materialsRoot, certMissingProductName);
   await cp(sourcePackageDir, certMissingPackageDir, { recursive: true });
@@ -1282,6 +1494,12 @@ async function createBatchSmokeFixtures() {
   const certAuxOnlyExcelPath = path.join(root, 'batch-cert-aux-only.xlsx');
   await writeBatchWorkbook(certAuxOnlyExcelPath, [createBatchWorkbookRow(certAuxOnlyProductName)]);
 
+  const testingVideoExcelPath = path.join(root, 'batch-testing-video-metadata.xlsx');
+  await writeBatchWorkbook(testingVideoExcelPath, [createBatchWorkbookRow(testingVideoProductName)]);
+
+  const testingVideoInvalidExcelPath = path.join(root, 'batch-testing-video-invalid.xlsx');
+  await writeBatchWorkbook(testingVideoInvalidExcelPath, [createBatchWorkbookRow(testingVideoInvalidProductName)]);
+
   return {
     root,
     packageDirs: [sourcePackageDir],
@@ -1296,6 +1514,8 @@ async function createBatchSmokeFixtures() {
     certExtraInvalidProductName,
     sourceMappingProductName,
     sourceCoverageGapProductName,
+    testingVideoProductName,
+    testingVideoInvalidProductName,
     createExcelPath,
     formulaExcelPath,
     prepareExcelPath,
@@ -1304,6 +1524,10 @@ async function createBatchSmokeFixtures() {
     certInvalidImageExcelPath,
     certAutoPairExcelPath,
     certAuxOnlyExcelPath,
+    testingVideoExcelPath,
+    testingVideoInvalidExcelPath,
+    testingVideoPackageDir,
+    testingVideoInvalidPackageDir,
     certInvalidImagePackageDir,
     certExtraInvalidPackageDir,
     sourceCoverageGapPackageDir
@@ -1504,6 +1728,121 @@ async function assertBatchModeSmoke() {
     assert(!markdown.includes('| 作业视频 | ./实测视频/actual.mp4 |'), 'batch prepare must not subjectively rewrite 实测视频 to 作业视频');
     assert(markdown.includes('目标模板无同名分类，保留原始分类'), 'batch prepare should trace preserved nonstandard media categories');
 
+    const testingVideoResult = await api.prepareProductBatchMarkdown({
+      excelPath: fixtures.testingVideoExcelPath,
+      materialsRoot: fixtures.materialsRoot,
+      responseMode: 'debug'
+    });
+    assert(testingVideoResult.ok === true, 'valid testing-video sidecars should not block batch prepare');
+    const testingVideoMarkdownPath = await existingPathFromResult(
+      testingVideoResult,
+      fixtures.materialsRoot,
+      (value) => /商品资料\.md$/i.test(value)
+    );
+    assert(testingVideoMarkdownPath, 'testing-video batch prepare did not return 商品资料.md');
+    let testingVideoMarkdown = await readFile(testingVideoMarkdownPath, 'utf8');
+    assert(testingVideoMarkdown.includes('erp-product-material-template-version: 2026-07-10.1'), 'testing-video prepare should use the new template version');
+    assert(testingVideoMarkdown.includes('动态特写完整标题'), 'exact UTF-8 sidecar title was not written to the media table');
+    assert(testingVideoMarkdown.includes('动态特写完整描述'), 'exact UTF-8 sidecar description was not written to the media table');
+    assert(testingVideoMarkdown.includes('履带行走测试'), 'converted video did not pair with the UTF-16LE sidecar title');
+    assert(testingVideoMarkdown.includes('履带通过性与稳定性测试'), 'UTF-16LE sidecar description was not decoded');
+    assert(testingVideoMarkdown.includes('第三方独立测评'), 'third-party testing video sidecar title was not written');
+    assert(testingVideoMarkdown.includes('| 三方实测视频 | ./视频/三方实测视频/第三方测评.mp4 |'), 'third-party testing video category was not preserved');
+    assert(!testingVideoMarkdown.includes('| 链界实测视频 | ./视频/链界实测视频/动态特写.txt |'), 'testing-video sidecar must not become a rich-text row');
+    assert(!testingVideoMarkdown.includes('| 链界实测视频 | ./视频/链界实测视频/履带.txt |'), 'converted video sidecar must not become a rich-text row');
+    assert(stringifyResult(testingVideoResult).includes('VIDEO_METADATA_TEXT_MISSING'), 'missing testing-video sidecar should be reported as a warning');
+    assert(stringifyResult(testingVideoResult).includes('utf-16le'), 'video metadata report should expose detected UTF-16LE encoding');
+
+    const testingVideoPrecheck = await precheckProductPackage({
+      packagePath: fixtures.testingVideoPackageDir,
+      includeDraft: true,
+      responseMode: 'standard',
+      ocrMode: 'off'
+    });
+    assert(testingVideoPrecheck.videoMetadataSummary?.blockedCount === 0, 'valid testing-video metadata should pass precheck pairing');
+    const testingVideos = (testingVideoPrecheck.draftCreateInput?.medias || []).filter((media) => media.videoCategory === 4 || media.videoCategory === 6);
+    const convertedVideo = testingVideos.find((media) => media.mediaName === '履带_converted.mp4');
+    const thirdPartyVideo = testingVideos.find((media) => media.mediaName === '第三方测评.mp4');
+    assert(convertedVideo?.mediaTitle === '履带行走测试', 'precheck draft did not carry converted-video mediaTitle');
+    assert(convertedVideo?.mediaDesc === '履带通过性与稳定性测试。', 'precheck draft did not carry converted-video mediaDesc');
+    assert(thirdPartyVideo?.videoCategory === 6 && thirdPartyVideo?.mediaTitle === '第三方独立测评', 'precheck draft did not carry third-party video metadata');
+    assert(
+      testingVideoPrecheck.uploadQueue.some((item) => item.sourceRelativePath === './视频/链界实测视频/履带_converted.mp4'),
+      'testing video should remain in uploadQueue'
+    );
+    assert(
+      !testingVideoPrecheck.uploadQueue.some((item) => /\.txt$/i.test(item.sourceRelativePath || '')),
+      'testing-video sidecars must not enter uploadQueue'
+    );
+    const textCoverage = testingVideoPrecheck.sourceCoverageReport.find((item) => item.sourcePath.endsWith('履带.txt'));
+    assert(textCoverage?.status === 'mapped', 'paired sidecar should be mapped in sourceCoverageReport');
+    assert(Array.isArray(textCoverage?.uploadUsage) && textCoverage.uploadUsage.length === 0, 'sidecar coverage should state that the text is not uploaded');
+
+    const blankMetadataMarkdown = testingVideoMarkdown
+      .replace('动态特写完整标题', '')
+      .replace('动态特写完整描述', '');
+    await writeFile(testingVideoMarkdownPath, blankMetadataMarkdown, 'utf8');
+    const blankMetadataBeforePrecheck = await readFile(testingVideoMarkdownPath, 'utf8');
+    const blankMetadataPrecheck = await precheckProductPackage({
+      packagePath: fixtures.testingVideoPackageDir,
+      includeDraft: true,
+      responseMode: 'standard',
+      ocrMode: 'off'
+    });
+    const exactDraftVideo = (blankMetadataPrecheck.draftCreateInput?.medias || []).find((media) => media.mediaName === '动态特写.mp4');
+    assert(exactDraftVideo?.mediaTitle === '动态特写完整标题', 'single-package precheck should fill blank mediaTitle in memory');
+    assert(exactDraftVideo?.mediaDesc === '动态特写完整描述', 'single-package precheck should fill blank mediaDesc in memory');
+    assert(
+      (await readFile(testingVideoMarkdownPath, 'utf8')) === blankMetadataBeforePrecheck,
+      'single-package precheck must not rewrite 商品资料.md while enriching the draft'
+    );
+    await writeFile(testingVideoMarkdownPath, testingVideoMarkdown, 'utf8');
+
+    testingVideoMarkdown = testingVideoMarkdown.replace('动态特写完整标题', '动态特写');
+    await writeFile(testingVideoMarkdownPath, testingVideoMarkdown, 'utf8');
+    await api.prepareProductBatchMarkdown({
+      excelPath: fixtures.testingVideoExcelPath,
+      materialsRoot: fixtures.materialsRoot,
+      responseMode: 'debug'
+    });
+    testingVideoMarkdown = await readFile(testingVideoMarkdownPath, 'utf8');
+    assert(testingVideoMarkdown.includes('动态特写完整标题'), 'legacy filename-stem fallback title should be replaced by sidecar title');
+    assert((testingVideoMarkdown.match(/\.\/视频\/链界实测视频\/动态特写\.mp4/g) || []).length === 1, 'repeated prepare should not duplicate video rows');
+
+    testingVideoMarkdown = testingVideoMarkdown.replace('动态特写完整标题', '用户手工标题');
+    await writeFile(testingVideoMarkdownPath, testingVideoMarkdown, 'utf8');
+    const conflictResult = await api.prepareProductBatchMarkdown({
+      excelPath: fixtures.testingVideoExcelPath,
+      materialsRoot: fixtures.materialsRoot,
+      responseMode: 'debug'
+    });
+    testingVideoMarkdown = await readFile(testingVideoMarkdownPath, 'utf8');
+    assert(testingVideoMarkdown.includes('用户手工标题'), 'user-authored video title should not be overwritten');
+    assert(stringifyResult(conflictResult).includes('VIDEO_METADATA_CONFLICT'), 'sidecar conflict should be reported as a warning');
+
+    const invalidVideoResult = await api.prepareProductBatchMarkdown({
+      excelPath: fixtures.testingVideoInvalidExcelPath,
+      materialsRoot: fixtures.materialsRoot,
+      responseMode: 'debug'
+    });
+    const invalidVideoText = stringifyResult(invalidVideoResult);
+    assert(invalidVideoResult.ok === false, 'invalid testing-video metadata should block batch prepare');
+    assert(invalidVideoText.includes('VIDEO_METADATA_FIELDS_INCOMPLETE'), 'incomplete sidecar should report VIDEO_METADATA_FIELDS_INCOMPLETE');
+    assert(invalidVideoText.includes('VIDEO_METADATA_TEXT_UNREADABLE'), 'invalid encoding should report VIDEO_METADATA_TEXT_UNREADABLE');
+    assert(invalidVideoText.includes('VIDEO_METADATA_VIDEO_NOT_FOUND'), 'orphan sidecar should report VIDEO_METADATA_VIDEO_NOT_FOUND');
+
+    const forbiddenWriteResult = await api.prepareProductBatchMarkdown({
+      excelPath: fixtures.prepareExcelPath,
+      materialsRoot: fixtures.materialsRoot,
+      markdownFileName: '../forbidden.md',
+      responseMode: 'debug'
+    });
+    assert(forbiddenWriteResult.ok === false, 'batch prepare should reject package writes outside the material package');
+    assert(
+      stringifyResult(forbiddenWriteResult).includes('Refusing to write outside the material package boundary'),
+      'material package write boundary should report an explicit refusal'
+    );
+
     const sourceMappingResult = await api.prepareProductBatchMarkdown({
       excelPath: fixtures.sourceMappingExcelPath,
       materialsRoot: fixtures.materialsRoot,
@@ -1668,6 +2007,60 @@ async function assertBatchModeSmoke() {
     assert(!certInvalidText.includes('ROW_WORKFLOW_FAILED'), 'batch preview invalid file error should not collapse to ROW_WORKFLOW_FAILED');
     assert(certInvalidUploadCalled === false, 'batch preview with invalid certification main image called upload');
     assert(certInvalidPreviewBackend.createPostCount === 0, 'batch preview with invalid certification main image called create');
+
+    const invalidVideoPreviewBackend = createWorkflowBackendStub({
+      allowCreate: true,
+      expectedDuplicateKeyword: 'TestingVideoInvalidMetadataProduct'
+    });
+    let invalidVideoUploadCalled = false;
+    const invalidVideoPreview = await api.runProductBatchFromExcel(
+      invalidVideoPreviewBackend,
+      {
+        excelPath: fixtures.testingVideoInvalidExcelPath,
+        materialsRoot: fixtures.materialsRoot,
+        runMode: 'preview',
+        responseMode: 'debug'
+      },
+      'smoke-batch-testing-video-invalid-preview',
+      {
+        async uploadLocalFile() {
+          invalidVideoUploadCalled = true;
+          throw new Error('batch preview with invalid testing-video metadata must not upload');
+        }
+      }
+    );
+    const invalidVideoPreviewText = stringifyResult(invalidVideoPreview);
+    assert(invalidVideoPreview.ok === false, 'batch preview should fail on invalid testing-video metadata');
+    assert(invalidVideoPreviewText.includes('VIDEO_METADATA_FIELDS_INCOMPLETE'), 'batch preview should expose incomplete testing-video metadata');
+    assert(invalidVideoPreviewText.includes('字段不全.txt'), 'batch preview should identify the invalid sidecar path');
+    assert(invalidVideoUploadCalled === false, 'invalid testing-video preview called upload');
+    assert(invalidVideoPreviewBackend.createPostCount === 0, 'invalid testing-video preview called create');
+
+    const testingVideoPreviewBackend = createWorkflowBackendStub({
+      allowCreate: true,
+      expectedDuplicateKeyword: 'TestingVideoMetadataProduct'
+    });
+    let testingVideoPreviewUploadCalled = false;
+    const testingVideoPreview = await api.runProductBatchFromExcel(
+      testingVideoPreviewBackend,
+      {
+        excelPath: fixtures.testingVideoExcelPath,
+        materialsRoot: fixtures.materialsRoot,
+        runMode: 'preview',
+        responseMode: 'debug'
+      },
+      'smoke-batch-testing-video-preview',
+      {
+        async uploadLocalFile() {
+          testingVideoPreviewUploadCalled = true;
+          throw new Error('batch testing-video preview must not upload');
+        }
+      }
+    );
+    assert(testingVideoPreview.ok === true, `valid testing-video metadata should pass batch preview: ${stringifyResult(testingVideoPreview)}`);
+    assert(stringifyResult(testingVideoPreview).includes('videoMetadataReport'), 'batch preview should expose videoMetadataReport');
+    assert(testingVideoPreviewUploadCalled === false, 'valid testing-video preview called upload');
+    assert(testingVideoPreviewBackend.createPostCount === 0, 'valid testing-video preview called create');
 
     const previewBackend = createWorkflowBackendStub({ allowCreate: true });
     let previewUploadCalled = false;

@@ -4,6 +4,7 @@ import { access, mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promi
 import path from 'node:path';
 import * as z from 'zod/v4';
 import { parseMarkdownTables, type MarkdownTable } from '../workflows/materialTemplate.js';
+import { assertMaterialPackageWrite } from '../workflows/materialWriteBoundary.js';
 
 type UnknownRecord = Record<string, unknown>;
 type OcrMode = 'suggest' | 'apply';
@@ -15,6 +16,7 @@ type OcrField =
   | 'effectiveDate'
   | 'expiryDate'
   | 'mainImagePath';
+type VisionField = OcrField | 'certificateName' | 'isPermanent' | 'remark';
 type OcrAction = 'filled' | 'suggested' | 'keptExisting' | 'conflict' | 'needsManual' | 'skippedByDatePolicy';
 
 const CERTIFICATION_HEADERS = [
@@ -48,6 +50,19 @@ const FIELD_TO_HEADER: Record<OcrField, string> = {
   mainImagePath: '主图路径'
 };
 
+const VISION_FIELD_TO_HEADER: Record<VisionField, string> = {
+  certificateName: '证书名称',
+  certificateType: '证书类型',
+  certificateNo: '证书编号',
+  coverRegions: '覆盖区域',
+  issuingAuthority: '发证机构',
+  effectiveDate: '生效日期',
+  expiryDate: '到期日期',
+  isPermanent: '是否永久有效',
+  mainImagePath: '主图路径',
+  remark: '备注'
+};
+
 export const productOcrOptionsSchema = z
   .object({
     autoFillThreshold: z.number().min(0).max(1).default(0.75),
@@ -68,15 +83,57 @@ export const productOcrOptionsSchema = z
   .partial()
   .optional();
 
+const visionFieldResultSchema = z
+  .object({
+    value: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional().nullable(),
+    confidence: z.number().min(0).max(1).optional(),
+    sourcePath: z.string().trim().optional(),
+    page: z.number().int().positive().optional().nullable(),
+    uncertainty: z.string().trim().optional(),
+    notes: z.string().trim().optional()
+  })
+  .partial();
+
+const visionExtractionResultSchema = z.object({
+  row: z.number().int().positive().optional(),
+  certificateName: z.string().trim().optional(),
+  sourcePath: z.string().trim().optional(),
+  relativePath: z.string().trim().optional(),
+  page: z.number().int().positive().optional().nullable(),
+  fields: z
+    .object({
+      certificateName: visionFieldResultSchema.optional(),
+      certificateType: visionFieldResultSchema.optional(),
+      certificateNo: visionFieldResultSchema.optional(),
+      coverRegions: visionFieldResultSchema.optional(),
+      issuingAuthority: visionFieldResultSchema.optional(),
+      effectiveDate: visionFieldResultSchema.optional(),
+      expiryDate: visionFieldResultSchema.optional(),
+      isPermanent: visionFieldResultSchema.optional(),
+      mainImagePath: visionFieldResultSchema.optional(),
+      remark: visionFieldResultSchema.optional()
+    })
+    .partial()
+    .default({}),
+  uncertainty: z.string().trim().optional(),
+  notes: z.string().trim().optional()
+});
+
 export const productOcrCertificationsInputSchema = {
   packagePath: z.string().trim().min(1).describe('Local product package directory or 商品资料.md path.'),
   markdownFileName: z.string().trim().default('商品资料.md'),
   mode: z.enum(['suggest', 'apply']).default('suggest'),
-  ocrOptions: productOcrOptionsSchema
+  ocrOptions: productOcrOptionsSchema,
+  visionExtractionResults: z
+    .array(visionExtractionResultSchema)
+    .optional()
+    .describe('Structured certification extraction results produced by the Codex native vision fallback.')
 };
 
 const productOcrCertificationsObjectSchema = z.object(productOcrCertificationsInputSchema);
 export type ProductOcrCertificationsInput = z.infer<typeof productOcrCertificationsObjectSchema>;
+type VisionExtractionResult = z.infer<typeof visionExtractionResultSchema>;
+type VisionFieldResult = z.infer<typeof visionFieldResultSchema>;
 
 interface CertificationRowRef {
   rowNumber: number;
@@ -119,6 +176,32 @@ interface OcrDiffEntry {
   source?: string;
   action: OcrAction;
   reason?: string;
+}
+
+interface VisionExtractionFieldSpec {
+  value: string;
+  label: string;
+  description: string;
+  requiredWhenVisible: boolean;
+}
+
+interface VisionExtractionFileRequest {
+  absolutePath: string;
+  relativePath: string;
+  sourceType: CertificationSource['sourceType'];
+  rowNumber?: number;
+  field?: CertificationSource['field'];
+  certificateName?: string;
+  suggestedPages?: number[];
+}
+
+interface VisionExtractionRequest {
+  fallbackType: 'codex_native_vision';
+  reason: string;
+  files: VisionExtractionFileRequest[];
+  fields: VisionExtractionFieldSpec[];
+  expectedResultJsonSchema: UnknownRecord;
+  instructions: string[];
 }
 
 function cleanCell(value: unknown): string {
@@ -224,6 +307,261 @@ function isDateKeepBlank(
     const fields = policy.fields.map(normalizeDateField);
     return rowMatches && nameMatches && fields.includes(field);
   });
+}
+
+function providerErrorCode(message: string): 'OCR_PROVIDER_UNAVAILABLE' | 'OCR_SOURCE_UNREADABLE' | 'OCR_LOW_CONFIDENCE' {
+  if (/No local OCR provider available|tesseract|PRODUCT_OCR_COMMAND/i.test(message)) return 'OCR_PROVIDER_UNAVAILABLE';
+  return 'OCR_SOURCE_UNREADABLE';
+}
+
+function isProviderUnavailableMessage(message: string): boolean {
+  return providerErrorCode(message) === 'OCR_PROVIDER_UNAVAILABLE';
+}
+
+function visionFieldSpecs(): VisionExtractionFieldSpec[] {
+  return [
+    { value: 'certificateName', label: '证书名称', description: '证书显示的名称；看不到时返回 null。', requiredWhenVisible: false },
+    { value: 'certificateType', label: '证书类型', description: '例如 CE、FCC、ISO 9001、RoHS。', requiredWhenVisible: true },
+    { value: 'certificateNo', label: '证书编号', description: '证书号、Certificate No.、Report No. 等可确认编号。', requiredWhenVisible: true },
+    { value: 'coverRegions', label: '覆盖区域', description: '例如 全球、欧盟、欧洲、美国、中国；看不出则 null。', requiredWhenVisible: true },
+    { value: 'issuingAuthority', label: '发证机构', description: 'Issued by / Certification Body / 发证机构。', requiredWhenVisible: false },
+    { value: 'effectiveDate', label: '生效日期', description: 'YYYY-MM-DD；只在证书明确显示时填写。', requiredWhenVisible: true },
+    { value: 'expiryDate', label: '到期日期', description: 'YYYY-MM-DD；未显示或永久有效时返回 null，并说明 uncertainty。', requiredWhenVisible: true },
+    { value: 'isPermanent', label: '是否永久有效', description: '证书明确永久有效时为 true；否则 false 或 null。', requiredWhenVisible: false },
+    { value: 'mainImagePath', label: '认证资料主图', description: '可作为主图的源图片路径；PDF 可用首页或证书页截图，由 MCP 负责已有路径。', requiredWhenVisible: false },
+    { value: 'remark', label: '备注/不确定项', description: '记录看不清、字段缺失、日期未显示等不确定信息。', requiredWhenVisible: false }
+  ];
+}
+
+function buildVisionExtractionRequest(
+  sources: CertificationSource[],
+  reason: string
+): VisionExtractionRequest | undefined {
+  if (!sources.length) return undefined;
+  return {
+    fallbackType: 'codex_native_vision',
+    reason,
+    files: sources.map((source) => ({
+      absolutePath: source.absolutePath,
+      relativePath: source.relativePath,
+      sourceType: source.sourceType,
+      rowNumber: source.rowNumber,
+      field: source.field,
+      certificateName: source.certificateName,
+      suggestedPages: source.sourceType === 'pdf' ? [1, 2, 3] : undefined
+    })),
+    fields: visionFieldSpecs(),
+    expectedResultJsonSchema: {
+      type: 'array',
+      items: {
+        type: 'object',
+        required: ['sourcePath', 'fields'],
+        properties: {
+          row: { type: ['number', 'null'], description: '认证资料行号；无法确定时可省略。' },
+          certificateName: { type: ['string', 'null'] },
+          sourcePath: { type: 'string', description: '必须等于请求中的 relativePath 或 absolutePath。' },
+          page: { type: ['number', 'null'], description: 'PDF 页码；图片可为 null。' },
+          fields: {
+            type: 'object',
+            properties: Object.fromEntries(
+              visionFieldSpecs().map((field) => [
+                field.value,
+                {
+                  type: 'object',
+                  properties: {
+                    value: { type: ['string', 'number', 'boolean', 'null'] },
+                    confidence: { type: 'number', minimum: 0, maximum: 1 },
+                    sourcePath: { type: 'string' },
+                    page: { type: ['number', 'null'] },
+                    uncertainty: { type: ['string', 'null'] }
+                  }
+                }
+              ])
+            )
+          },
+          uncertainty: { type: ['string', 'null'] },
+          notes: { type: ['string', 'null'] }
+        }
+      }
+    },
+    instructions: [
+      '请使用 Codex 原生图像理解读取证书文件；MCP 服务端不会直接调用视觉模型。',
+      '不得臆造字段。看不清、证书未显示、无法确认时，字段 value 必须返回 null，并写明 uncertainty。',
+      '日期必须标准化为 YYYY-MM-DD；如果证书没有到期日或只写永久有效，expiryDate 返回 null，isPermanent 返回 true。',
+      '每个字段都要带 confidence、sourcePath、page 和 uncertainty，方便 MCP 回填时保留审计来源。'
+    ]
+  };
+}
+
+function normalizeVisionFieldValue(field: VisionField, raw: unknown): string {
+  if (raw === undefined || raw === null) return '';
+  if (field === 'isPermanent') {
+    if (raw === true) return '是';
+    if (raw === false) return '否';
+    const text = cleanCell(raw).toLowerCase();
+    if (['是', 'true', 'yes', '永久', 'permanent'].some((item) => text.includes(item))) return '是';
+    if (['否', 'false', 'no', '不是'].some((item) => text.includes(item))) return '否';
+    return '';
+  }
+  if (field === 'effectiveDate' || field === 'expiryDate') {
+    return normalizeDate(cleanCell(raw)) || '';
+  }
+  return cleanCell(raw);
+}
+
+function visionFieldUncertain(field: VisionFieldResult | undefined, result: VisionExtractionResult): string {
+  return cleanCell(field?.uncertainty) || cleanCell(field?.notes) || cleanCell(result.uncertainty) || cleanCell(result.notes);
+}
+
+function confidenceOf(field: VisionFieldResult | undefined): number {
+  return typeof field?.confidence === 'number' ? field.confidence : 0;
+}
+
+function matchRowForVisionResult(
+  rows: CertificationRowRef[],
+  result: VisionExtractionResult,
+  packageDir: string
+): CertificationRowRef | undefined {
+  if (result.row) {
+    const matched = rows.find((row) => row.rowNumber === result.row);
+    if (matched) return matched;
+  }
+  const name = cleanCell(result.certificateName);
+  if (name) {
+    const matched = rows.find((row) => cleanCell(row.row['证书名称']) === name);
+    if (matched) return matched;
+  }
+  const sourcePath = cleanCell(result.sourcePath || result.relativePath);
+  if (sourcePath) {
+    const normalized = normalizeRelativePath(toMarkdownRelativePath(packageDir, resolveLocalPath(packageDir, sourcePath)));
+    const matched = rows.find((row) => rowSourceKey(row.row, packageDir).includes(normalized));
+    if (matched) return matched;
+  }
+  return undefined;
+}
+
+function appendAuditRemark(row: Record<string, string>, note: string): void {
+  const existing = cleanCell(row['备注']);
+  if (existing.includes(note)) return;
+  row['备注'] = existing ? `${existing}；${note}` : note;
+}
+
+function applyVisionExtractionResults(params: {
+  rows: CertificationRowRef[];
+  results: VisionExtractionResult[];
+  packageDir: string;
+  options: Required<NonNullable<ProductOcrCertificationsInput['ocrOptions']>>;
+  mode: OcrMode;
+}): { diff: OcrDiffEntry[]; warnings: Array<{ severity: 'warning'; code: string; message: string; field?: string }> } {
+  const diff: OcrDiffEntry[] = [];
+  const warnings: Array<{ severity: 'warning'; code: string; message: string; field?: string }> = [];
+  for (const result of params.results) {
+    const row = matchRowForVisionResult(params.rows, result, params.packageDir);
+    if (!row) {
+      warnings.push({
+        severity: 'warning',
+        code: 'VISION_RESULT_ROW_NOT_MATCHED',
+        message: `Codex 视觉识别结果未能匹配认证资料行：${cleanCell(result.sourcePath || result.relativePath || result.certificateName || '') || 'unknown source'}。`
+      });
+      continue;
+    }
+    const fields = result.fields || {};
+    for (const field of Object.keys(VISION_FIELD_TO_HEADER) as VisionField[]) {
+      const fieldResult = fields[field];
+      if (!fieldResult) continue;
+      const header = VISION_FIELD_TO_HEADER[field];
+      const before = cleanCell(row.row[header]);
+      const uncertainty = visionFieldUncertain(fieldResult, result);
+      const confidence = confidenceOf(fieldResult);
+      let candidateValue = normalizeVisionFieldValue(field, fieldResult.value);
+      if (field === 'mainImagePath' && candidateValue && !/^https?:\/\//i.test(candidateValue) && !candidateValue.startsWith('{{')) {
+        candidateValue = toMarkdownRelativePath(params.packageDir, resolveLocalPath(params.packageDir, candidateValue));
+      }
+      const source = cleanCell(fieldResult.sourcePath) || cleanCell(result.sourcePath) || cleanCell(result.relativePath);
+      const sourceText = source ? `来自 ${path.basename(source)}${fieldResult.page || result.page ? ` 第 ${fieldResult.page || result.page} 页` : ''}` : undefined;
+
+      if ((field === 'effectiveDate' || field === 'expiryDate') && isDateKeepBlank(field, row.rowNumber, cleanCell(row.row['证书名称']) || undefined, params.options)) {
+        diff.push({
+          row: row.rowNumber,
+          certificateName: cleanCell(row.row['证书名称']) || undefined,
+          field: header,
+          before,
+          after: before,
+          candidate: candidateValue || undefined,
+          confidence,
+          source: sourceText,
+          action: 'skippedByDatePolicy',
+          reason: '用户策略要求日期保持空白，不使用 Codex 视觉日期回填。'
+        });
+        continue;
+      }
+
+      if (!candidateValue || uncertainty || confidence < params.options.autoFillThreshold) {
+        warnings.push({
+          severity: 'warning',
+          code: 'VISION_FIELD_UNCERTAIN',
+          field: header,
+          message: `认证资料第 ${row.rowNumber} 行 ${header} 的视觉识别结果未自动回填：${uncertainty || '置信度不足或值为空'}。`
+        });
+        diff.push({
+          row: row.rowNumber,
+          certificateName: cleanCell(row.row['证书名称']) || undefined,
+          field: header,
+          before,
+          after: before,
+          candidate: candidateValue || undefined,
+          confidence,
+          source: sourceText,
+          action: 'needsManual',
+          reason: uncertainty || 'Codex 视觉结果为空或置信度不足，需人工确认。'
+        });
+        continue;
+      }
+
+      if (before) {
+        const same = before.toLowerCase() === candidateValue.toLowerCase();
+        if (!same) {
+          warnings.push({
+            severity: 'warning',
+            code: 'VISION_FIELD_CONFLICT',
+            field: header,
+            message: `认证资料第 ${row.rowNumber} 行 ${header} 已有值与 Codex 视觉结果不一致，未覆盖已有值。`
+          });
+        }
+        diff.push({
+          row: row.rowNumber,
+          certificateName: cleanCell(row.row['证书名称']) || undefined,
+          field: header,
+          before,
+          after: before,
+          candidate: candidateValue,
+          confidence,
+          source: sourceText,
+          action: same ? 'keptExisting' : 'conflict',
+          reason: same ? '已有值与 Codex 视觉结果一致，保持不变。' : '已有值优先，Codex 视觉结果仅记录为冲突。'
+        });
+        continue;
+      }
+
+      if (params.mode === 'apply') {
+        row.row[header] = candidateValue;
+        appendAuditRemark(row.row, `Codex native vision fallback after OCR unavailable；${header} ${sourceText || '来源未标明'}；confidence=${confidence.toFixed(2)}`);
+      }
+      diff.push({
+        row: row.rowNumber,
+        certificateName: cleanCell(row.row['证书名称']) || undefined,
+        field: header,
+        before,
+        after: params.mode === 'apply' ? candidateValue : before,
+        candidate: candidateValue,
+        confidence,
+        source: sourceText,
+        action: params.mode === 'apply' ? 'filled' : 'suggested',
+        reason: params.mode === 'apply' ? '空白字段已按 Codex 视觉结果回填。' : 'Codex 视觉结果可用于回填。'
+      });
+    }
+  }
+  return { diff, warnings };
 }
 
 function splitCommandLine(commandLine: string): string[] {
@@ -359,8 +697,10 @@ async function ocrImage(filePath: string, source: CertificationSource, page?: nu
 
 async function renderPdfPage(source: CertificationSource, packageDir: string, page: number): Promise<string> {
   const generatedDir = path.join(packageDir, '.generated', 'ocr', 'certifications');
+  assertMaterialPackageWrite({ packageDir, targetPath: generatedDir, kind: 'generatedArtifact' });
   await mkdir(generatedDir, { recursive: true });
   const outputPath = path.join(generatedDir, `${path.basename(source.relativePath, path.extname(source.relativePath))}-page-${page}.png`);
+  assertMaterialPackageWrite({ packageDir, targetPath: outputPath, kind: 'generatedArtifact' });
   const command = process.env.PRODUCT_PDF_RENDER_COMMAND?.trim();
   if (command) {
     await runCommandJson(command, {
@@ -621,6 +961,17 @@ function applyCandidateToRow(
   }
 
   if (!selected || selected.confidence < options.suggestThreshold) {
+    if (before) {
+      return {
+        row: row.rowNumber,
+        certificateName,
+        field: header,
+        before,
+        after: before,
+        action: 'keptExisting',
+        reason: '字段已有值，本地 OCR 未识别到更可信候选，保持不变。'
+      };
+    }
     return {
       row: row.rowNumber,
       certificateName,
@@ -698,6 +1049,7 @@ export async function productOcrCertifications(rawInput: unknown) {
   const ocrResults = [];
   const ocrDiff: OcrDiffEntry[] = [];
   const issues: Array<{ severity: 'warning' | 'info'; code: string; message: string; field?: string }> = [];
+  const warnings: Array<{ severity: 'warning'; code: string; message: string; field?: string }> = [];
 
   let workingRows = rows;
   const sourcesByRow = new Map<number, CertificationSource[]>();
@@ -768,6 +1120,19 @@ export async function productOcrCertifications(rawInput: unknown) {
     }
   }
 
+  if (input.visionExtractionResults?.length) {
+    const visionApplied = applyVisionExtractionResults({
+      rows: workingRows,
+      results: input.visionExtractionResults,
+      packageDir,
+      options,
+      mode: input.mode
+    });
+    ocrDiff.push(...visionApplied.diff);
+    warnings.push(...visionApplied.warnings);
+    issues.push(...visionApplied.warnings);
+  }
+
   for (const row of workingRows) {
     const sourceList = sourcesByRow.get(row.rowNumber) || [];
     const merged = new Map<OcrField, OcrCandidate>();
@@ -797,6 +1162,12 @@ export async function productOcrCertifications(rawInput: unknown) {
       const headers = ensureCertificationHeaders(table.headers);
       const nextMarkdown = replaceTable(markdown, table, headers, workingRows.map((row) => row.row));
       if (nextMarkdown !== markdown) {
+        assertMaterialPackageWrite({
+          packageDir,
+          targetPath: markdownPath,
+          kind: 'materialMarkdown',
+          markdownFileName: path.basename(markdownPath)
+        });
         await writeFile(markdownPath, nextMarkdown, 'utf8');
         wrote = true;
         outputMarkdownPath = markdownPath;
@@ -813,18 +1184,58 @@ export async function productOcrCertifications(rawInput: unknown) {
     needsManualCount: ocrDiff.filter((item) => item.action === 'needsManual').length,
     conflictCount: ocrDiff.filter((item) => item.action === 'conflict').length,
     skippedByDatePolicyCount: ocrDiff.filter((item) => item.action === 'skippedByDatePolicy').length,
+    visionResultCount: input.visionExtractionResults?.length || 0,
+    visionFilledCount: ocrDiff.filter((item) => item.action === 'filled' && item.reason?.includes('Codex 视觉')).length,
     wrote
   };
+  const providerErrors = ocrResults.flatMap((result) =>
+    result.providerResults
+      .filter((item) => item.error)
+      .map((item) => ({
+        source: item.source,
+        code: providerErrorCode(item.error || ''),
+        message: item.error || ''
+      }))
+  );
+  const providerUnavailable = providerErrors.some((error) => isProviderUnavailableMessage(error.message));
+  const hasVisionResults = Boolean(input.visionExtractionResults?.length);
+  const unresolvedFieldCount = ocrDiff.filter((item) => item.action === 'needsManual' || (input.mode === 'apply' && item.action === 'suggested')).length;
+  const fallbackRequired = unresolvedFieldCount > 0 || (providerErrors.length > 0 && !hasVisionResults);
+  const code = providerUnavailable
+    ? 'OCR_PROVIDER_UNAVAILABLE'
+    : providerErrors.length > 0
+      ? 'OCR_SOURCE_UNREADABLE'
+      : unresolvedFieldCount > 0
+        ? 'OCR_LOW_CONFIDENCE'
+        : undefined;
+  const visionExtractionRequest = fallbackRequired
+    ? buildVisionExtractionRequest(
+        sources,
+        providerUnavailable
+          ? '本地 OCR provider 不可用，请由 Codex 原生视觉读取证书字段。'
+          : providerErrors.length > 0
+            ? '部分认证文件无法由本地 OCR/PDF 渲染读取，请由 Codex 原生视觉补充。'
+            : '本地 OCR 置信度不足或字段未识别完整，请由 Codex 原生视觉确认。'
+      )
+    : undefined;
 
   return {
-    ok: true,
+    ok: !fallbackRequired,
+    partial: fallbackRequired || undefined,
+    code,
+    blocking: false,
+    fallbackRequired,
+    fallbackType: fallbackRequired ? 'codex_native_vision' : undefined,
+    visionExtractionRequest,
     packageDir,
     markdownPath,
     mode: input.mode,
     provider: process.env.PRODUCT_OCR_COMMAND ? 'PRODUCT_OCR_COMMAND' : 'auto-local',
+    providerErrors,
     ocrSummary: summary,
     ocrDiff,
     ocrResults,
+    warnings,
     issues,
     outputMarkdownPath
   };

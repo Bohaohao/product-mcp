@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { TextDecoder } from 'node:util';
 import ExcelJS from 'exceljs';
 import type { SourceInventoryItem } from './sourceInventory.js';
 
@@ -16,6 +17,55 @@ export interface TextExtractionResult {
 
 const MAX_TEXT_BYTES = 512 * 1024;
 
+export interface DecodedTextFile {
+  text: string;
+  encoding: 'utf-8' | 'utf-16le' | 'utf-16be' | 'gb18030';
+}
+
+function decodeText(bytes: Uint8Array, encoding: DecodedTextFile['encoding']): string {
+  return new TextDecoder(encoding, { fatal: true }).decode(bytes);
+}
+
+function validateDecodedText(text: string): string {
+  if (text.includes('\u0000') || text.includes('\uFFFD')) {
+    throw new Error('Decoded text contains invalid null or replacement characters.');
+  }
+  return text.replace(/^\uFEFF/, '');
+}
+
+export async function readTextFileWithDetectedEncoding(absolutePath: string, size?: number): Promise<DecodedTextFile> {
+  if (size !== undefined && size > MAX_TEXT_BYTES) {
+    throw new Error(`文本文件过大，超过 ${Math.round(MAX_TEXT_BYTES / 1024)}KB 自动解析上限。`);
+  }
+
+  const bytes = await readFile(absolutePath);
+  if (bytes.length > MAX_TEXT_BYTES) {
+    throw new Error(`文本文件过大，超过 ${Math.round(MAX_TEXT_BYTES / 1024)}KB 自动解析上限。`);
+  }
+
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) {
+    return { text: validateDecodedText(decodeText(bytes.subarray(3), 'utf-8')), encoding: 'utf-8' };
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return { text: validateDecodedText(decodeText(bytes.subarray(2), 'utf-16le')), encoding: 'utf-16le' };
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    return { text: validateDecodedText(decodeText(bytes.subarray(2), 'utf-16be')), encoding: 'utf-16be' };
+  }
+
+  try {
+    return { text: validateDecodedText(decodeText(bytes, 'utf-8')), encoding: 'utf-8' };
+  } catch (utf8Error) {
+    try {
+      return { text: validateDecodedText(decodeText(bytes, 'gb18030')), encoding: 'gb18030' };
+    } catch (gb18030Error) {
+      const utf8Message = utf8Error instanceof Error ? utf8Error.message : String(utf8Error);
+      const gb18030Message = gb18030Error instanceof Error ? gb18030Error.message : String(gb18030Error);
+      throw new Error(`无法按 UTF-8 或 GB18030 解码文本。UTF-8: ${utf8Message}; GB18030: ${gb18030Message}`);
+    }
+  }
+}
+
 function compactWhitespace(value: string): string {
   return value.replace(/\r/g, '').replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
 }
@@ -26,20 +76,22 @@ function summarize(value: string): string {
 }
 
 async function readPlainText(source: SourceInventoryItem): Promise<TextExtractionResult> {
-  if (source.size > MAX_TEXT_BYTES) {
+  try {
+    const decoded = await readTextFileWithDetectedEncoding(source.absolutePath, source.size);
+    const text = compactWhitespace(decoded.text);
+    return {
+      ok: Boolean(text),
+      text,
+      summary: text ? summarize(text) : undefined,
+      reason: text ? undefined : '文本为空。'
+    };
+  } catch (error) {
     return {
       ok: false,
       text: '',
-      reason: `文本文件过大，超过 ${Math.round(MAX_TEXT_BYTES / 1024)}KB 自动解析上限。`
+      reason: error instanceof Error ? error.message : String(error)
     };
   }
-  const text = compactWhitespace(await readFile(source.absolutePath, 'utf8'));
-  return {
-    ok: Boolean(text),
-    text,
-    summary: text ? summarize(text) : undefined,
-    reason: text ? undefined : '文本为空。'
-  };
 }
 
 async function readSpreadsheet(source: SourceInventoryItem): Promise<TextExtractionResult> {

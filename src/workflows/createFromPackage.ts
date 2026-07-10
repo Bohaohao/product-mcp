@@ -22,7 +22,10 @@ export const productCreateFromPackageInputSchema = {
   runMode: z.enum(['preview', 'create']).default('preview').describe('preview does not upload or create; create requires confirm=true.'),
   confirm: z.boolean().optional().describe('Required true when runMode=create.'),
   clientRequestId: z.string().trim().max(100).optional(),
-  ocrMode: z.enum(['off', 'suggest', 'apply']).default('apply').describe('Certification OCR assistance before precheck. apply fills blank fields only.'),
+  ocrMode: z
+    .enum(['off', 'auto', 'strict', 'suggest', 'apply'])
+    .default('auto')
+    .describe('Certification OCR assistance before precheck. auto applies local OCR when possible and returns Codex native vision fallback requests when needed.'),
   ocrOptions: productOcrOptionsSchema,
   responseMode: z.enum(['summary', 'standard', 'debug']).default('summary'),
   includeDetailSections: z
@@ -104,6 +107,18 @@ function sha(value: string): string {
 
 function defaultClientRequestId(input: ProductCreateFromPackageInput): string {
   return `pkg_${sha(path.resolve(input.packagePath)).slice(0, 20)}`;
+}
+
+function shouldRunCertificationOcr(mode: ProductCreateFromPackageInput['ocrMode']): boolean {
+  return mode !== 'off';
+}
+
+function certificationOcrHelperMode(mode: ProductCreateFromPackageInput['ocrMode']): 'suggest' | 'apply' {
+  return mode === 'suggest' ? 'suggest' : 'apply';
+}
+
+function strictOcrMode(mode: ProductCreateFromPackageInput['ocrMode']): boolean {
+  return mode === 'strict';
 }
 
 function workflowDir(): string {
@@ -581,7 +596,11 @@ function precheckContext(precheck: UnknownRecord): UnknownRecord {
     uploadQueueSummary: uploadQueueSummary(precheck.uploadQueue),
     sourceInventorySummary: precheck.sourceInventorySummary,
     sourceMappingSummary: precheck.sourceMappingSummary,
-    sourceCoverageReport: precheck.sourceCoverageReport
+    sourceCoverageReport: precheck.sourceCoverageReport,
+    videoMetadataSummary: precheck.videoMetadataSummary,
+    videoMetadataReport: precheck.videoMetadataReport,
+    ocrFallback: precheck.ocrFallback,
+    visionExtractionRequest: isRecord(precheck.ocrFallback) ? precheck.ocrFallback.visionExtractionRequest : undefined
   };
 }
 
@@ -654,6 +673,11 @@ function packageResult(result: UnknownRecord, responseMode: ProductCreateFromPac
     sourceInventorySummary: result.sourceInventorySummary,
     sourceMappingSummary: result.sourceMappingSummary,
     sourceCoverageReport: result.sourceCoverageReport,
+    videoMetadataSummary: result.videoMetadataSummary,
+    videoMetadataReport: result.videoMetadataReport,
+    certificationOcr: result.certificationOcr,
+    ocrFallback: result.ocrFallback,
+    visionExtractionRequest: result.visionExtractionRequest,
     duplicateCheck: result.duplicateCheck,
     referenceResolution: result.referenceResolution,
     uploadSummary: result.uploadSummary,
@@ -735,14 +759,14 @@ export async function productCreateFromPackage(
   }
 
   const certificationOcr =
-    input.ocrMode === 'off'
-      ? undefined
-      : await productOcrCertifications({
+    shouldRunCertificationOcr(input.ocrMode)
+      ? await productOcrCertifications({
           packagePath: input.packagePath,
           markdownFileName: input.markdownFileName,
-          mode: input.ocrMode === 'apply' ? 'apply' : 'suggest',
+          mode: certificationOcrHelperMode(input.ocrMode),
           ocrOptions: input.ocrOptions
-        });
+        })
+      : undefined;
   if (certificationOcr) {
     journal.snapshots = { ...(journal.snapshots || {}), certificationOcr };
     addStage(journal, {
@@ -763,6 +787,34 @@ export async function productCreateFromPackage(
         : undefined
     });
     await writeJournal(journal);
+    if (strictOcrMode(input.ocrMode) && certificationOcr.fallbackRequired === true) {
+      return blockingResult(
+        journal,
+        String(certificationOcr.code || 'OCR_PROVIDER_UNAVAILABLE'),
+        'Certification OCR failed in strict mode; no upload or create was attempted.',
+        {
+          certificationOcr,
+          ocrFallback: {
+            code: certificationOcr.code,
+            fallbackRequired: certificationOcr.fallbackRequired,
+            fallbackType: certificationOcr.fallbackType,
+            visionExtractionRequest: certificationOcr.visionExtractionRequest,
+            providerErrors: certificationOcr.providerErrors,
+            warnings: certificationOcr.warnings
+          },
+          visionExtractionRequest: certificationOcr.visionExtractionRequest,
+          actionableIssues: toActionableIssues([
+            {
+              code: String(certificationOcr.code || 'OCR_PROVIDER_UNAVAILABLE'),
+              message: 'Certification OCR failed in strict mode. Use ocrMode=auto for Codex native vision fallback, or fill certification fields manually.',
+              severity: 'error',
+              field: 'ocrMode'
+            }
+          ])
+        },
+        input.responseMode
+      );
+    }
   }
 
   const precheck = (await precheckProductPackage({
@@ -783,6 +835,9 @@ export async function productCreateFromPackage(
     sourceInventorySummary: precheck.sourceInventorySummary,
     sourceMappingSummary: precheck.sourceMappingSummary,
     sourceCoverageReport: precheck.sourceCoverageReport,
+    videoMetadataSummary: precheck.videoMetadataSummary,
+    videoMetadataReport: precheck.videoMetadataReport,
+    ocrFallback: precheck.ocrFallback,
     certificationOcr,
     draftCreateInput: precheck.draftCreateInput,
     uploadQueue: precheck.uploadQueue

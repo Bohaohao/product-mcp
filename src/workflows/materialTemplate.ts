@@ -24,6 +24,8 @@ export interface TableMergeSpec {
   uniqueHeaders?: string[];
   labelHeader?: string;
   singletonLabels?: string[];
+  replaceFileStemHeaders?: string[];
+  removePathValues?: string[];
 }
 
 export interface ApplyMaterialTemplateInput {
@@ -221,21 +223,43 @@ function firstFilled(row: Record<string, string>, headers: string[]): string {
   return '';
 }
 
-function mergeKeepingExistingValues(generated: Record<string, string>, existing: Record<string, string> | undefined): Record<string, string> {
+function fileStemFromRow(row: Record<string, string>, pathHeaders: string[]): string {
+  const value = firstFilled(row, pathHeaders).replace(/\\/g, '/');
+  if (!value) return '';
+  const fileName = value.split('/').pop() || '';
+  return fileName.replace(/\.[^.]+$/, '');
+}
+
+function mergeKeepingExistingValues(
+  generated: Record<string, string>,
+  existing: Record<string, string> | undefined,
+  spec: TableMergeSpec
+): Record<string, string> {
   const merged = { ...generated };
   if (!existing) return merged;
 
+  const pathHeaders = spec.pathHeaders || ['文件路径', '图片路径', '附件路径', '主图路径', '文件路径或内容'];
+  const replaceFileStemHeaders = new Set(spec.replaceFileStemHeaders || []);
+  const existingFileStem = fileStemFromRow(existing, pathHeaders);
+
   for (const [key, value] of Object.entries(existing)) {
-    if (cleanCell(value)) merged[key] = value;
+    if (!cleanCell(value)) continue;
+    if (replaceFileStemHeaders.has(key) && cleanCell(value) === existingFileStem && cleanCell(generated[key])) continue;
+    merged[key] = value;
   }
 
   return merged;
 }
 
 function mergeRows(existingRows: Array<Record<string, string>>, spec: TableMergeSpec): Array<Record<string, string>> {
-  const rows = existingRows.filter((row) => !isBlankRow(row)).map((row) => ({ ...row }));
-  const generatedRows = spec.rows || [];
   const pathHeaders = spec.pathHeaders || ['文件路径', '图片路径', '附件路径', '主图路径', '文件路径或内容'];
+  const normalizePathValue = (value: string) => cleanCell(value).replace(/\\/g, '/').replace(/^\.\//, '').normalize('NFC').toLowerCase();
+  const removePathValues = new Set((spec.removePathValues || []).map(normalizePathValue));
+  const rows = existingRows
+    .filter((row) => !isBlankRow(row))
+    .filter((row) => !pathHeaders.some((header) => removePathValues.has(normalizePathValue(row[header] || ''))))
+    .map((row) => ({ ...row }));
+  const generatedRows = spec.rows || [];
   const uniqueHeaders = spec.uniqueHeaders || pathHeaders;
   const singletonLabels = new Set(spec.singletonLabels || []);
 
@@ -249,7 +273,7 @@ function mergeRows(existingRows: Array<Record<string, string>>, spec: TableMerge
       for (let index = rows.length - 1; index >= 0; index -= 1) {
         if (cleanCell(rows[index][spec.labelHeader || '']) === label) rows.splice(index, 1);
       }
-      rows.push(mergeKeepingExistingValues(generatedRow, preserved));
+      rows.push(mergeKeepingExistingValues(generatedRow, preserved, spec));
       continue;
     }
 
@@ -261,7 +285,7 @@ function mergeRows(existingRows: Array<Record<string, string>>, spec: TableMerge
     });
 
     if (existingIndex >= 0) {
-      rows[existingIndex] = mergeKeepingExistingValues(generatedRow, rows[existingIndex]);
+      rows[existingIndex] = mergeKeepingExistingValues(generatedRow, rows[existingIndex], spec);
       continue;
     }
 
@@ -271,7 +295,7 @@ function mergeRows(existingRows: Array<Record<string, string>>, spec: TableMerge
     });
 
     if (blankIndex >= 0) {
-      rows[blankIndex] = mergeKeepingExistingValues(generatedRow, rows[blankIndex]);
+      rows[blankIndex] = mergeKeepingExistingValues(generatedRow, rows[blankIndex], spec);
       continue;
     }
 
@@ -285,7 +309,7 @@ function applyTableMerges(markdown: string, specs: TableMergeSpec[], issues: Mat
   let result = markdown;
 
   for (const spec of specs) {
-    if (!(spec.rows || []).length) continue;
+    if (!(spec.rows || []).length && !(spec.removePathValues || []).length) continue;
     const tables = parseMarkdownTables(result);
     const table = firstMatchingTable(tables, spec);
     if (!table) {

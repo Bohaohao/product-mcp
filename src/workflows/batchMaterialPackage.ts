@@ -14,6 +14,15 @@ import {
 import { buildSourceCoverageAudit } from './sourceCoverageAudit.js';
 import { collectSourceInventory, sourceInventorySummary } from './sourceInventory.js';
 import { mapSourcesToStructuredRows } from './sourceTargetMapper.js';
+import { assertMaterialPackageWrite } from './materialWriteBoundary.js';
+import {
+  isTestingVideoMetadataSidecar,
+  resolveTestingVideoMetadata,
+  testingVideoCategoryFromValue,
+  videoMetadataForPath,
+  type TestingVideoCandidate,
+  type VideoMetadataResolution
+} from './videoMetadataPairs.js';
 
 type UnknownRow = Record<string, unknown>;
 type IssueSeverity = 'error' | 'warning' | 'info';
@@ -52,6 +61,8 @@ export interface BatchMaterialRowResult {
   classifiedCounts?: Record<string, number>;
   sourceInventorySummary?: ReturnType<typeof sourceInventorySummary>;
   sourceCoverageSummary?: ReturnType<typeof buildSourceCoverageAudit>['summary'];
+  videoMetadataSummary?: VideoMetadataResolution['summary'];
+  videoMetadataReport?: VideoMetadataResolution['reports'];
   issues: BatchMaterialIssue[];
 }
 
@@ -105,6 +116,7 @@ interface ClassifiedMaterialRows {
   accessoryRows: Array<Record<string, string>>;
   spareRows: Array<Record<string, string>>;
   wearPartRows: Array<Record<string, string>>;
+  testingVideoSidecarPaths: string[];
   issues: BatchMaterialIssue[];
   counts: Record<string, number>;
 }
@@ -474,6 +486,59 @@ function videoLabel(file: FileInventoryItem): string {
   return '实拍视频';
 }
 
+function testingVideoCandidates(
+  files: FileInventoryItem[],
+  existingMarkdown: string | undefined,
+  sourceClassification: string
+): TestingVideoCandidate[] {
+  const candidates = new Map<string, TestingVideoCandidate>();
+  const keyFor = (value: string) => normalizeMaterialRelativePath(value);
+
+  if (existingMarkdown) {
+    const table = parseMarkdownTables(existingMarkdown).find(
+      (candidate) =>
+        candidate.heading.includes('商品视频、3D 与附件') &&
+        candidate.headers.includes('资料用途') &&
+        candidate.headers.includes('文件路径')
+    );
+    table?.rows.forEach((row, index) => {
+      const categoryLabel = testingVideoCategoryFromValue(row['资料用途'] || '');
+      const videoPath = String(row['文件路径'] || '').trim();
+      if (!categoryLabel || !videoPath) return;
+      const normalizedVideoPath = videoPath.replace(/\\/g, '/');
+      const fallbackTitle = path.posix.basename(normalizedVideoPath, path.posix.extname(normalizedVideoPath));
+      const existingTitle = String(row['标题'] || '').trim();
+      candidates.set(keyFor(videoPath), {
+        videoPath,
+        categoryLabel,
+        title: existingTitle === fallbackTitle ? undefined : existingTitle,
+        description: row['描述'],
+        remark: row['备注'],
+        row: index + 1
+      });
+    });
+  }
+
+  for (const file of files.filter(isVideo)) {
+    const decision = resolveMediaClassification({
+      kind: 'media',
+      directParentCategory: directParentCategoryFromPath(file.relativePath),
+      fallbackLabel: videoLabel(file),
+      sourceClassification
+    });
+    const categoryLabel = testingVideoCategoryFromValue(decision.label);
+    const key = keyFor(file.relativePath);
+    if (!categoryLabel || candidates.has(key)) continue;
+    candidates.set(key, {
+      videoPath: file.relativePath,
+      categoryLabel,
+      remark: decision.remark
+    });
+  }
+
+  return [...candidates.values()];
+}
+
 function customerNameFromPath(file: FileInventoryItem): string {
   const parts = file.pathParts.map((part) => part.replace(/^\.+\//, ''));
   const caseIndex = parts.findIndex((part) => includesAny(part.toLowerCase(), ['案例', '客户', 'case', 'customer']));
@@ -493,7 +558,8 @@ function classifyMaterialFiles(
   files: FileInventoryItem[],
   productNameCn: string,
   sourceClassification = '',
-  boundRelativePaths: Set<string> = new Set()
+  boundRelativePaths: Set<string> = new Set(),
+  videoMetadata?: VideoMetadataResolution
 ): ClassifiedMaterialRows {
   const classified: ClassifiedMaterialRows = {
     productImages: [],
@@ -511,6 +577,7 @@ function classifyMaterialFiles(
     accessoryRows: [],
     spareRows: [],
     wearPartRows: [],
+    testingVideoSidecarPaths: videoMetadata ? [...videoMetadata.sidecarTextPaths] : [],
     issues: [],
     counts: {}
   };
@@ -531,7 +598,7 @@ function classifyMaterialFiles(
     });
 
   const withClassificationRemark = (row: Record<string, string>, remark?: string): Record<string, string> => {
-    if (remark) row['备注'] = remark;
+    if (remark) row['备注'] = row['备注'] ? `${row['备注']}；${remark}` : remark;
     return row;
   };
 
@@ -627,7 +694,13 @@ function classifyMaterialFiles(
   };
 
   for (const file of files) {
-    if (boundRelativePaths.has(normalizeMaterialRelativePath(file.relativePath))) {
+    if (isTestingVideoMetadataSidecar(videoMetadata, file.relativePath)) {
+      increment(classified.counts, 'testingVideoMetadataSidecars');
+      continue;
+    }
+
+    const testingMetadata = isVideo(file) ? videoMetadataForPath(videoMetadata, file.relativePath) : undefined;
+    if (boundRelativePaths.has(normalizeMaterialRelativePath(file.relativePath)) && !testingMetadata) {
       increment(classified.counts, 'alreadyBoundFilesSkipped');
       continue;
     }
@@ -658,7 +731,9 @@ function classifyMaterialFiles(
       classified.productMedia.push(withClassificationRemark({
         资料用途: decision.label,
         文件路径: file.relativePath,
-        标题: file.baseName
+        标题: testingMetadata?.title || file.baseName,
+        描述: testingMetadata?.description || '',
+        备注: testingMetadata?.effectiveRemark || ''
       }, decision.remark));
       increment(classified.counts, 'productMedia');
       continue;
@@ -730,7 +805,8 @@ function buildTableMerges(classified: ClassifiedMaterialRows, regionRows: Array<
       requiredHeaders: ['资料用途', '文件路径'],
       rows: classified.productMedia,
       pathHeaders: ['文件路径'],
-      labelHeader: '资料用途'
+      labelHeader: '资料用途',
+      replaceFileStemHeaders: ['标题']
     },
     {
       headingIncludes: '图文详情卡片',
@@ -744,7 +820,8 @@ function buildTableMerges(classified: ClassifiedMaterialRows, regionRows: Array<
       requiredHeaders: ['资料用途', '文件路径或内容'],
       rows: classified.richTextMaterials,
       pathHeaders: ['文件路径或内容'],
-      labelHeader: '资料用途'
+      labelHeader: '资料用途',
+      removePathValues: classified.testingVideoSidecarPaths
     },
     {
       headingIncludes: '核心优势',
@@ -965,7 +1042,12 @@ export async function prepareBatchMaterialPackages(rawInput: unknown): Promise<B
       const inventory = await collectMaterialFiles(packageDir, input.markdownFileName);
       const sourceInventory = await collectSourceInventory(packageDir, { markdownFileName: input.markdownFileName });
       const boundRelativePaths = extractReferencedMaterialPaths(existingMarkdown);
-      const classified = classifyMaterialFiles(inventory, productNameCn, sourceClassification, boundRelativePaths);
+      const videoMetadata = await resolveTestingVideoMetadata({
+        sources: sourceInventory,
+        candidates: testingVideoCandidates(inventory, existingMarkdown, sourceClassification),
+        productNameCn
+      });
+      const classified = classifyMaterialFiles(inventory, productNameCn, sourceClassification, boundRelativePaths, videoMetadata);
       const structuredRows = await mapSourcesToStructuredRows(sourceInventory, productNameCn);
       classified.advantageRows.push(...structuredRows.advantageRows);
       classified.scenarioRows.push(...structuredRows.scenarioRows);
@@ -976,6 +1058,7 @@ export async function prepareBatchMaterialPackages(rawInput: unknown): Promise<B
       classified.caseMediaRows.push(...structuredRows.caseMediaRows);
       Object.assign(classified.counts, Object.fromEntries(Object.entries(structuredRows.counts).map(([key, value]) => [key, (classified.counts[key] || 0) + value])));
       issues.push(...classified.issues.map((issue) => ({ ...issue, rowIndex, packageDir })));
+      issues.push(...videoMetadata.issues.map((issue) => ({ ...issue, rowIndex, productNameCn, packageDir })));
 
       const hasGrossWeight = findCell(row, ['包装重量 kg', '包装重量', '毛重', '毛重 kg', 'grossWeight', 'grossWeightKg', 'packWeight', 'packageWeight']).found;
       const existingNetWeight = fieldValue(existingMarkdown, '净重 kg');
@@ -1001,7 +1084,8 @@ export async function prepareBatchMaterialPackages(rawInput: unknown): Promise<B
       issues.push(...mediaClassificationIssues(applied.markdown, rowIndex, productNameCn, packageDir));
       const sourceCoverage = buildSourceCoverageAudit({
         sources: sourceInventory,
-        markdown: applied.markdown
+        markdown: applied.markdown,
+        videoMetadataReport: videoMetadata.reports
       });
       issues.push(
         ...sourceCoverage.issues.map((issue) => ({
@@ -1015,7 +1099,15 @@ export async function prepareBatchMaterialPackages(rawInput: unknown): Promise<B
         }))
       );
 
-      if (!input.dryRun) await writeFile(markdownPath, applied.markdown, 'utf8');
+      if (!input.dryRun) {
+        assertMaterialPackageWrite({
+          packageDir,
+          targetPath: markdownPath,
+          kind: 'materialMarkdown',
+          markdownFileName: input.markdownFileName
+        });
+        await writeFile(markdownPath, applied.markdown, 'utf8');
+      }
 
       results.push({
         rowIndex,
@@ -1030,6 +1122,8 @@ export async function prepareBatchMaterialPackages(rawInput: unknown): Promise<B
         classifiedCounts: classified.counts,
         sourceInventorySummary: sourceInventorySummary(sourceInventory),
         sourceCoverageSummary: sourceCoverage.summary,
+        videoMetadataSummary: videoMetadata.summary,
+        videoMetadataReport: videoMetadata.reports,
         issues
       });
     } catch (error) {

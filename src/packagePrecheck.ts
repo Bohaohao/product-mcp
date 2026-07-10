@@ -16,6 +16,14 @@ import { validateMediaClassificationRow, type MediaClassificationKind } from './
 import { productOcrCertifications, productOcrOptionsSchema } from './ocr/certificationOcr.js';
 import { buildSourceCoverageAudit } from './workflows/sourceCoverageAudit.js';
 import { collectSourceInventory, sourceInventorySummary } from './workflows/sourceInventory.js';
+import {
+  isTestingVideoMetadataSidecar,
+  resolveTestingVideoMetadata,
+  testingVideoCategoryFromValue,
+  videoMetadataForPath,
+  type TestingVideoCandidate,
+  type VideoMetadataResolution
+} from './workflows/videoMetadataPairs.js';
 
 export const productPrecheckPackageInputSchema = {
   packagePath: z
@@ -908,7 +916,8 @@ function addFileReference(
 function collectFileReferences(
   tables: MarkdownTable[],
   packageDir: string,
-  issues: PrecheckIssue[]
+  issues: PrecheckIssue[],
+  videoMetadata?: VideoMetadataResolution
 ): FileReference[] {
   const references: FileReference[] = [];
 
@@ -962,6 +971,7 @@ function collectFileReferences(
       });
       return;
     }
+    const resolvedMetadata = testingVideoCategoryFromValue(label) ? videoMetadataForPath(videoMetadata, relativePath) : undefined;
     addFileReference(
       references,
       packageDir,
@@ -970,8 +980,8 @@ function collectFileReferences(
       usage,
       label,
       relativePath,
-      row['标题'],
-      row['描述'],
+      resolvedMetadata?.title || row['标题'],
+      resolvedMetadata?.description || row['描述'],
       row['语言'],
       undefined,
       {
@@ -979,7 +989,7 @@ function collectFileReferences(
         mediaSubtitle: row['副标题'],
         mediaLanguage: row['语言代码'],
         mediaId: row['原图文ID'],
-        mediaRemark: row['备注']
+        mediaRemark: resolvedMetadata?.effectiveRemark || row['备注']
       }
     );
   });
@@ -988,6 +998,7 @@ function collectFileReferences(
     const label = cleanCell(row['资料用途']);
     const relativePath = cleanCell(row['文件路径或内容']);
     if (!isPathLike(relativePath)) return;
+    if (isTestingVideoMetadataSidecar(videoMetadata, relativePath)) return;
     const usage = fileUsageByLabel[label];
     if (!usage) {
       addIssue(issues, {
@@ -1227,6 +1238,27 @@ function collectFileReferences(
   });
 
   return references;
+}
+
+function testingVideoCandidatesFromTables(tables: MarkdownTable[]): TestingVideoCandidate[] {
+  const candidates: TestingVideoCandidate[] = [];
+  tableRows(tables, '商品视频、3D 与附件', '资料用途').forEach((row, index) => {
+    const categoryLabel = testingVideoCategoryFromValue(row['资料用途'] || '');
+    const videoPath = cleanCell(row['文件路径']);
+    if (!categoryLabel || !videoPath) return;
+    const normalizedVideoPath = videoPath.replace(/\\/g, '/');
+    const fallbackTitle = path.posix.basename(normalizedVideoPath, path.posix.extname(normalizedVideoPath));
+    const existingTitle = cleanCell(row['标题']);
+    candidates.push({
+      videoPath,
+      categoryLabel,
+      title: existingTitle === fallbackTitle ? undefined : existingTitle,
+      description: row['描述'],
+      remark: row['备注'],
+      row: index + 1
+    });
+  });
+  return candidates;
 }
 
 function extraPathSuggestsCertification(relativePath: string): boolean {
@@ -2231,11 +2263,28 @@ export async function precheckProductPackage(rawInput: unknown) {
   issues.push(...mediaClassificationPrecheckIssues(tables));
   const draft = input.includeDraft ? parseDraft(markdown, tables, issues) : undefined;
   const draftProductNameCn = typeof draft?.productNameCn === 'string' ? draft.productNameCn : undefined;
+  const sourceInventory = await collectSourceInventory(packageDir, { markdownFileName: input.markdownFileName });
+  const videoMetadata = await resolveTestingVideoMetadata({
+    sources: sourceInventory,
+    candidates: testingVideoCandidatesFromTables(tables),
+    productNameCn: draftProductNameCn
+  });
+  for (const metadataIssue of videoMetadata.issues) {
+    addIssue(issues, {
+      severity: metadataIssue.severity,
+      code: metadataIssue.code,
+      message: metadataIssue.message,
+      section: metadataIssue.section,
+      row: metadataIssue.row,
+      field: metadataIssue.field,
+      path: metadataIssue.path
+    });
+  }
   validateDraftAgainstCategoryConfig(draft, input.categoryConfig, issues);
   validateCertificationTables(tables, issues);
   validateSalesSupportTables(tables, issues);
   validateCustomerCaseTables(tables, issues);
-  const explicitFileReferences = collectFileReferences(tables, packageDir, issues);
+  const explicitFileReferences = collectFileReferences(tables, packageDir, issues, videoMetadata);
   const extraDiscoveredFiles = await collectExtraDiscoveredCertificationImages(packageDir, explicitFileReferences);
   const fileReferences = [...explicitFileReferences, ...extraDiscoveredFiles];
   const checkedFiles = await checkFiles(fileReferences, issues, draftProductNameCn);
@@ -2277,6 +2326,19 @@ export async function precheckProductPackage(rawInput: unknown) {
           ocrOptions: input.ocrOptions
         })
       : undefined;
+  const ocrFallback =
+    certificationOcr?.fallbackRequired === true
+      ? {
+          code: certificationOcr.code,
+          partial: certificationOcr.partial,
+          blocking: certificationOcr.blocking,
+          fallbackRequired: certificationOcr.fallbackRequired,
+          fallbackType: certificationOcr.fallbackType,
+          visionExtractionRequest: certificationOcr.visionExtractionRequest,
+          providerErrors: certificationOcr.providerErrors,
+          warnings: certificationOcr.warnings
+        }
+      : undefined;
 
   const blockingInvalidFiles = checkedFiles
     .filter((file) => !file.ok && isBlockingFileReference(file))
@@ -2312,11 +2374,11 @@ export async function precheckProductPackage(rawInput: unknown) {
         draftBinding: file.rowKey ? buildDraftBinding(policy.target, file.rowKey) : undefined
       };
     });
-  const sourceInventory = await collectSourceInventory(packageDir, { markdownFileName: input.markdownFileName });
   const sourceCoverage = buildSourceCoverageAudit({
     sources: sourceInventory,
     markdown,
-    uploadQueue
+    uploadQueue,
+    videoMetadataReport: videoMetadata.reports
   });
   issues.push(
     ...sourceCoverage.issues.map((issue) => ({
@@ -2354,7 +2416,9 @@ export async function precheckProductPackage(rawInput: unknown) {
     blockingInvalidFileCount: blockingInvalidFiles.length,
     ignoredInvalidExtraFileCount: ignoredInvalidExtraFiles.length,
     sourceCoverageBlockedCount: sourceCoverage.summary.blockedCount,
-    sourceCoverageAmbiguousCount: sourceCoverage.summary.ambiguousCount
+    sourceCoverageAmbiguousCount: sourceCoverage.summary.ambiguousCount,
+    videoMetadataBlockedCount: videoMetadata.summary.blockedCount,
+    videoMetadataWarningCount: videoMetadata.summary.warningCount
   };
   const fieldCoverage = draft ? buildFieldCoverage(draft) : undefined;
   const submissionPreview = draft ? buildSubmissionPreview(draft) : undefined;
@@ -2393,6 +2457,11 @@ export async function precheckProductPackage(rawInput: unknown) {
       counts: submissionPreview?.counts
     },
     {
+      name: 'resolve_testing_video_metadata',
+      ok: videoMetadata.summary.blockedCount === 0,
+      counts: videoMetadata.summary
+    },
+    {
       name: 'source_coverage_audit',
       ok: sourceCoverage.ok,
       counts: sourceCoverage.summary
@@ -2406,7 +2475,8 @@ export async function precheckProductPackage(rawInput: unknown) {
             autoFilledCount: certificationOcr.ocrSummary?.autoFilledCount,
             suggestedCount: certificationOcr.ocrSummary?.suggestedCount,
             needsManualCount: certificationOcr.ocrSummary?.needsManualCount,
-            conflictCount: certificationOcr.ocrSummary?.conflictCount
+            conflictCount: certificationOcr.ocrSummary?.conflictCount,
+            fallbackRequiredCount: certificationOcr.fallbackRequired ? 1 : 0
           }
         : undefined
     }
@@ -2434,7 +2504,11 @@ export async function precheckProductPackage(rawInput: unknown) {
       blockedCount: sourceCoverage.summary.blockedCount
     },
     sourceCoverageReport: input.responseMode === 'summary' ? sourceCoverage.report.slice(0, 100) : sourceCoverage.report,
+    videoMetadataSummary: videoMetadata.summary,
+    videoMetadataReport: input.responseMode === 'summary' ? videoMetadata.reports.slice(0, 100) : videoMetadata.reports,
     certificationOcr,
+    ocrFallback,
+    visionExtractionRequest: ocrFallback?.visionExtractionRequest,
     actionableIssues,
     unresolvedReferences: draft ? unresolvedReferences(draft) : undefined,
     uploadQueue,
@@ -2459,7 +2533,11 @@ export async function precheckProductPackage(rawInput: unknown) {
       sourceInventorySummary: result.sourceInventorySummary,
       sourceMappingSummary: result.sourceMappingSummary,
       sourceCoverageReport: result.sourceCoverageReport,
+      videoMetadataSummary: result.videoMetadataSummary,
+      videoMetadataReport: result.videoMetadataReport,
       certificationOcr,
+      ocrFallback,
+      visionExtractionRequest: ocrFallback?.visionExtractionRequest,
       actionableIssues,
       blockingInvalidFiles,
       ignoredInvalidExtraFiles,

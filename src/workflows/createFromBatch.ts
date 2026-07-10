@@ -18,7 +18,10 @@ export const productCreateFromBatchInputSchema = {
   runMode: z.enum(['prepare', 'preview', 'create']).default('preview'),
   confirm: z.boolean().optional().describe('Required true when runMode=create. One confirmation covers the full selected batch.'),
   clientRequestId: z.string().trim().min(1).optional().describe('Optional workflow idempotency key. Reuse the same value from preview to create.'),
-  ocrMode: z.enum(['off', 'suggest', 'apply']).default('apply').describe('Per-row certification OCR assistance before each package precheck.'),
+  ocrMode: z
+    .enum(['off', 'auto', 'strict', 'suggest', 'apply'])
+    .default('auto')
+    .describe('Per-row certification OCR assistance. auto uses local OCR first and returns Codex native vision fallback requests when needed.'),
   ocrOptions: productOcrOptionsSchema,
   sheetName: z.string().trim().optional(),
   rowSelection: z
@@ -58,6 +61,10 @@ interface BatchRowResult {
   clientRequestId?: string;
   sourceMappingSummary?: unknown;
   sourceCoverageReport?: unknown;
+  videoMetadataSummary?: unknown;
+  videoMetadataReport?: unknown;
+  ocrFallback?: unknown;
+  visionExtractionRequest?: unknown;
   issues?: BatchRowIssue[];
 }
 
@@ -214,6 +221,10 @@ function rowResultFromPackageResult(row: BatchProductRow, result: UnknownRecord,
     clientRequestId: stringValue(result.clientRequestId),
     sourceMappingSummary: result.sourceMappingSummary,
     sourceCoverageReport: result.sourceCoverageReport,
+    videoMetadataSummary: result.videoMetadataSummary,
+    videoMetadataReport: result.videoMetadataReport,
+    ocrFallback: result.ocrFallback,
+    visionExtractionRequest: result.visionExtractionRequest,
     issues: issues.length ? issues : undefined
   };
 }
@@ -248,6 +259,10 @@ function packageResult(result: UnknownRecord, responseMode: ProductCreateFromBat
     clientRequestId: row.clientRequestId,
     sourceMappingSummary: row.sourceMappingSummary,
     sourceCoverageReport: row.sourceCoverageReport,
+    videoMetadataSummary: row.videoMetadataSummary,
+    videoMetadataReport: row.videoMetadataReport,
+    ocrFallback: row.ocrFallback,
+    visionExtractionRequest: row.visionExtractionRequest,
     issues: row.issues?.slice(0, 10)
   }));
   if (responseMode === 'summary') {

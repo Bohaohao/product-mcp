@@ -2,6 +2,7 @@ import type { MarkdownTable } from './materialTemplate.js';
 import { parseMarkdownTables } from './materialTemplate.js';
 import type { SourceInventoryItem } from './sourceInventory.js';
 import { businessTypeLabel, sectionByBusinessType, structuredBusinessTypes, type BusinessType } from './templateSectionRegistry.js';
+import type { VideoMetadataReportItem } from './videoMetadataPairs.js';
 
 export type SourceCoverageStatus = 'mapped' | 'ignored' | 'ambiguous' | 'blocked';
 
@@ -55,6 +56,10 @@ interface UploadQueueLike {
 
 function clean(value: unknown): string {
   return String(value ?? '').trim();
+}
+
+function normalizedSourcePath(value: string): string {
+  return value.replace(/\\/g, '/').replace(/^\.\//, '').normalize('NFC').trim().toLowerCase();
 }
 
 function rowHasContent(row: Record<string, string>): boolean {
@@ -154,13 +159,40 @@ export function buildSourceCoverageAudit(params: {
   sources: SourceInventoryItem[];
   markdown: string;
   uploadQueue?: UploadQueueLike[];
+  videoMetadataReport?: VideoMetadataReportItem[];
 }): SourceCoverageAuditResult {
   const tables = parseMarkdownTables(params.markdown);
   const uploadQueue = params.uploadQueue || [];
   const report: SourceCoverageReportItem[] = [];
   const issues: SourceCoverageIssue[] = [];
+  const videoMetadataByTextPath = new Map<string, VideoMetadataReportItem>();
+  for (const item of params.videoMetadataReport || []) {
+    if (item.metadataPath) videoMetadataByTextPath.set(normalizedSourcePath(item.metadataPath), item);
+    for (const candidatePath of item.candidateMetadataPaths || []) {
+      videoMetadataByTextPath.set(normalizedSourcePath(candidatePath), item);
+    }
+  }
 
   for (const source of params.sources.filter((item) => item.sourceKind !== 'folder')) {
+    const videoMetadata = videoMetadataByTextPath.get(normalizedSourcePath(source.sourcePath));
+    if (videoMetadata) {
+      const refs = videoMetadata.videoPath ? sourceReferences(tables, videoMetadata.videoPath) : { targetSections: [], targetRows: [] };
+      const blocked = videoMetadata.status === 'blocked';
+      report.push({
+        sourcePath: source.sourcePath,
+        detectedBusinessType: '实测视频文案',
+        targetSections: refs.targetSections,
+        targetRows: refs.targetRows,
+        uploadUsage: [],
+        status: blocked ? 'blocked' : 'mapped',
+        reason: blocked
+          ? videoMetadata.issues.find((item) => item.severity === 'error')?.message || '实测视频文案配对或解析失败。'
+          : `仅作为${videoMetadata.categoryLabel || '实测视频'}的标题/描述来源，不单独上传。`,
+        code: blocked ? 'TEXT_SOURCE_NOT_PARSED' : undefined
+      });
+      continue;
+    }
+
     const businessTypes = structuredBusinessTypes(source.possibleBusinessTypes);
     const detectedBusinessType = businessTypes.map(businessTypeLabel).join('、') || '';
     const expected = expectedSections(businessTypes);
@@ -235,7 +267,7 @@ export function buildSourceCoverageAudit(params: {
   };
 
   return {
-    ok: issues.length === 0,
+    ok: issues.length === 0 && report.every((item) => item.status !== 'blocked' && item.status !== 'ambiguous'),
     summary,
     report,
     issues

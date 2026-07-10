@@ -1454,7 +1454,7 @@ async function main(): Promise<void> {
     {
       title: 'OCR product certification materials',
       description:
-        'Run local OCR on certification PDFs/images in a 商品资料.md package. suggest mode returns traceable candidates only; apply mode fills blank certification fields with high-confidence local OCR results and never overwrites user-provided values.',
+        'Run local OCR on certification PDFs/images in a 商品资料.md package. suggest mode returns traceable candidates only; apply mode fills blank certification fields with high-confidence local OCR or Codex vision fallback results and never overwrites user-provided values. Original package files are not modified; derived OCR renders are written only under .generated/.',
       inputSchema: productOcrCertificationsInputSchema
     },
     async (input) => {
@@ -1530,7 +1530,7 @@ async function main(): Promise<void> {
     {
       title: 'Create product from package',
       description:
-        'High-level local workflow for 商品资料.md packages. Preview mode validates, checks duplicates, resolves references, and returns a final submission preview without upload/create. Create mode requires confirm=true, uploads every valid uploadQueue item sequentially with one retry per failed file, binds OSS URLs, creates the product, verifies detail, and returns a diff report.',
+        'High-level local workflow for 商品资料.md packages. Preview mode validates, checks duplicates, resolves references, and returns a final submission preview without upload/create. Create mode requires confirm=true, uploads every valid uploadQueue item sequentially with one retry per failed file, binds OSS URLs, creates the product, verifies detail, and returns a diff report. The workflow treats original package files as read-only; allowed package writes are limited to 商品资料.md and .generated/ derived artifacts.',
       inputSchema: productCreateFromPackageInputSchema
     },
     async (input) => {
@@ -1555,7 +1555,7 @@ async function main(): Promise<void> {
     {
       title: 'Create products from batch workbook',
       description:
-        'High-level local workflow for Excel-driven batch product creation. It reads a standard import workbook, matches each row to a same-name material package folder, generates/updates 商品资料.md, writes row progress back to the workbook, and in create mode runs the full per-package workflow for each selected product. Create mode requires confirm=true.',
+        'High-level local workflow for Excel-driven batch product creation. It reads a standard import workbook, matches each row to a same-name material package folder, generates/updates 商品资料.md, writes row progress back to the workbook, and in create mode runs the full per-package workflow for each selected product. Create mode requires confirm=true. Original material files are not renamed, moved, deleted, converted, or overwritten.',
       inputSchema: productCreateFromBatchInputSchema
     },
     async (input) => {

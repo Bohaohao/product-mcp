@@ -7,6 +7,7 @@ export type BusinessType =
   | 'spareParts'
   | 'wearParts'
   | 'graphicInfo'
+  | 'testingVideoMetadata'
   | 'certification'
   | 'coreAdvantage'
   | 'applicationScenario'
@@ -122,6 +123,18 @@ export const TEMPLATE_SECTION_REGISTRY: TemplateSectionDefinition[] = [
     mediaReferenceExpected: true
   },
   {
+    sectionId: '6.2',
+    sectionName: '商品视频、3D 与附件',
+    aliases: ['链界实测视频', '链界实测', '三方实测视频', '三方实测', '第三方实测'],
+    businessTypes: ['testingVideoMetadata'],
+    rowSchema: ['资料用途', '文件路径', '标题', '描述', '备注'],
+    supportedSourceTypes: ['video', 'text'],
+    targetDtoPath: 'medias[videoCategory=4|6].mediaTitle/mediaDesc',
+    relatedUploadUsage: ['linkActualTestingVideo', 'thirdActualTestingVideo'],
+    textExtractionUseful: true,
+    mediaReferenceExpected: true
+  },
+  {
     sectionId: '7',
     sectionName: '认证资料',
     aliases: ['认证', '认证资料', '证书', '检测报告', 'certificate', 'certification', 'cert'],
@@ -227,6 +240,7 @@ const BUSINESS_TYPE_BY_PRIORITY: BusinessType[] = [
   'spareParts',
   'wearParts',
   'parts',
+  'testingVideoMetadata',
   'productConfig',
   'priceInfo',
   'inventoryLogistics',
